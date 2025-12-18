@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2025 Microbus LLC and various contributors
+Copyright (c) 2025-2026 Microbus LLC and various contributors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,19 +17,16 @@ limitations under the License.
 package sequel
 
 import (
+	"crypto/sha256"
 	"database/sql"
-	"errors"
-	"fmt"
+	"encoding/hex"
 	"io/fs"
 	"math"
-	"os"
-	"path"
+	"net/url"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
-	"testing"
 	"time"
 
 	_ "github.com/denisenkom/go-mssqldb"
@@ -37,21 +34,16 @@ import (
 	"github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
+	"github.com/microbus-io/errors"
 )
 
 var (
-	singletonsMap  = map[string]*DB{}
-	singletonMux   sync.Mutex
-	testingCreated = map[string]bool{}
-	testingMux     sync.Mutex
+	singletonsMap      = map[string]*DB{}
+	singletonMutex     sync.Mutex
+	testingDSNs        = map[string]string{}
+	testingGlobalMutex sync.Mutex
+	testingMutexes     = map[string]*sync.Mutex{}
 )
-
-// FS is a file system that is used to read migration files.
-type FS interface {
-	fs.FS
-	fs.ReadDirFS
-	fs.ReadFileFS
-}
 
 /*
 DB is an enhanced database connection that
@@ -61,42 +53,58 @@ DB is an enhanced database connection that
 */
 type DB struct {
 	*sql.DB
-	driver        string
-	dataSource    string
-	refCount      int
-	mux           sync.Mutex
-	testingDBName string
+	driverName          string
+	singletonKey        string
+	refCount            int
+	mutex               sync.Mutex
+	dropTestingDatabase func() (err error)
 }
 
-// Open a new database connection.
+/*
+Open returns a database connection to the named data source.
+
+If a driver name is not provided, it is inferred from the data source name on a best-effort basis.
+Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres) or "mssql" (SQL Server).
+
+Example data source name for each of the supported drivers:
+  - mysql: username:password@tcp(hostname:3306)/
+  - pgx: postgres://username:password@hostname:5432/
+  - mssql: sqlserver://username:password@hostname:1433
+*/
 func Open(driverName string, dataSourceName string) (db *DB, err error) {
+	if dataSourceName == "" {
+		return nil, errors.New("data source name is required")
+	}
 	if driverName == "mariadb" {
 		driverName = "mysql"
 	}
-
 	if driverName == "" {
-		return nil, errors.New("driver name cannot be empty")
+		driverName = inferDriverName(dataSourceName)
 	}
-	testingDBName := ""
-	if dataSourceName == "" && testing.Testing() {
-		dataSourceName, testingDBName, err = createTestingDatabase(driverName)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create testing database: %w", err)
-		}
+	if driverName == "" {
+		return nil, errors.New("driver name could not be inferred from data source name")
 	}
-	if dataSourceName == "" {
-		return nil, errors.New("data source name cannot be empty")
-	}
+	singletonKey := hashStr(driverName + "|" + dataSourceName)
 
-	singletonMux.Lock()
-	defer singletonMux.Unlock()
-	cached, ok := singletonsMap[driverName+"|"+dataSourceName]
-	if ok {
-		cached.mux.Lock()
-		defer cached.mux.Unlock()
-		cached.refCount++
-		cached.adjustConnectionLimits()
-		return cached, nil
+	singletonMutex.Lock()
+	singletonDB, ok := singletonsMap[singletonKey]
+	if !ok {
+		singletonDB = &DB{
+			DB:           nil,
+			driverName:   driverName,
+			singletonKey: singletonKey,
+			refCount:     0,
+		}
+		singletonsMap[singletonKey] = singletonDB
+	}
+	singletonMutex.Unlock()
+
+	singletonDB.mutex.Lock()
+	defer singletonDB.mutex.Unlock()
+	if singletonDB.DB != nil {
+		singletonDB.refCount++
+		singletonDB.adjustConnectionLimits()
+		return singletonDB, nil
 	}
 
 	var sqlDB *sql.DB
@@ -104,7 +112,7 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 	case "mysql":
 		cfg, err := mysql.ParseDSN(dataSourceName)
 		if err != nil {
-			return nil, err
+			return nil, errors.Trace(err)
 		}
 		if cfg.Params == nil {
 			cfg.Params = map[string]string{}
@@ -116,7 +124,7 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 		cfg.Params["writeTimeout"] = "8s"
 		sqlDB, err = sql.Open(driverName, cfg.FormatDSN())
 		if err != nil {
-			return nil, err
+			return nil, errors.Trace(err)
 		}
 		// Strict mode guards against errors
 		// https://dev.mysql.com/doc/refman/5.7/en/sql-mode.html#sql-mode-strict
@@ -129,153 +137,317 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 		)
 		if err != nil {
 			sqlDB.Close()
-			return nil, err
+			return nil, errors.Trace(err)
 		}
 	default:
 		sqlDB, err = sql.Open(driverName, dataSourceName)
 		if err != nil {
-			return nil, err
+			return nil, errors.Trace(err)
 		}
-	}
-	err = sqlDB.Ping()
-	if err != nil {
-		sqlDB.Close()
-		return nil, err
 	}
 
 	// Prepare the database struct
-	db = &DB{
-		DB:            sqlDB,
-		driver:        driverName,
-		dataSource:    dataSourceName,
-		refCount:      1,
-		testingDBName: testingDBName,
-	}
-	db.adjustConnectionLimits()
-	singletonsMap[driverName+"|"+dataSourceName] = db
-	return db, nil
+	singletonDB.DB = sqlDB
+	singletonDB.refCount = 1
+	singletonDB.adjustConnectionLimits()
+	return singletonDB, nil
 }
 
 // Close closes the database connection.
 func (db *DB) Close() (err error) {
-	singletonMux.Lock()
-	defer singletonMux.Unlock()
-	db.mux.Lock()
-	defer db.mux.Unlock()
+	if db == nil {
+		return nil
+	}
+	db.mutex.Lock()
+	defer db.mutex.Unlock()
 	if db.DB == nil || db.refCount == 0 {
 		return nil
 	}
-
 	db.refCount--
 	if db.refCount == 0 {
-		if db.testingDBName != "" {
-			db.Exec("DROP DATABASE " + db.testingDBName)
-		}
 		err = db.DB.Close()
 		db.DB = nil
-		delete(singletonsMap, db.driver+"|"+db.dataSource)
+		if db.dropTestingDatabase != nil {
+			db.dropTestingDatabase()
+		}
 	} else {
 		db.adjustConnectionLimits()
 	}
-	return err
+	return errors.Trace(err)
 }
 
-// createTestingDatabase creates a database for testing automatically.
-func createTestingDatabase(driverName string) (dataSourceName string, dbName string, err error) {
-	// Identify the top-most test function
-	testFunctionName := ""
-	for lvl := 0; ; lvl++ {
-		pc, _, _, ok := runtime.Caller(lvl + 1)
-		if !ok {
-			break
+// DriverName is the name of the driver: "mysql", "pgx" or "mssql".
+func (db *DB) DriverName() string {
+	return db.driverName
+}
+
+// databaseNameFromDataSourceName extracts the database name part of the data source name.
+func databaseNameFromDataSourceName(driverName string, dsn string) (databaseName string, err error) {
+	if dsn == "" {
+		return "", errors.New("empty dsn")
+	}
+	switch driverName {
+	case "mysql":
+		cfg, err := mysql.ParseDSN(dsn)
+		if err != nil {
+			return "", errors.New("error parsing data source name %s", dsn, err)
 		}
-		runtimeFunc := runtime.FuncForPC(pc)
-		if runtimeFunc != nil {
-			functionName := runtimeFunc.Name()
-			p := strings.LastIndex(functionName, "/")
-			if p >= 0 {
-				functionName = functionName[p+1:]
-			}
-			// github.com/microbus-io/sequel.Test_Example
-			// github.com/microbus-io/sequel.Test_Example.func1
-			pkgName, functionName, ok := strings.Cut(functionName, ".")
-			if ok && strings.HasPrefix(functionName, "Test") {
-				functionName, _, _ = strings.Cut(functionName, ".") // Subtests share the same database
-				testFunctionName = pkgName + "_" + functionName
-			}
+		return cfg.DBName, nil
+	case "pgx":
+		_, err = pgx.ParseConfig(dsn)
+		if err != nil {
+			return "", errors.New("error parsing data source name %s", dsn, err)
+		}
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", errors.New("error parsing data source name %s", dsn, err)
+		}
+		return strings.TrimPrefix(u.Path, "/"), nil
+	case "mssql":
+		// https://github.com/microsoft/go-mssqldb?tab=readme-ov-file#common-parameters
+		_, _, err = msdsn.Parse(dsn)
+		if err != nil {
+			return "", errors.New("error parsing data source name %s", dsn, err)
+		}
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", errors.New("error parsing data source name %s", dsn, err)
+		}
+		return u.Query().Get("database"), nil
+	default:
+		return "", errors.New("unsupported driver name %s", driverName)
+	}
+}
+
+// setDatabaseInDataSourceName alters the database in the data source name and returns the new data source name.
+func setDatabaseInDataSourceName(driverName string, dsn string, databaseName string) (alteredDSN string, err error) {
+	if dsn == "" {
+		return "", errors.New("empty dsn")
+	}
+	switch driverName {
+	case "mysql":
+		cfg, err := mysql.ParseDSN(dsn)
+		if err != nil {
+			return "", errors.New("error parsing data source name %s", dsn, err)
+		}
+		cfg.DBName = databaseName
+		alteredDSN = cfg.FormatDSN()
+		return alteredDSN, nil
+	case "pgx":
+		_, err = pgx.ParseConfig(dsn)
+		if err != nil {
+			return "", errors.New("error parsing data source name %s", dsn, err)
+		}
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", errors.New("error parsing data source name %s", dsn, err)
+		}
+		u.Path = "/" + databaseName
+		alteredDSN = u.String()
+		return alteredDSN, nil
+	case "mssql":
+		// https://github.com/microsoft/go-mssqldb?tab=readme-ov-file#common-parameters
+		_, _, err = msdsn.Parse(dsn)
+		if err != nil {
+			return "", errors.New("error parsing data source name %s", dsn, err)
+		}
+		u, err := url.Parse(dsn)
+		if err != nil {
+			return "", errors.New("error parsing data source name %s", dsn, err)
+		}
+		q := u.Query()
+		if databaseName == "" {
+			q.Del("database")
+		} else {
+			q.Set("database", databaseName)
+		}
+		u.RawQuery = q.Encode()
+		alteredDSN = u.String()
+		return alteredDSN, nil
+	default:
+		return "", errors.New("unsupported driver name %s", driverName)
+	}
+}
+
+// inferDriverName tries to infer the driver name from the data source name.
+func inferDriverName(dataSourceName string) (driverName string) {
+	if dataSourceName == "" {
+		return ""
+	}
+	if strings.HasPrefix(dataSourceName, "postgres://") {
+		return "pgx"
+	}
+	if strings.HasPrefix(dataSourceName, "sqlserver://") {
+		return "mssql"
+	}
+	if strings.Contains(dataSourceName, "tcp(") {
+		return "mysql"
+	}
+	if strings.Contains(dataSourceName, ":3306") {
+		return "mysql"
+	}
+	if strings.Contains(dataSourceName, ":5432") {
+		return "pgx"
+	}
+	if strings.Contains(dataSourceName, ":1433") {
+		return "mssql"
+	}
+	return ""
+}
+
+/*
+OpenTesting opens a connection to a uniquely named database for testing purposes.
+A database is created for each unique test at the database instance pointed to by the input DSN.
+
+If a driver name is not provided, it is inferred from the data source name on a best-effort basis.
+Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres) or "mssql" (SQL Server).
+
+If a data source name is not provided, the following defaults are used based on the driver name:
+  - (empty): root:root@tcp(127.0.0.1:3306)/
+  - mysql: root:root@tcp(127.0.0.1:3306)/
+  - pgx: postgres://postgres:postgres@127.0.0.1:5432/
+  - mssql: sqlserver://sa:sa@127.0.0.1:1433
+*/
+func OpenTesting(driverName string, dataSourceName string, uniqueTestID string) (db *DB, err error) {
+	// Set default connection to localhost
+	if dataSourceName == "" {
+		switch driverName {
+		case "", "mysql":
+			dataSourceName = "root:root@tcp(127.0.0.1:3306)/"
+		case "pgx":
+			dataSourceName = "postgres://postgres:postgres@127.0.0.1:5432/"
+		case "mssql":
+			dataSourceName = "sqlserver://sa:sa@127.0.0.1:1433"
+		default:
+			return nil, errors.New("unsupported driver name: %s", driverName)
 		}
 	}
-	if testFunctionName == "" {
-		return "", "", nil
+	if driverName == "" {
+		driverName = inferDriverName(dataSourceName)
+	}
+
+	cacheKey := hashStr(driverName + "|" + dataSourceName + "|" + uniqueTestID)
+
+	// Obtain the mutex for the unique test
+	testingGlobalMutex.Lock()
+	testingMux, ok := testingMutexes[cacheKey]
+	if !ok {
+		testingMux = &sync.Mutex{}
+		testingMutexes[cacheKey] = testingMux
+	}
+	testingDataSourceName, ok := testingDSNs[cacheKey]
+	testingGlobalMutex.Unlock()
+
+	// Check if a database was previously created for this test
+	if ok {
+		db, err = Open(driverName, testingDataSourceName)
+		return db, errors.Trace(err)
 	}
 
 	testingMux.Lock()
 	defer testingMux.Unlock()
 
-	testingDataSourceName := strings.TrimSpace(os.Getenv("TESTING_DATA_SOURCE_NAME"))
-	dbName = regexp.MustCompile(`[^a-z0-9]`).ReplaceAllString(strings.ToLower(testFunctionName), "_")
+	// Generate a database name
+	baseDatabaseName, err := databaseNameFromDataSourceName(driverName, dataSourceName)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	if baseDatabaseName != "" {
+		baseDatabaseName = strings.ToLower(baseDatabaseName) + "_"
+	}
+	now := time.Now().UTC()
+	testingDatabaseName := "testing_" + now.Format("15") + "_" + baseDatabaseName + strings.ToLower(uniqueTestID)
+	testingDatabaseName = regexp.MustCompile(`[^a-z0-9_]`).ReplaceAllString(testingDatabaseName, "_")
 
+	// Open the master database
+	masterDataSourceName, err := setDatabaseInDataSourceName(driverName, dataSourceName, "")
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	masterDB, err := Open(driverName, masterDataSourceName)
+	if err != nil {
+		return nil, errors.New("failed to open master database", err)
+	}
+	defer masterDB.Close()
+
+	// Create the testing database
+	_, err = masterDB.Exec("DROP DATABASE IF EXISTS " + testingDatabaseName)
+	if err != nil {
+		return nil, errors.New("failed to drop database %s", testingDatabaseName, err)
+	}
+	_, err = masterDB.Exec("CREATE DATABASE " + testingDatabaseName)
+	if err != nil {
+		return nil, errors.New("failed to create database %s", testingDatabaseName, err)
+	}
+
+	// Cleanup leftover testing databases, on a best-effort basis.
+	// A testing database is considered leftover if it is more than 1 to 2 hours old.
+	stmt := ""
 	switch driverName {
 	case "mysql":
-		if testingDataSourceName == "" {
-			testingDataSourceName = "root:secret1234@tcp(127.0.0.1:3306)/"
-		}
-		cfg, err := mysql.ParseDSN(testingDataSourceName)
-		if err != nil {
-			return "", "", fmt.Errorf("error parsing data source name %s: %w", testingDataSourceName, err)
-		}
-		cfg.DBName = "" // Remove the database name, if any
-		testingDataSourceName = cfg.FormatDSN()
-		cfg.DBName = dbName // Set the actual datasource name
-		dataSourceName = cfg.FormatDSN()
+		stmt = "SHOW DATABASES"
 	case "pgx":
-		if testingDataSourceName == "" {
-			testingDataSourceName = "postgres://root:secret1234@127.0.0.1:5432/"
-		}
-		cfg, err := pgx.ParseConfig(testingDataSourceName)
-		if err != nil {
-			return "", "", fmt.Errorf("error parsing data source name %s: %w", testingDataSourceName, err)
-		}
-		cfg.Database = "" // Remove the database name, if any
-		testingDataSourceName = cfg.ConnString()
-		cfg.Database = dbName // Set the actual datasource name
-		dataSourceName = cfg.ConnString()
+		stmt = "SELECT datname FROM pg_database"
 	case "mssql":
-		// https://github.com/microsoft/go-mssqldb?tab=readme-ov-file#common-parameters
-		if testingDataSourceName == "" {
-			testingDataSourceName = "user id=root;password=secret1234;server=127.0.0.1;port=1433"
-		}
-		_, cfg, err := msdsn.Parse(testingDataSourceName)
-		if err != nil {
-			return "", "", fmt.Errorf("error parsing data source name %s: %w", testingDataSourceName, err)
-		}
-		delete(cfg, "database") // Remove the database name, if any
-		testingDataSourceName = ""
-		for k, v := range cfg {
-			testingDataSourceName += k + "=" + v + ";"
-		}
-		dataSourceName = testingDataSourceName + "database=" + dbName + ";" // Set the actual datasource name
-	default:
-		return "", "", fmt.Errorf("unsupported driver name: %s", driverName)
+		stmt = "SELECT name FROM sys.databases"
 	}
-	if !testingCreated[driverName+"|"+testFunctionName] {
-		// Create the database
-		rootDB, err := sql.Open(driverName, testingDataSourceName)
-		if err != nil {
-			return "", "", fmt.Errorf("failed to connect to database on localhost: %w", err)
+	rows, err := masterDB.Query(stmt)
+	if err == nil {
+		defer rows.Close()
+		re := regexp.MustCompile(`^testing_[0-2][0-9]_`)
+		var leftoverDatabaseNames []string
+		h14 := now.Add(-time.Hour).Format("15")
+		h15 := now.Format("15")
+		h16 := now.Add(time.Hour).Format("15")
+		for rows.Next() {
+			var databaseName string
+			rows.Scan(&databaseName)
+			if re.MatchString(databaseName) &&
+				!strings.HasPrefix(databaseName, "testing_"+h14+"_") &&
+				!strings.HasPrefix(databaseName, "testing_"+h15+"_") &&
+				!strings.HasPrefix(databaseName, "testing_"+h16+"_") {
+				leftoverDatabaseNames = append(leftoverDatabaseNames, databaseName)
+			}
 		}
-		defer rootDB.Close()
-		_, err = rootDB.Exec("DROP DATABASE IF EXISTS " + dbName)
-		if err != nil {
-			return "", "", fmt.Errorf("failed to drop database %s: %w", dbName, err)
+		for _, databaseName := range leftoverDatabaseNames {
+			masterDB.Exec("DROP DATABASE IF EXISTS " + databaseName)
 		}
-		_, err = rootDB.Exec("CREATE DATABASE " + dbName)
-		if err != nil {
-			return "", "", fmt.Errorf("failed to create database %s: %w", dbName, err)
-		}
-		testingCreated[driverName+"|"+testFunctionName] = true
 	}
-	return dataSourceName, dbName, nil
+	masterDB.Close()
+
+	// Open the new database
+	testingDataSourceName, err = setDatabaseInDataSourceName(driverName, dataSourceName, testingDatabaseName)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	testingDB, err := Open(driverName, testingDataSourceName)
+	if err != nil {
+		return nil, errors.New("failed to open testing database", err)
+	}
+	// Drop the database when it's no longer used
+	testingDB.dropTestingDatabase = func() (err error) {
+		masterDataSourceName, err := setDatabaseInDataSourceName(driverName, dataSourceName, "")
+		if err != nil {
+			return errors.Trace(err)
+		}
+		masterDB, err := Open(driverName, masterDataSourceName)
+		if err != nil {
+			return errors.New("failed to open master database", err)
+		}
+		defer masterDB.Close()
+		_, err = masterDB.Exec("DROP DATABASE IF EXISTS " + testingDatabaseName)
+		if err != nil {
+			return errors.New("failed to drop database %s", testingDatabaseName, err)
+		}
+		return nil
+	}
+
+	// Cache for other microservices running in the same test
+	testingGlobalMutex.Lock()
+	testingDSNs[cacheKey] = testingDataSourceName
+	testingGlobalMutex.Unlock()
+
+	return testingDB, nil
 }
 
 // adjustConnectionLimits adjusts the size of the connection pool based on the ref count.
@@ -303,11 +475,12 @@ func (db *DB) adjustConnectionLimits() {
 	db.DB.SetMaxIdleConns(int(maxIdle))
 }
 
-// Migrate reads all sql/#.*.sql files from the FS, and executes any new migrations in order of their sequence number.
-func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
+// Migrate reads all #.sql files from the FS, and executes any new migrations in order of their file name.
+// The order of execution is guaranteed only within the context of a sequence name.
+func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 	// Init the schema migration table
 	stmt := ""
-	switch db.driver {
+	switch db.driverName {
 	case "mysql":
 		stmt = `
 		CREATE TABLE IF NOT EXISTS sequel_migrations (
@@ -341,16 +514,16 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 			)
 		END`
 	default:
-		return fmt.Errorf("unsupported driver name: %s", db.driver)
+		return errors.New("unsupported driver name: %s", db.driverName)
 	}
 	_, err = db.Exec(stmt)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 
 	// Query for the high watermark
 	var nullableWatermark sql.NullInt32
-	switch db.driver {
+	switch db.driverName {
 	case "mysql":
 		stmt = `SELECT MAX(seq_num) FROM sequel_migrations WHERE seq_name=? AND completed=TRUE`
 	case "pgx":
@@ -358,12 +531,12 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 	case "mssql":
 		stmt = `SELECT MAX(seq_num) FROM sequel_migrations WHERE seq_name=? AND completed=1`
 	default:
-		return fmt.Errorf("unsupported driver name: %s", db.driver)
+		return errors.New("unsupported driver name: %s", db.driverName)
 	}
 	row := db.QueryRow(stmt, sequenceName)
 	err = row.Scan(&nullableWatermark)
 	if err != nil {
-		return err
+		return errors.Trace(err)
 	}
 	watermark := 0
 	if nullableWatermark.Valid {
@@ -371,9 +544,9 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 	}
 
 	// Read migrations from FS
-	files, err := fs.ReadDir("sql")
+	files, err := fs.ReadDir(fileSys, ".")
 	if err != nil {
-		return fmt.Errorf("unable to read sql directory: %w", err)
+		return errors.New("unable to read directory", err)
 	}
 	var sequenceNumbersToRun []int
 	migrations := map[int]string{}
@@ -382,22 +555,19 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 		if !strings.HasSuffix(file.Name(), ".sql") {
 			continue
 		}
-		seqStr, _, ok := strings.Cut(file.Name(), ".")
-		if !ok {
-			return fmt.Errorf("file name should start with a number followed by a dot: %s", file.Name())
-		}
+		seqStr, _, _ := strings.Cut(file.Name(), ".")
 		seqNum, err := strconv.Atoi(seqStr)
 		if err != nil {
-			return fmt.Errorf("file name should start with a number followed by a dot: %s", file.Name())
+			continue
 		}
 		if seqNum <= watermark {
 			// Already migrated
 			continue
 		}
 		sequenceNumbersToRun = append(sequenceNumbersToRun, seqNum)
-		content, err := fs.ReadFile(path.Join("sql", file.Name()))
+		content, err := fs.ReadFile(fileSys, file.Name())
 		if err != nil {
-			return fmt.Errorf("unable to read file %s: %w", path.Join("sql", file.Name()), err)
+			return errors.New("unable to read file %s", file.Name(), err)
 		}
 		migrations[seqNum] = string(content)
 		fileNames[seqNum] = file.Name()
@@ -409,7 +579,7 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 
 		// Insert new migrations into the database first
 		// Ignore duplicate key violations
-		switch db.driver {
+		switch db.driverName {
 		case "mysql":
 			stmt = `INSERT IGNORE INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
 		case "pgx":
@@ -423,15 +593,15 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 				INSERT (seq_name, seq_num)
 				VALUES (src.seq_name, src.seq_num);`
 		default:
-			return fmt.Errorf("unsupported driver name: %s", db.driver)
+			return errors.New("unsupported driver name: %s", db.driverName)
 		}
 		_, err = db.Exec(stmt, sequenceName, seqNum)
 		if err != nil {
-			return err
+			return errors.Trace(err)
 		}
 
 		// See if completed by another process
-		switch db.driver {
+		switch db.driverName {
 		case "mysql":
 			stmt = `SELECT completed FROM sequel_migrations WHERE seq_name=? AND seq_num=?`
 		case "pgx":
@@ -439,13 +609,13 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 		case "mssql":
 			stmt = `SELECT completed FROM sequel_migrations WHERE seq_name=? AND seq_num=?`
 		default:
-			return fmt.Errorf("unsupported driver name: %s", db.driver)
+			return errors.New("unsupported driver name: %s", db.driverName)
 		}
 		row := db.QueryRow(stmt, sequenceName, seqNum)
 		var completed bool
 		err := row.Scan(&completed)
 		if err != nil {
-			return err
+			return errors.Trace(err)
 		}
 		if completed {
 			sequenceNumbersToRun = sequenceNumbersToRun[1:]
@@ -453,7 +623,7 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 		}
 
 		// Try to obtain a lock
-		switch db.driver {
+		switch db.driverName {
 		case "mysql":
 			stmt = `UPDATE sequel_migrations SET locked_until=DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 15 SECOND)
 					WHERE seq_name=? AND seq_num=? AND locked_until<UTC_TIMESTAMP(6) AND completed=FALSE`
@@ -464,15 +634,15 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 			stmt = `UPDATE sequel_migrations SET locked_until=DATEADD(second, 15, SYSUTCDATETIME())
 					WHERE seq_name=? AND seq_num=? AND locked_until<SYSUTCDATETIME() AND completed=0`
 		default:
-			return fmt.Errorf("unsupported driver name: %s", db.driver)
+			return errors.New("unsupported driver name: %s", db.driverName)
 		}
 		res, err := db.Exec(stmt, sequenceName, seqNum)
 		if err != nil {
-			return err
+			return errors.Trace(err)
 		}
 		affected, err := res.RowsAffected()
 		if err != nil {
-			return err
+			return errors.Trace(err)
 		}
 		if affected == 0 {
 			time.Sleep(20 * time.Millisecond)
@@ -483,11 +653,9 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 		statement := migrations[seqNum]
 		lines := strings.Split(statement, "\n")
 		for i := range lines {
-			lines[i], _, _ = strings.Cut(lines[i], "--")
-			lines[i] = strings.TrimRight(lines[i], "\r\t ")
+			lines[i] = strings.TrimRight(lines[i], " \t\r")
 		}
 		statement = strings.Join(lines, "\n")
-		statement = strings.TrimSpace(statement)
 
 		done := make(chan error)
 		go func() {
@@ -496,6 +664,20 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 				if stmt == "" {
 					continue
 				}
+				p := strings.Index(stmt, "-- DRIVER:")
+				if p >= 0 {
+					driver, _, _ := strings.Cut(stmt[p+10:], "\n")
+					if !strings.Contains(driver, db.driverName) {
+						continue
+					}
+				}
+				lines := strings.Split(stmt, "\n")
+				for i := range lines {
+					lines[i], _, _ = strings.Cut(lines[i], "--")
+					lines[i] = strings.TrimSpace(lines[i])
+				}
+				stmt = strings.Join(lines, "\n")
+				stmt = strings.TrimSpace(stmt)
 				_, e := db.Exec(stmt)
 				if e != nil {
 					done <- e
@@ -513,7 +695,7 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 				exit = true
 			case <-time.After(5 * time.Second):
 				// Extend the lock while the migration is in progress
-				switch db.driver {
+				switch db.driverName {
 				case "mysql":
 					stmt = `UPDATE sequel_migrations SET locked_until=DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 15 SECOND) WHERE seq_name=? AND seq_num=?`
 				case "pgx":
@@ -521,7 +703,7 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 				case "mssql":
 					stmt = `UPDATE sequel_migrations SET locked_until=DATEADD(second, 15, SYSUTCDATETIME()) WHERE seq_name=? AND seq_num=?`
 				default:
-					return fmt.Errorf("unsupported driver name: %s", db.driver)
+					return errors.New("unsupported driver name: %s", db.driverName)
 				}
 				_, err = db.Exec(stmt, sequenceName, seqNum)
 				if err != nil {
@@ -532,7 +714,7 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 
 		if err != nil {
 			// Release the lock
-			switch db.driver {
+			switch db.driverName {
 			case "mysql":
 				stmt = `UPDATE sequel_migrations SET locked_until=UTC_TIMESTAMP(6) WHERE seq_name=? AND seq_num=?`
 			case "pgx":
@@ -540,14 +722,14 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 			case "mssql":
 				stmt = `UPDATE sequel_migrations SET locked_until=SYSUTCDATETIME() WHERE seq_name=? AND seq_num=?`
 			default:
-				return fmt.Errorf("unsupported driver name: %s", db.driver)
+				return errors.New("unsupported driver name: %s", db.driverName)
 			}
 			_, _ = db.Exec(stmt, sequenceName, seqNum)
-			return fmt.Errorf("error running migration %s: %w", fileNames[seqNum], err)
+			return errors.New("error running migration %s", fileNames[seqNum], err)
 		}
 
 		// Mark as complete
-		switch db.driver {
+		switch db.driverName {
 		case "mysql":
 			stmt = `UPDATE sequel_migrations SET locked_until=UTC_TIMESTAMP(6), completed_on=UTC_TIMESTAMP(6), completed=TRUE WHERE seq_name=? AND seq_num=?`
 		case "pgx":
@@ -555,22 +737,86 @@ func (db *DB) Migrate(sequenceName string, fs FS) (err error) {
 		case "mssql":
 			stmt = `UPDATE sequel_migrations SET locked_until=SYSUTCDATETIME(), completed_on=SYSUTCDATETIME(), completed=1 WHERE seq_name=? AND seq_num=?`
 		default:
-			return fmt.Errorf("unsupported driver name: %s", db.driver)
+			return errors.New("unsupported driver name: %s", db.driverName)
 		}
 		_, err = db.Exec(stmt, sequenceName, seqNum)
 		if err != nil {
-			return err
+			return errors.Trace(err)
 		}
 		sequenceNumbersToRun = sequenceNumbersToRun[1:]
 	}
 	return nil
 }
 
-// ArgPlaceholdersToPGX replaces the ? arg placeholders in a SQL statement to $1, $2 etc which is the format expected by Postgres.
-func ArgPlaceholdersToPGX(stmt string) string {
-	parts := strings.Split(stmt, "?")
-	for i := 0; i < len(parts)-1; i++ {
-		parts[i] += fmt.Sprintf("$%d", i+1)
+// ConformArgPlaceholders replaces the ? arg placeholders in a SQL statement to $1, $2 etc. for a Postgres driver.
+func (db *DB) ConformArgPlaceholders(stmt string) string {
+	if db.driverName != "pgx" {
+		return stmt
 	}
-	return strings.Join(parts, "")
+	n := strings.Count(stmt, "?")
+	if n == 0 {
+		return stmt
+	}
+	var sb strings.Builder
+	sb.Grow(len(stmt) + n*3)
+	argIndex := 1
+	for {
+		i := strings.Index(stmt, "?")
+		if i < 0 {
+			sb.WriteString(stmt)
+			break
+		}
+		sb.WriteString(stmt[:i])
+		sb.WriteString("$")
+		sb.WriteString(strconv.Itoa(argIndex))
+		argIndex++
+		stmt = stmt[i+1:]
+	}
+	return sb.String()
+}
+
+// NowUTC is a SQL statement that returns the database server time in UTC.
+func (db *DB) NowUTC() string {
+	switch db.driverName {
+	case "mysql":
+		return "UTC_TIMESTAMP(3)"
+	case "pgx":
+		return "(NOW() AT TIME ZONE 'UTC')"
+	case "mssql":
+		return "SYSUTCDATETIME()"
+	default:
+		return ""
+	}
+}
+
+func hashStr(x string) string {
+	h := sha256.New()
+	h.Write([]byte(x))
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum)
+}
+
+// RegexpTextSearch is a SQL statement that performs a REGEXP_LIKE search on multiple columns.
+// The statement includes a single argument placeholder ? that should be filled with a valid regular expression.
+func (db *DB) RegexpTextSearch(searchableColumns ...string) string {
+	concatenated := ""
+	switch len(searchableColumns) {
+	case 0:
+		concatenated = "''"
+	case 1:
+		concatenated = searchableColumns[0]
+	default:
+		concatenated = "CONCAT_WS(' '," + strings.Join(searchableColumns, ",") + ")"
+	}
+	switch db.DriverName() {
+	case "mysql":
+		return concatenated + " REGEXP ?"
+	case "pgx":
+		return "REGEXP_LIKE(" + concatenated + ", ?, 'i')"
+	case "mssql":
+		// The database compatibility level must be set to 170 or higher
+		return "REGEXP_LIKE(" + concatenated + ", ?, 'i')"
+	default:
+		return ""
+	}
 }

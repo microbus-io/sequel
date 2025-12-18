@@ -1,0 +1,39 @@
+# https://docs.github.com/en/actions/use-cases-and-examples/building-and-testing/building-and-testing-go
+
+name: Test
+on:
+  pull_request:
+    types: [opened, reopened, edited]
+  push:
+    branches:
+      - "main"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      mysql:
+        image: mysql:5.7
+        env:
+          MYSQL_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+    
+    name: Run tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v4
+        with:
+          go-version-file: 'go.mod'
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Go version
+        run: go version
+      - name: Go test
+        run: go test -count 1 -timeout 30s -cover ./...

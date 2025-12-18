@@ -1,0 +1,5 @@
+*.local.*
+/main/main
+/main/__debug_bin*
+.DS_Store
+!/codegen/bundle/*

@@ -1,5 +1,5 @@
 /*
-Copyright (c) yyyy Microbus LLC and various contributors
+Copyright (c) 2025-yyyy Microbus LLC and various contributors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,9 @@ limitations under the License.
 
 //go:generate go run github.com/microbus-io/copyrighter
 // - /testdata/sql/*.sql
+// - /codegen/bundle/*
 // - .*
+// - resources/*
 
 package sequel
 

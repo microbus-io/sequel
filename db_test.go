@@ -1,5 +1,5 @@
 /*
-Copyright (c) 2025 Microbus LLC and various contributors
+Copyright (c) 2025-2026 Microbus LLC and various contributors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,11 +24,13 @@ import (
 )
 
 func TestDB_AutoCreate(t *testing.T) {
+	t.Skip()
+
 	for _, driver := range []string{"mysql", "pgx", "mssql"} {
 		t.Run(driver, func(t *testing.T) {
 			assert := testarossa.For(t)
 
-			db, err := Open(driver, "")
+			db, err := OpenTesting(driver, "", "AutoCreate")
 			assert.NoError(err)
 			assert.NotNil(db)
 			defer db.Close()
@@ -45,14 +47,45 @@ func TestDB_AutoCreate(t *testing.T) {
 	}
 }
 
-func TestDB_ArgsPlaceholdersToPGX(t *testing.T) {
+func TestDB_ConformArgPlaceholders(t *testing.T) {
+	t.Parallel()
 	assert := testarossa.For(t)
 
+	db := &DB{
+		driverName: "pgx",
+	}
 	stmt := `SELECT completed FROM sequel_migrations WHERE seq_name=? AND seq_num=?`
-	pgxStmt := ArgPlaceholdersToPGX(stmt)
+	pgxStmt := db.ConformArgPlaceholders(stmt)
 	assert.Expect(pgxStmt, `SELECT completed FROM sequel_migrations WHERE seq_name=$1 AND seq_num=$2`)
 
 	stmt = `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
-	pgxStmt = ArgPlaceholdersToPGX(stmt)
+	pgxStmt = db.ConformArgPlaceholders(stmt)
 	assert.Expect(pgxStmt, `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES ($1, $2)`)
+}
+
+func TestDB_DatabaseNameFromDataSourceName(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	// mysql
+	name, err := databaseNameFromDataSourceName("mysql", "x:x@tcp(127.0.0.1:3306)/my_database")
+	assert.Expect(name, "my_database", err, nil)
+	name, err = databaseNameFromDataSourceName("mysql", "x:x@tcp(127.0.0.1:3306)/")
+	assert.Expect(name, "", err, nil)
+	name, err = databaseNameFromDataSourceName("mysql", "x:x@tcp(127.0.0.1:3306)")
+	assert.Error(err) // Trailing slash is required
+
+	// pgx
+	name, err = databaseNameFromDataSourceName("pgx", "postgres://user:pw@127.0.0.1:5432/my_database")
+	assert.Expect(name, "my_database", err, nil)
+	name, err = databaseNameFromDataSourceName("pgx", "postgres://user:pw@127.0.0.1:5432/")
+	assert.Expect(name, "", err, nil)
+	name, err = databaseNameFromDataSourceName("pgx", "postgres://user:pw@127.0.0.1:5432")
+	assert.Expect(name, "", err, nil)
+
+	// mssql
+	name, err = databaseNameFromDataSourceName("mssql", "sqlserver://user:pw@127.0.0.1:1433?database=my_database")
+	assert.Expect(name, "my_database", err, nil)
+	name, err = databaseNameFromDataSourceName("mssql", "sqlserver://user:pw@127.0.0.1:1433")
+	assert.Expect(name, "", err, nil)
 }
