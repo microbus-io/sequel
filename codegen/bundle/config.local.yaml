@@ -1,4 +1,4 @@
 all:
   SQLDataSourceName: root:root@tcp(127.0.0.1:3306)/sequel
   # SQLDataSourceName: postgres://postgres:postgres@127.0.0.1:5432/sequel
-  # SQLDataSourceName: sqlserver://sa:sa@127.0.0.1:1433?database=sequel
+  # SQLDataSourceName: sqlserver://sa:sysadmin@127.0.0.1:1433?database=sequel
