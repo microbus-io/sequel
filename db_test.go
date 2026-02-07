@@ -43,7 +43,7 @@ func TestDB_AutoCreate(t *testing.T) {
 			}
 			defer db.Close()
 
-			err = db.Migrate("auto_create", testdata.FS)
+			err = db.Migrate(t.Name(), testdata.FS)
 			assert.NoError(err)
 
 			var count int
