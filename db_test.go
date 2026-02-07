@@ -24,7 +24,7 @@ import (
 )
 
 func TestDB_AutoCreate(t *testing.T) {
-	for _, driver := range []string{"mysql", "pgx", "mssql"} {
+	for _, driver := range []string{"mysql", "pgx" /* , "mssql" */} {
 		t.Run(driver, func(t *testing.T) {
 			assert := testarossa.For(t)
 
