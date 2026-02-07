@@ -40,11 +40,11 @@ jobs:
         image: mcr.microsoft.com/mssql/server:2025-latest
         env:
           ACCEPT_EULA: "Y"
-          MSSQL_SA_PASSWORD: sysadmin
+          MSSQL_SA_PASSWORD: sa_SA_54
         ports:
           - 1433:1433
         options: >-
-          --health-cmd "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P sysadmin -Q 'SELECT 1'"
+          --health-cmd "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P sa_SA_54 -Q 'SELECT 1'"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 10
