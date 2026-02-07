@@ -306,7 +306,7 @@ If a data source name is not provided, the following defaults are used based on 
   - (empty): root:root@tcp(127.0.0.1:3306)/
   - mysql: root:root@tcp(127.0.0.1:3306)/
   - pgx: postgres://postgres:postgres@127.0.0.1:5432/
-  - mssql: sqlserver://sa:sa_SA_54@127.0.0.1:1433
+  - mssql: sqlserver://sa:Password123@127.0.0.1:1433
 */
 func OpenTesting(driverName string, dataSourceName string, uniqueTestID string) (db *DB, err error) {
 	// Set default connection to localhost
@@ -317,7 +317,7 @@ func OpenTesting(driverName string, dataSourceName string, uniqueTestID string) 
 		case "pgx":
 			dataSourceName = "postgres://postgres:postgres@127.0.0.1:5432/"
 		case "mssql":
-			dataSourceName = "sqlserver://sa:sa_SA_54@127.0.0.1:1433"
+			dataSourceName = "sqlserver://sa:Password123@127.0.0.1:1433"
 		default:
 			return nil, errors.New("unsupported driver name: %s", driverName)
 		}
