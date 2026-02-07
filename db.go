@@ -487,8 +487,8 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			seq_name VARCHAR(256) NOT NULL,
 			seq_num INT NOT NULL,
 			completed BOOL NOT NULL DEFAULT FALSE,
-			completed_on DATETIME(6),
-			locked_until DATETIME(6) NOT NULL DEFAULT UTC_TIMESTAMP(6),
+			completed_on DATETIME(3),
+			locked_before DATETIME(3) NOT NULL DEFAULT UTC_TIMESTAMP(3),
 			PRIMARY KEY (seq_name, seq_num)
 		)`
 	case "pgx":
@@ -497,8 +497,8 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			seq_name VARCHAR(256) NOT NULL,
 			seq_num INT NOT NULL,
 			completed BOOL NOT NULL DEFAULT FALSE,
-			completed_on TIMESTAMP,
-			locked_until TIMESTAMP NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+			completed_on TIMESTAMP(3),
+			locked_before TIMESTAMP(3) NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
 			PRIMARY KEY (seq_name, seq_num)
 		)`
 	case "mssql":
@@ -508,8 +508,8 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 				seq_name VARCHAR(256) NOT NULL,
 				seq_num INT NOT NULL,
 				completed BIT NOT NULL DEFAULT 0,
-				completed_on DATETIME2,
-				locked_until DATETIME2 NOT NULL DEFAULT SYSUTCDATETIME(),
+				completed_on DATETIME2(3),
+				locked_before DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
 				PRIMARY KEY (seq_name, seq_num)
 			)
 		END`
@@ -625,14 +625,14 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		// Try to obtain a lock
 		switch db.driverName {
 		case "mysql":
-			stmt = `UPDATE sequel_migrations SET locked_until=DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 15 SECOND)
-					WHERE seq_name=? AND seq_num=? AND locked_until<UTC_TIMESTAMP(6) AND completed=FALSE`
+			stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 15 SECOND)
+					WHERE seq_name=? AND seq_num=? AND locked_before<UTC_TIMESTAMP(3) AND completed=FALSE`
 		case "pgx":
-			stmt = `UPDATE sequel_migrations SET locked_until=((NOW() + INTERVAL '15 seconds') AT TIME ZONE 'UTC')
-					WHERE seq_name=$1 AND seq_num=$2 AND locked_until<(NOW() AT TIME ZONE 'UTC') AND completed=FALSE`
+			stmt = `UPDATE sequel_migrations SET locked_before=((NOW() + INTERVAL '15 seconds') AT TIME ZONE 'UTC')
+					WHERE seq_name=$1 AND seq_num=$2 AND locked_before<(NOW() AT TIME ZONE 'UTC') AND completed=FALSE`
 		case "mssql":
-			stmt = `UPDATE sequel_migrations SET locked_until=DATEADD(second, 15, SYSUTCDATETIME())
-					WHERE seq_name=? AND seq_num=? AND locked_until<SYSUTCDATETIME() AND completed=0`
+			stmt = `UPDATE sequel_migrations SET locked_before=DATEADD(second, 15, SYSUTCDATETIME())
+					WHERE seq_name=? AND seq_num=? AND locked_before<SYSUTCDATETIME() AND completed=0`
 		default:
 			return errors.New("unsupported driver name: %s", db.driverName)
 		}
@@ -697,11 +697,11 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 				// Extend the lock while the migration is in progress
 				switch db.driverName {
 				case "mysql":
-					stmt = `UPDATE sequel_migrations SET locked_until=DATE_ADD(UTC_TIMESTAMP(6), INTERVAL 15 SECOND) WHERE seq_name=? AND seq_num=?`
+					stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 15 SECOND) WHERE seq_name=? AND seq_num=?`
 				case "pgx":
-					stmt = `UPDATE sequel_migrations SET locked_until=((NOW() + INTERVAL '15 seconds') AT TIME ZONE 'UTC') WHERE seq_name=$1 AND seq_num=$2`
+					stmt = `UPDATE sequel_migrations SET locked_before=((NOW() + INTERVAL '15 seconds') AT TIME ZONE 'UTC') WHERE seq_name=$1 AND seq_num=$2`
 				case "mssql":
-					stmt = `UPDATE sequel_migrations SET locked_until=DATEADD(second, 15, SYSUTCDATETIME()) WHERE seq_name=? AND seq_num=?`
+					stmt = `UPDATE sequel_migrations SET locked_before=DATEADD(second, 15, SYSUTCDATETIME()) WHERE seq_name=? AND seq_num=?`
 				default:
 					return errors.New("unsupported driver name: %s", db.driverName)
 				}
@@ -716,11 +716,11 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			// Release the lock
 			switch db.driverName {
 			case "mysql":
-				stmt = `UPDATE sequel_migrations SET locked_until=UTC_TIMESTAMP(6) WHERE seq_name=? AND seq_num=?`
+				stmt = `UPDATE sequel_migrations SET locked_before=UTC_TIMESTAMP(3) WHERE seq_name=? AND seq_num=?`
 			case "pgx":
-				stmt = `UPDATE sequel_migrations SET locked_until=(NOW() AT TIME ZONE 'UTC') WHERE seq_name=$1 AND seq_num=$2`
+				stmt = `UPDATE sequel_migrations SET locked_before=(NOW() AT TIME ZONE 'UTC') WHERE seq_name=$1 AND seq_num=$2`
 			case "mssql":
-				stmt = `UPDATE sequel_migrations SET locked_until=SYSUTCDATETIME() WHERE seq_name=? AND seq_num=?`
+				stmt = `UPDATE sequel_migrations SET locked_before=SYSUTCDATETIME() WHERE seq_name=? AND seq_num=?`
 			default:
 				return errors.New("unsupported driver name: %s", db.driverName)
 			}
@@ -731,11 +731,11 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		// Mark as complete
 		switch db.driverName {
 		case "mysql":
-			stmt = `UPDATE sequel_migrations SET locked_until=UTC_TIMESTAMP(6), completed_on=UTC_TIMESTAMP(6), completed=TRUE WHERE seq_name=? AND seq_num=?`
+			stmt = `UPDATE sequel_migrations SET locked_before=UTC_TIMESTAMP(3), completed_on=UTC_TIMESTAMP(3), completed=TRUE WHERE seq_name=? AND seq_num=?`
 		case "pgx":
-			stmt = `UPDATE sequel_migrations SET locked_until=(NOW() AT TIME ZONE 'UTC'), completed_on=(NOW() AT TIME ZONE 'UTC'), completed=TRUE WHERE seq_name=$1 AND seq_num=$2`
+			stmt = `UPDATE sequel_migrations SET locked_before=(NOW() AT TIME ZONE 'UTC'), completed_on=(NOW() AT TIME ZONE 'UTC'), completed=TRUE WHERE seq_name=$1 AND seq_num=$2`
 		case "mssql":
-			stmt = `UPDATE sequel_migrations SET locked_until=SYSUTCDATETIME(), completed_on=SYSUTCDATETIME(), completed=1 WHERE seq_name=? AND seq_num=?`
+			stmt = `UPDATE sequel_migrations SET locked_before=SYSUTCDATETIME(), completed_on=SYSUTCDATETIME(), completed=1 WHERE seq_name=? AND seq_num=?`
 		default:
 			return errors.New("unsupported driver name: %s", db.driverName)
 		}

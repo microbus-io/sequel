@@ -14,7 +14,7 @@ jobs:
 
     services:
       mysql:
-        image: mysql:5.7
+        image: mysql:9.6
         env:
           MYSQL_ROOT_PASSWORD: root
         ports:
@@ -24,7 +24,31 @@ jobs:
           --health-interval=10s
           --health-timeout=5s
           --health-retries=3
-    
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      sqlserver:
+        image: mcr.microsoft.com/mssql/server:2025-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: sa
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P sa -Q 'SELECT 1'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
     name: Run tests
     steps:
       - uses: actions/checkout@v4
