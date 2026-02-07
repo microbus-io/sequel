@@ -488,7 +488,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			seq_num INT NOT NULL,
 			completed BOOL NOT NULL DEFAULT FALSE,
 			completed_on DATETIME(3),
-			locked_before DATETIME(3) NOT NULL DEFAULT UTC_TIMESTAMP(3),
+			locked_before DATETIME(3) NOT NULL DEFAULT (UTC_TIMESTAMP(3)),
 			PRIMARY KEY (seq_name, seq_num)
 		)`
 	case "pgx":
@@ -509,7 +509,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 				seq_num INT NOT NULL,
 				completed BIT NOT NULL DEFAULT 0,
 				completed_on DATETIME2(3),
-				locked_before DATETIME2(3) NOT NULL DEFAULT SYSUTCDATETIME(),
+				locked_before DATETIME2(3) NOT NULL DEFAULT (SYSUTCDATETIME()),
 				PRIMARY KEY (seq_name, seq_num)
 			)
 		END`
