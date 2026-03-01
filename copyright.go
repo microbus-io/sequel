@@ -16,9 +16,7 @@ limitations under the License.
 
 //go:generate go run github.com/microbus-io/copyrighter
 // - /testdata/sql/*.sql
-// - /codegen/bundle/*
 // - .*
-// - resources/*
 
 package sequel
 

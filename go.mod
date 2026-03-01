@@ -6,11 +6,9 @@ require (
 	github.com/denisenkom/go-mssqldb v0.12.3
 	github.com/go-sql-driver/mysql v1.9.3
 	github.com/jackc/pgx/v5 v5.8.0
-	github.com/microbus-io/codegen v1.0.0
 	github.com/microbus-io/copyrighter v1.3.0
 	github.com/microbus-io/errors v1.0.0
 	github.com/microbus-io/testarossa v0.7.3
-	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -21,9 +19,6 @@ require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
-	github.com/kr/pretty v0.3.1 // indirect
-	github.com/microbus-io/boolexp v1.0.0 // indirect
-	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	golang.org/x/crypto v0.47.0 // indirect
 	golang.org/x/net v0.49.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect

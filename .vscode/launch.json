@@ -12,14 +12,5 @@
 			"program": "${workspaceFolder}/main",
 			"cwd": "${workspaceFolder}/main"
 		},
-		{
-			"name": "Codegen",
-			"type": "go",
-			"request": "launch",
-			"mode": "auto",
-			"program": "${workspaceFolder}/codegen",
-			"cwd": "${workspaceFolder}/book",
-			"env": {"CODEGEN": "-f -v"}
-		},
     ]
 }
