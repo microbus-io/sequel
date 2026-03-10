@@ -17,6 +17,7 @@ limitations under the License.
 package sequel
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -176,9 +177,87 @@ func (db *DB) Close() (err error) {
 	return errors.Trace(err)
 }
 
+// Exec shadows sql.DB.Exec and conforms arg placeholders for the driver.
+func (db *DB) Exec(query string, args ...any) (sql.Result, error) {
+	query, err := db.UnpackQuery(query)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return db.DB.Exec(query, args...)
+}
+
+// ExecContext shadows sql.DB.ExecContext and conforms arg placeholders for the driver.
+func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
+	query, err := db.UnpackQuery(query)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return db.DB.ExecContext(ctx, query, args...)
+}
+
+// Query shadows sql.DB.Query and conforms arg placeholders for the driver.
+func (db *DB) Query(query string, args ...any) (*sql.Rows, error) {
+	query, err := db.UnpackQuery(query)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return db.DB.Query(query, args...)
+}
+
+// QueryContext shadows sql.DB.QueryContext and conforms arg placeholders for the driver.
+func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+	query, err := db.UnpackQuery(query)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return db.DB.QueryContext(ctx, query, args...)
+}
+
+// QueryRow shadows sql.DB.QueryRow and conforms arg placeholders for the driver.
+func (db *DB) QueryRow(query string, args ...any) *sql.Row {
+	query, _ = db.UnpackQuery(query)
+	return db.DB.QueryRow(query, args...)
+}
+
+// QueryRowContext shadows sql.DB.QueryRowContext and conforms arg placeholders for the driver.
+func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
+	query, _ = db.UnpackQuery(query)
+	return db.DB.QueryRowContext(ctx, query, args...)
+}
+
+// Prepare shadows sql.DB.Prepare and conforms arg placeholders for the driver.
+func (db *DB) Prepare(query string) (*sql.Stmt, error) {
+	query, err := db.UnpackQuery(query)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return db.DB.Prepare(query)
+}
+
+// PrepareContext shadows sql.DB.PrepareContext and conforms arg placeholders for the driver.
+func (db *DB) PrepareContext(ctx context.Context, query string) (*sql.Stmt, error) {
+	query, err := db.UnpackQuery(query)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return db.DB.PrepareContext(ctx, query)
+}
+
 // DriverName is the name of the driver: "mysql", "pgx" or "mssql".
 func (db *DB) DriverName() string {
 	return db.driverName
+}
+
+// UnpackQuery expands virtual functions (e.g. NOW_UTC(), REGEXP_TEXT_SEARCH()) into
+// driver-specific SQL expressions, and conforms arg placeholders
+// to the syntax expected by the driver (e.g. ? to $1, $2 for PostgreSQL).
+func (db *DB) UnpackQuery(query string) (string, error) {
+	query, err := expandVirtualFuncs(db.driverName, query)
+	if err != nil {
+		return "", errors.Trace(err)
+	}
+	query = db.conformPlaceholders(query)
+	return query, nil
 }
 
 // databaseNameFromDataSourceName extracts the database name part of the data source name.
@@ -748,8 +827,9 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 	return nil
 }
 
-// ConformArgPlaceholders replaces the ? arg placeholders in a SQL statement to $1, $2 etc. for a Postgres driver.
-func (db *DB) ConformArgPlaceholders(stmt string) string {
+// conformPlaceholders replaces the ? arg placeholders in a SQL statement to $1, $2 etc. for a Postgres driver.
+// Question marks inside quoted strings (single or double quotes) are left as-is.
+func (db *DB) conformPlaceholders(stmt string) string {
 	if db.driverName != "pgx" {
 		return stmt
 	}
@@ -757,25 +837,68 @@ func (db *DB) ConformArgPlaceholders(stmt string) string {
 	if n == 0 {
 		return stmt
 	}
+	// Fast path: no quotes means no risk of replacing inside strings
+	if !strings.ContainsAny(stmt, `'"`) {
+		var sb strings.Builder
+		sb.Grow(len(stmt) + n*3)
+		argIndex := 1
+		for {
+			i := strings.Index(stmt, "?")
+			if i < 0 {
+				sb.WriteString(stmt)
+				break
+			}
+			sb.WriteString(stmt[:i])
+			sb.WriteString("$")
+			sb.WriteString(strconv.Itoa(argIndex))
+			argIndex++
+			stmt = stmt[i+1:]
+		}
+		return sb.String()
+	}
+	// Slow path: scan character by character to skip quoted regions
 	var sb strings.Builder
 	sb.Grow(len(stmt) + n*3)
 	argIndex := 1
-	for {
-		i := strings.Index(stmt, "?")
-		if i < 0 {
-			sb.WriteString(stmt)
-			break
+	for i := 0; i < len(stmt); i++ {
+		ch := stmt[i]
+		if ch == '\'' || ch == '"' {
+			// Copy everything up to and including the closing quote
+			quote := ch
+			sb.WriteByte(ch)
+			i++
+			for i < len(stmt) {
+				sb.WriteByte(stmt[i])
+				if stmt[i] == quote {
+					break
+				}
+				i++
+			}
+		} else if ch == '?' {
+			sb.WriteString("$")
+			sb.WriteString(strconv.Itoa(argIndex))
+			argIndex++
+		} else {
+			sb.WriteByte(ch)
 		}
-		sb.WriteString(stmt[:i])
-		sb.WriteString("$")
-		sb.WriteString(strconv.Itoa(argIndex))
-		argIndex++
-		stmt = stmt[i+1:]
 	}
 	return sb.String()
 }
 
-// NowUTC is a SQL statement that returns the database server time in UTC.
+func hashStr(x string) string {
+	h := sha256.New()
+	h.Write([]byte(x))
+	sum := h.Sum(nil)
+	return hex.EncodeToString(sum)
+}
+
+// Deprecated: ConformArgPlaceholders is applied automatically by the query shadow methods.
+// Use ? placeholders directly in queries passed to Exec, Query, QueryRow, and Prepare.
+func (db *DB) ConformArgPlaceholders(stmt string) string {
+	return db.conformPlaceholders(stmt)
+}
+
+// Deprecated: Use the NOW_UTC() virtual function directly in queries instead.
 func (db *DB) NowUTC() string {
 	switch db.driverName {
 	case "mysql":
@@ -789,15 +912,7 @@ func (db *DB) NowUTC() string {
 	}
 }
 
-func hashStr(x string) string {
-	h := sha256.New()
-	h.Write([]byte(x))
-	sum := h.Sum(nil)
-	return hex.EncodeToString(sum)
-}
-
-// RegexpTextSearch is a SQL statement that performs a REGEXP_LIKE search on multiple columns.
-// The statement includes a single argument placeholder ? that should be filled with a valid regular expression.
+// Deprecated: Use the REGEXP_TEXT_SEARCH() virtual function directly in queries instead.
 func (db *DB) RegexpTextSearch(searchableColumns ...string) string {
 	concatenated := ""
 	switch len(searchableColumns) {
@@ -820,3 +935,4 @@ func (db *DB) RegexpTextSearch(searchableColumns ...string) string {
 		return ""
 	}
 }
+

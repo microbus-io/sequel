@@ -77,6 +77,40 @@ func TestDB_ConformArgPlaceholders(t *testing.T) {
 	assert.Expect(pgxStmt, `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES ($1, $2)`)
 }
 
+func TestDB_ConformArgPlaceholders_Quotes(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := &DB{
+		driverName: "pgx",
+	}
+
+	// Single-quoted string containing ? should not be replaced
+	stmt := `SELECT * FROM users WHERE name='What?' AND id=?`
+	pgxStmt := db.ConformArgPlaceholders(stmt)
+	assert.Expect(pgxStmt, `SELECT * FROM users WHERE name='What?' AND id=$1`)
+
+	// Double-quoted identifier containing ? should not be replaced
+	stmt = `SELECT * FROM "is_this?" WHERE id=?`
+	pgxStmt = db.ConformArgPlaceholders(stmt)
+	assert.Expect(pgxStmt, `SELECT * FROM "is_this?" WHERE id=$1`)
+
+	// Multiple quoted regions with ? outside
+	stmt = `INSERT INTO t (a, b, c) VALUES ('hello?', ?, "col?")`
+	pgxStmt = db.ConformArgPlaceholders(stmt)
+	assert.Expect(pgxStmt, `INSERT INTO t (a, b, c) VALUES ('hello?', $1, "col?")`)
+
+	// No quotes falls back to fast path
+	stmt = `SELECT * FROM t WHERE a=? AND b=?`
+	pgxStmt = db.ConformArgPlaceholders(stmt)
+	assert.Expect(pgxStmt, `SELECT * FROM t WHERE a=$1 AND b=$2`)
+
+	// Only quoted ?, no unquoted ?
+	stmt = `SELECT * FROM t WHERE name='really?'`
+	pgxStmt = db.ConformArgPlaceholders(stmt)
+	assert.Expect(pgxStmt, `SELECT * FROM t WHERE name='really?'`)
+}
+
 func TestDB_DatabaseNameFromDataSourceName(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)
@@ -250,6 +284,180 @@ func TestDB_RegexpTextSearch(t *testing.T) {
 	// Unknown driver
 	db = &DB{driverName: "unknown"}
 	assert.Equal("", db.RegexpTextSearch("name"))
+}
+
+func newTestDB(driverName string) *DB {
+	return &DB{
+		driverName: driverName,
+	}
+}
+
+func TestDB_UnpackQuery_NowUTC(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB("mysql")
+	q, err := db.UnpackQuery("UPDATE t SET updated_at=NOW_UTC() WHERE id=?")
+	assert.NoError(err)
+	assert.Equal("UPDATE t SET updated_at=UTC_TIMESTAMP(3) WHERE id=?", q)
+
+	db = newTestDB("pgx")
+	q, err = db.UnpackQuery("UPDATE t SET updated_at=NOW_UTC() WHERE id=?")
+	assert.NoError(err)
+	assert.Equal("UPDATE t SET updated_at=(NOW() AT TIME ZONE 'UTC') WHERE id=$1", q)
+
+	db = newTestDB("mssql")
+	q, err = db.UnpackQuery("UPDATE t SET updated_at=NOW_UTC() WHERE id=?")
+	assert.NoError(err)
+	assert.Equal("UPDATE t SET updated_at=SYSUTCDATETIME() WHERE id=?", q)
+
+	// Case insensitive
+	db = newTestDB("mysql")
+	q, err = db.UnpackQuery("SELECT now_utc()")
+	assert.NoError(err)
+	assert.Equal("SELECT UTC_TIMESTAMP(3)", q)
+
+}
+
+func TestDB_UnpackQuery_RegexpTextSearch(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB("mysql")
+	q, err := db.UnpackQuery("SELECT * FROM t WHERE REGEXP_TEXT_SEARCH(? IN name, email)")
+	assert.NoError(err)
+	assert.Equal("SELECT * FROM t WHERE CONCAT_WS(' ',name,email) REGEXP ?", q)
+
+	db = newTestDB("pgx")
+	q, err = db.UnpackQuery("SELECT * FROM t WHERE REGEXP_TEXT_SEARCH(? IN name)")
+	assert.NoError(err)
+	assert.Equal("SELECT * FROM t WHERE REGEXP_LIKE(name, $1, 'i')", q)
+
+	// Missing IN
+	db = newTestDB("mysql")
+	_, err = db.UnpackQuery("SELECT * FROM t WHERE REGEXP_TEXT_SEARCH(name, email)")
+	assert.Error(err)
+}
+
+func TestDB_UnpackQuery_DateAddMillis(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB("mysql")
+	q, err := db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, 5000)")
+	assert.NoError(err)
+	assert.Equal("SELECT DATE_ADD(created_at, INTERVAL (5000) * 1000 MICROSECOND)", q)
+
+	db = newTestDB("pgx")
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, ?)")
+	assert.NoError(err)
+	assert.Equal("SELECT created_at + MAKE_INTERVAL(secs => ($1) / 1000.0)", q)
+
+	db = newTestDB("mssql")
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, 5000)")
+	assert.NoError(err)
+	assert.Equal("SELECT DATEADD(MILLISECOND, 5000, created_at)", q)
+
+	// Missing comma
+	db = newTestDB("mysql")
+	_, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at)")
+	assert.Error(err)
+}
+
+func TestDB_UnpackQuery_DateDiffMillis(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB("mysql")
+	q, err := db.UnpackQuery("SELECT DATE_DIFF_MILLIS(updated_at, created_at)")
+	assert.NoError(err)
+	assert.Equal("SELECT TIMESTAMPDIFF(MICROSECOND, created_at, updated_at) / 1000.0", q)
+
+	db = newTestDB("pgx")
+	q, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(updated_at, created_at)")
+	assert.NoError(err)
+	assert.Equal("SELECT EXTRACT(EPOCH FROM (updated_at - created_at)) * 1000.0", q)
+
+	db = newTestDB("mssql")
+	q, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(updated_at, created_at)")
+	assert.NoError(err)
+	assert.Equal("SELECT DATEDIFF_BIG(MILLISECOND, created_at, updated_at)", q)
+
+	// Missing comma
+	db = newTestDB("mysql")
+	_, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(created_at)")
+	assert.Error(err)
+}
+
+func TestDB_UnpackQuery_LimitOffset(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB("mysql")
+	q, err := db.UnpackQuery("SELECT * FROM users ORDER BY id LIMIT_OFFSET(10, 0)")
+	assert.NoError(err)
+	assert.Equal("SELECT * FROM users ORDER BY id LIMIT 10 OFFSET 0", q)
+
+	db = newTestDB("pgx")
+	q, err = db.UnpackQuery("SELECT * FROM users ORDER BY id LIMIT_OFFSET(?, ?)")
+	assert.NoError(err)
+	assert.Equal("SELECT * FROM users ORDER BY id LIMIT $1 OFFSET $2", q)
+
+	db = newTestDB("mssql")
+	q, err = db.UnpackQuery("SELECT * FROM users ORDER BY id LIMIT_OFFSET(10, 20)")
+	assert.NoError(err)
+	assert.Equal("SELECT * FROM users ORDER BY id OFFSET 20 ROWS FETCH NEXT 10 ROWS ONLY", q)
+
+	db = newTestDB("mssql")
+	q, err = db.UnpackQuery("SELECT * FROM users ORDER BY id LIMIT_OFFSET(?, ?)")
+	assert.NoError(err)
+	assert.Equal("SELECT * FROM users ORDER BY id OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", q)
+
+	// Missing comma
+	db = newTestDB("mysql")
+	_, err = db.UnpackQuery("SELECT * FROM users LIMIT_OFFSET(10)")
+	assert.Error(err)
+}
+
+func TestDB_UnpackQuery_Composed(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	// NOW_UTC inside DATE_ADD_MILLIS
+	db := newTestDB("mysql")
+	q, err := db.UnpackQuery("SELECT DATE_ADD_MILLIS(NOW_UTC(), ?)")
+	assert.NoError(err)
+	assert.Equal("SELECT DATE_ADD(UTC_TIMESTAMP(3), INTERVAL (?) * 1000 MICROSECOND)", q)
+
+	// NOW_UTC inside DATE_DIFF_MILLIS
+	db = newTestDB("pgx")
+	q, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(NOW_UTC(), created_at)")
+	assert.NoError(err)
+	assert.Equal("SELECT EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - created_at)) * 1000.0", q)
+
+	// No virtual functions, just placeholders
+	db = newTestDB("pgx")
+	q, err = db.UnpackQuery("SELECT * FROM t WHERE a=? AND b=?")
+	assert.NoError(err)
+	assert.Equal("SELECT * FROM t WHERE a=$1 AND b=$2", q)
+
+	// Quoted parens should not affect balancing
+	db = newTestDB("mysql")
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, ?) WHERE name='hello (world)'")
+	assert.NoError(err)
+	assert.Equal("SELECT DATE_ADD(created_at, INTERVAL (?) * 1000 MICROSECOND) WHERE name='hello (world)'", q)
+
+	// Quoted ) without matching ( should not close the virtual function early
+	db = newTestDB("mysql")
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, ?) WHERE name='smile :)'")
+	assert.NoError(err)
+	assert.Equal("SELECT DATE_ADD(created_at, INTERVAL (?) * 1000 MICROSECOND) WHERE name='smile :)'", q)
+
+	// No transformations needed
+	db = newTestDB("mysql")
+	q, err = db.UnpackQuery("SELECT 1")
+	assert.NoError(err)
+	assert.Equal("SELECT 1", q)
 }
 
 func TestDB_Nullify(t *testing.T) {

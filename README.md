@@ -6,8 +6,8 @@ A Go library that enhances `sql.DB` for building SQL-backed CRUD microservices w
 
 - **Connection pool management** - Prevents database exhaustion in multi-microservice solutions
 - **Schema migration** - Concurrency-safe, incremental database migrations
-- **Ephemeral test databases** - Isolated databases per test with automatic cleanup
 - **Cross-driver support** - MySQL, PostgreSQL, and SQL Server with unified API
+- **Ephemeral test databases** - Isolated databases per test with automatic cleanup
 
 ## Quick Start
 
@@ -62,6 +62,110 @@ ALTER TABLE users ALTER COLUMN email TYPE VARCHAR(384);
 -- DRIVER: mssql
 ALTER TABLE users ALTER COLUMN email NVARCHAR(384) NOT NULL;
 ```
+
+## Cross-Driver Support
+
+Sequel supports MySQL, PostgreSQL, and SQL Server through a unified API. Write your SQL once using MySQL-style `?` placeholders and virtual functions, and Sequel automatically adapts queries for the active driver.
+
+### Automatic Placeholder Conversion
+
+All query methods (`Exec`, `Query`, `QueryRow`, `Prepare`, and their `Context` variants) automatically convert `?` placeholders to the driver's native syntax. For PostgreSQL, `?` becomes `$1`, `$2`, etc. For MySQL and SQL Server, `?` is left as-is. Placeholders inside quoted strings are left untouched.
+
+```go
+// Works on all drivers - placeholders are converted automatically
+rows, err := db.Query("SELECT * FROM users WHERE tenant_id = ? AND active = ?", tenantID, true)
+// PostgreSQL receives: SELECT * FROM users WHERE tenant_id = $1 AND active = $2
+```
+
+### Virtual Functions
+
+Virtual functions are driver-agnostic function calls in your SQL that Sequel expands into driver-specific expressions before execution. They are matched case-insensitively and support nesting. Quoted strings inside arguments are handled correctly.
+
+#### Built-in Virtual Functions
+
+**`NOW_UTC()`** returns the current UTC timestamp with millisecond precision.
+
+| Driver     | `NOW_UTC()` expands to        |
+|------------|-------------------------------|
+| MySQL      | `UTC_TIMESTAMP(3)`            |
+| PostgreSQL | `(NOW() AT TIME ZONE 'UTC')`  |
+| SQL Server | `SYSUTCDATETIME()`            |
+
+**`REGEXP_TEXT_SEARCH(expr IN col1, col2, ...)`** performs a case-insensitive regular expression search across one or more columns.
+
+| Driver     | `REGEXP_TEXT_SEARCH(? IN name, email)` expands to           |
+|------------|-------------------------------------------------------------|
+| MySQL      | `CONCAT_WS(' ',name,email) REGEXP ?`                       |
+| PostgreSQL | `REGEXP_LIKE(CONCAT_WS(' ',name,email), ?, 'i')`           |
+| SQL Server | `REGEXP_LIKE(CONCAT_WS(' ',name,email), ?, 'i')`           |
+
+**`DATE_ADD_MILLIS(baseExpr, milliseconds)`** adds milliseconds to a timestamp expression.
+
+| Driver     | `DATE_ADD_MILLIS(created_at, ?)` expands to                        |
+|------------|--------------------------------------------------------------------|
+| MySQL      | `DATE_ADD(created_at, INTERVAL (?) * 1000 MICROSECOND)`           |
+| PostgreSQL | `created_at + MAKE_INTERVAL(secs => (?) / 1000.0)`               |
+| SQL Server | `DATEADD(MILLISECOND, ?, created_at)`                              |
+
+**`DATE_DIFF_MILLIS(a, b)`** returns the difference `(a - b)` in milliseconds.
+
+| Driver     | `DATE_DIFF_MILLIS(updated_at, created_at)` expands to                   |
+|------------|--------------------------------------------------------------------------|
+| MySQL      | `TIMESTAMPDIFF(MICROSECOND, created_at, updated_at) / 1000.0`          |
+| PostgreSQL | `EXTRACT(EPOCH FROM (updated_at - created_at)) * 1000.0`               |
+| SQL Server | `DATEDIFF_BIG(MILLISECOND, created_at, updated_at)`                     |
+
+**`LIMIT_OFFSET(limit, offset)`** provides cross-driver pagination. Note that SQL Server requires an `ORDER BY` clause.
+
+| Driver     | `LIMIT_OFFSET(10, 0)` expands to                      |
+|------------|--------------------------------------------------------|
+| MySQL      | `LIMIT 10 OFFSET 0`                                   |
+| PostgreSQL | `LIMIT 10 OFFSET 0`                                   |
+| SQL Server | `OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY`               |
+
+```go
+db.Query("SELECT * FROM users ORDER BY id LIMIT_OFFSET(?, ?)", limit, offset)
+```
+
+#### Nesting
+
+Virtual functions can be nested. Inner functions are expanded first across multiple passes:
+
+```go
+db.Exec("UPDATE t SET expires_at = DATE_ADD_MILLIS(NOW_UTC(), ?) WHERE id = ?", ttlMs, id)
+// MySQL:      UPDATE t SET expires_at = DATE_ADD(UTC_TIMESTAMP(3), INTERVAL (?) * 1000 MICROSECOND) WHERE id = ?
+// PostgreSQL: UPDATE t SET expires_at = (NOW() AT TIME ZONE 'UTC') + MAKE_INTERVAL(secs => ($1) / 1000.0) WHERE id = $2
+```
+
+#### Custom Virtual Functions
+
+Register your own virtual functions with `RegisterVirtualFunc`:
+
+```go
+sequel.RegisterVirtualFunc("BOOL", func(driverName string, args string) (string, error) {
+    switch driverName {
+    case "mysql", "pgx":
+        return args, nil
+    case "mssql":
+        // SQL Server uses BIT, not BOOL
+        return "CAST(" + args + " AS BIT)", nil
+    default:
+        return "", errors.New("unsupported driver: %s", driverName)
+    }
+})
+```
+
+#### UnpackQuery
+
+`UnpackQuery` is the public method that expands virtual functions and conforms placeholders. It is called automatically by the query shadow methods, but can be used directly if needed:
+
+```go
+expanded, err := db.UnpackQuery("SELECT * FROM t WHERE updated_at > DATE_ADD_MILLIS(NOW_UTC(), ?) AND active = ?")
+```
+
+### DriverName()
+
+`DriverName()` returns the active driver name (`"mysql"`, `"pgx"`, or `"mssql"`) for cases where you need driver-specific logic in Go code.
 
 ## Ephemeral Test Databases
 
