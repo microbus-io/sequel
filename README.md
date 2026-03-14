@@ -163,6 +163,20 @@ sequel.RegisterVirtualFunc("BOOL", func(driverName string, args string) (string,
 expanded, err := db.UnpackQuery("SELECT * FROM t WHERE updated_at > DATE_ADD_MILLIS(NOW_UTC(), ?) AND active = ?")
 ```
 
+### InsertReturnID
+
+`InsertReturnID` executes an INSERT statement and returns the auto-generated ID for the named ID column. Each driver uses its native mechanism:
+
+| Driver     | Mechanism                                |
+|------------|------------------------------------------|
+| MySQL      | `LastInsertId()` from the result          |
+| PostgreSQL | Appends `RETURNING <idColumn>` to the query |
+| SQL Server | Injects `OUTPUT INSERTED.<idColumn>` before `VALUES` |
+
+```go
+id, err := db.InsertReturnID(ctx, "id", "INSERT INTO users (name, email) VALUES (?, ?)", name, email)
+```
+
 ### DriverName()
 
 `DriverName()` returns the active driver name (`"mysql"`, `"pgx"`, or `"mssql"`) for cases where you need driver-specific logic in Go code.
