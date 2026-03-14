@@ -44,6 +44,8 @@ var (
 	testingDSNs        = map[string]string{}
 	testingGlobalMutex sync.Mutex
 	testingMutexes     = map[string]*sync.Mutex{}
+
+	valuesClausePattern = regexp.MustCompile(`(?i)\s+VALUES\s*`)
 )
 
 /*
@@ -258,6 +260,51 @@ func (db *DB) UnpackQuery(query string) (string, error) {
 	}
 	query = db.conformPlaceholders(query)
 	return query, nil
+}
+
+// InsertReturnID executes an INSERT statement and returns the auto-generated ID for the named ID column.
+func (db *DB) InsertReturnID(ctx context.Context, idColumn string, stmt string, args ...any) (int64, error) {
+	switch db.DriverName() {
+	case "mysql":
+		res, err := db.ExecContext(ctx, stmt, args...)
+		if err != nil {
+			return 0, errors.Trace(err)
+		}
+		id, err := res.LastInsertId()
+		if err != nil {
+			return 0, errors.Trace(err)
+		}
+		return id, nil
+	case "pgx":
+		var id int64
+		err := db.QueryRowContext(ctx, stmt+" RETURNING "+idColumn, args...).Scan(&id)
+		if err != nil {
+			return 0, errors.Trace(err)
+		}
+		return id, nil
+	case "mssql":
+		var id int64
+		stmt, err := injectOutputInserted(stmt, idColumn)
+		if err != nil {
+			return 0, errors.Trace(err)
+		}
+		err = db.QueryRowContext(ctx, stmt, args...).Scan(&id)
+		if err != nil {
+			return 0, errors.Trace(err)
+		}
+		return id, nil
+	}
+	return 0, errors.New("unsupported driver name: %s", db.DriverName())
+}
+
+// injectOutputInserted rewrites an INSERT statement to include an OUTPUT INSERTED clause
+// before the VALUES keyword, for use with MSSQL.
+func injectOutputInserted(stmt string, idColumn string) (string, error) {
+	loc := valuesClausePattern.FindStringIndex(stmt)
+	if loc == nil {
+		return "", errors.New("VALUES clause not found in INSERT statement")
+	}
+	return stmt[:loc[0]] + " OUTPUT INSERTED." + idColumn + stmt[loc[0]:], nil
 }
 
 // databaseNameFromDataSourceName extracts the database name part of the data source name.
@@ -935,4 +982,3 @@ func (db *DB) RegexpTextSearch(searchableColumns ...string) string {
 		return ""
 	}
 }
-

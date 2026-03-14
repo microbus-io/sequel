@@ -588,3 +588,37 @@ func TestDB_OpenInferDriverFails(t *testing.T) {
 	_, err := Open("", "some-unknown-connection-string")
 	assert.Error(err)
 }
+
+func TestDB_InjectOutputInserted(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	// Standard case
+	result, err := injectOutputInserted("INSERT INTO foo (a, b) VALUES (?, ?)", "id")
+	assert.NoError(err)
+	assert.Equal("INSERT INTO foo (a, b) OUTPUT INSERTED.id VALUES (?, ?)", result)
+
+	// Lowercase values
+	result, err = injectOutputInserted("INSERT INTO foo (a, b) values (?, ?)", "id")
+	assert.NoError(err)
+	assert.Equal("INSERT INTO foo (a, b) OUTPUT INSERTED.id values (?, ?)", result)
+
+	// Mixed case
+	result, err = injectOutputInserted("INSERT INTO foo (a, b) Values (?, ?)", "id")
+	assert.NoError(err)
+	assert.Equal("INSERT INTO foo (a, b) OUTPUT INSERTED.id Values (?, ?)", result)
+
+	// Extra whitespace before VALUES
+	result, err = injectOutputInserted("INSERT INTO foo (a, b)   VALUES (?, ?)", "id")
+	assert.NoError(err)
+	assert.Equal("INSERT INTO foo (a, b) OUTPUT INSERTED.id   VALUES (?, ?)", result)
+
+	// Tab before VALUES
+	result, err = injectOutputInserted("INSERT INTO foo (a, b)\tVALUES (?, ?)", "id")
+	assert.NoError(err)
+	assert.Equal("INSERT INTO foo (a, b) OUTPUT INSERTED.id\tVALUES (?, ?)", result)
+
+	// No VALUES clause
+	_, err = injectOutputInserted("INSERT INTO foo (a, b) SELECT a, b FROM bar", "id")
+	assert.Error(err)
+}
