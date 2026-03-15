@@ -292,14 +292,8 @@ func (db *DB) InsertReturnID(ctx context.Context, idColumn string, stmt string, 
 	return insertReturnID(ctx, db, db.driverName, idColumn, stmt, args...)
 }
 
-// queryExecer is the interface satisfied by both DB and Tx for use by insertReturnID.
-type queryExecer interface {
-	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
-}
-
 // insertReturnID executes an INSERT statement and returns the auto-generated ID for the named ID column.
-func insertReturnID(ctx context.Context, qe queryExecer, driverName string, idColumn string, stmt string, args ...any) (int64, error) {
+func insertReturnID(ctx context.Context, qe Executor, driverName string, idColumn string, stmt string, args ...any) (int64, error) {
 	switch driverName {
 	case "mysql":
 		res, err := qe.ExecContext(ctx, stmt, args...)
