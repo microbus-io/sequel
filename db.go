@@ -254,19 +254,55 @@ func (db *DB) DriverName() string {
 // driver-specific SQL expressions, and conforms arg placeholders
 // to the syntax expected by the driver (e.g. ? to $1, $2 for PostgreSQL).
 func (db *DB) UnpackQuery(query string) (string, error) {
-	query, err := expandVirtualFuncs(db.driverName, query)
+	return unpackQuery(db.driverName, query)
+}
+
+// unpackQuery expands virtual functions and conforms arg placeholders for the driver.
+func unpackQuery(driverName string, query string) (string, error) {
+	query, err := expandVirtualFuncs(driverName, query)
 	if err != nil {
 		return "", errors.Trace(err)
 	}
-	query = db.conformPlaceholders(query)
+	query = conformPlaceholders(driverName, query)
 	return query, nil
+}
+
+// Begin starts a transaction and returns a sequel.Tx that applies virtual function
+// expansion and placeholder conforming.
+func (db *DB) Begin() (*Tx, error) {
+	sqlTx, err := db.DB.Begin()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return &Tx{Tx: sqlTx, driverName: db.driverName}, nil
+}
+
+// BeginTx starts a transaction with the given options and returns a sequel.Tx that
+// applies virtual function expansion and placeholder conforming.
+func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
+	sqlTx, err := db.DB.BeginTx(ctx, opts)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	return &Tx{Tx: sqlTx, driverName: db.driverName}, nil
 }
 
 // InsertReturnID executes an INSERT statement and returns the auto-generated ID for the named ID column.
 func (db *DB) InsertReturnID(ctx context.Context, idColumn string, stmt string, args ...any) (int64, error) {
-	switch db.DriverName() {
+	return insertReturnID(ctx, db, db.driverName, idColumn, stmt, args...)
+}
+
+// queryExecer is the interface satisfied by both DB and Tx for use by insertReturnID.
+type queryExecer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// insertReturnID executes an INSERT statement and returns the auto-generated ID for the named ID column.
+func insertReturnID(ctx context.Context, qe queryExecer, driverName string, idColumn string, stmt string, args ...any) (int64, error) {
+	switch driverName {
 	case "mysql":
-		res, err := db.ExecContext(ctx, stmt, args...)
+		res, err := qe.ExecContext(ctx, stmt, args...)
 		if err != nil {
 			return 0, errors.Trace(err)
 		}
@@ -277,7 +313,7 @@ func (db *DB) InsertReturnID(ctx context.Context, idColumn string, stmt string, 
 		return id, nil
 	case "pgx":
 		var id int64
-		err := db.QueryRowContext(ctx, stmt+" RETURNING "+idColumn, args...).Scan(&id)
+		err := qe.QueryRowContext(ctx, stmt+" RETURNING "+idColumn, args...).Scan(&id)
 		if err != nil {
 			return 0, errors.Trace(err)
 		}
@@ -288,13 +324,13 @@ func (db *DB) InsertReturnID(ctx context.Context, idColumn string, stmt string, 
 		if err != nil {
 			return 0, errors.Trace(err)
 		}
-		err = db.QueryRowContext(ctx, stmt, args...).Scan(&id)
+		err = qe.QueryRowContext(ctx, stmt, args...).Scan(&id)
 		if err != nil {
 			return 0, errors.Trace(err)
 		}
 		return id, nil
 	}
-	return 0, errors.New("unsupported driver name: %s", db.DriverName())
+	return 0, errors.New("unsupported driver name: %s", driverName)
 }
 
 // injectOutputInserted rewrites an INSERT statement to include an OUTPUT INSERTED clause
@@ -876,8 +912,8 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 
 // conformPlaceholders replaces the ? arg placeholders in a SQL statement to $1, $2 etc. for a Postgres driver.
 // Question marks inside quoted strings (single or double quotes) are left as-is.
-func (db *DB) conformPlaceholders(stmt string) string {
-	if db.driverName != "pgx" {
+func conformPlaceholders(driverName string, stmt string) string {
+	if driverName != "pgx" {
 		return stmt
 	}
 	n := strings.Count(stmt, "?")
@@ -942,7 +978,7 @@ func hashStr(x string) string {
 // Deprecated: ConformArgPlaceholders is applied automatically by the query shadow methods.
 // Use ? placeholders directly in queries passed to Exec, Query, QueryRow, and Prepare.
 func (db *DB) ConformArgPlaceholders(stmt string) string {
-	return db.conformPlaceholders(stmt)
+	return conformPlaceholders(db.driverName, stmt)
 }
 
 // Deprecated: Use the NOW_UTC() virtual function directly in queries instead.
