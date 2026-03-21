@@ -28,8 +28,9 @@ import (
 func TestDB_AutoCreate(t *testing.T) {
 	t.Parallel()
 	dsns := map[string]string{
-		"mysql": "root:root@tcp(127.0.0.1:3306)/",
-		"pgx":   "postgres://postgres:postgres@127.0.0.1:5432/",
+		"mysql":  "root:root@tcp(127.0.0.1:3306)/",
+		"pgx":    "postgres://postgres:postgres@127.0.0.1:5432/",
+		"sqlite": "",
 		// "mssql": "sqlserver://sa:Password123@127.0.0.1:1433",
 	}
 	for drv, dsn := range dsns {
@@ -141,8 +142,16 @@ func TestDB_DatabaseNameFromDataSourceName(t *testing.T) {
 	_, err = databaseNameFromDataSourceName("mysql", "")
 	assert.Error(err)
 
+	// sqlite
+	name, err = databaseNameFromDataSourceName("sqlite", "file:path/to/mydb.sqlite?_pragma=journal_mode(WAL)")
+	assert.Expect(name, "path/to/mydb.sqlite", err, nil)
+	name, err = databaseNameFromDataSourceName("sqlite", "/tmp/test.db")
+	assert.Expect(name, "/tmp/test.db", err, nil)
+	name, err = databaseNameFromDataSourceName("sqlite", ":memory:")
+	assert.Expect(name, ":memory:", err, nil)
+
 	// unsupported driver
-	_, err = databaseNameFromDataSourceName("sqlite", "file.db")
+	_, err = databaseNameFromDataSourceName("oracle", "oracle://user:pw@host/db")
 	assert.Error(err)
 }
 
@@ -158,6 +167,14 @@ func TestDB_InferDriverName(t *testing.T) {
 
 	// MySQL tcp() style
 	assert.Equal("mysql", inferDriverName("root:root@tcp(127.0.0.1:3306)/"))
+
+	// SQLite
+	assert.Equal("sqlite", inferDriverName("file:test.db"))
+	assert.Equal("sqlite", inferDriverName("file::memory:?cache=shared"))
+	assert.Equal("sqlite", inferDriverName(":memory:"))
+	assert.Equal("sqlite", inferDriverName("/tmp/data.db"))
+	assert.Equal("sqlite", inferDriverName("my_database.sqlite"))
+	assert.Equal("sqlite", inferDriverName("my_database.sqlite3"))
 
 	// Port-based inference
 	assert.Equal("mysql", inferDriverName("root:root@127.0.0.1:3306/"))
@@ -215,8 +232,18 @@ func TestDB_SetDatabaseInDataSourceName(t *testing.T) {
 	_, err = setDatabaseInDataSourceName("mysql", "", "mydb")
 	assert.Error(err)
 
+	// sqlite - set database with file: prefix
+	dsn, err = setDatabaseInDataSourceName("sqlite", "file:old.db?_pragma=journal_mode(WAL)", "new.db")
+	assert.NoError(err)
+	assert.Equal("file:new.db?_pragma=journal_mode(WAL)", dsn)
+
+	// sqlite - set database without prefix
+	dsn, err = setDatabaseInDataSourceName("sqlite", "old.db", "new.db")
+	assert.NoError(err)
+	assert.Equal("new.db", dsn)
+
 	// unsupported driver
-	_, err = setDatabaseInDataSourceName("sqlite", "file.db", "mydb")
+	_, err = setDatabaseInDataSourceName("oracle", "oracle://host/db", "mydb")
 	assert.Error(err)
 }
 
@@ -256,6 +283,9 @@ func TestDB_NowUTC(t *testing.T) {
 	db = &DB{driverName: "mssql"}
 	assert.Equal("SYSUTCDATETIME()", db.NowUTC())
 
+	db = &DB{driverName: "sqlite"}
+	assert.Equal("STRFTIME('%Y-%m-%d %H:%M:%f', 'now')", db.NowUTC())
+
 	db = &DB{driverName: "unknown"}
 	assert.Equal("", db.NowUTC())
 }
@@ -280,6 +310,12 @@ func TestDB_RegexpTextSearch(t *testing.T) {
 	db = &DB{driverName: "mssql"}
 	assert.Equal("REGEXP_LIKE('', ?, 'i')", db.RegexpTextSearch())
 	assert.Equal("REGEXP_LIKE(name, ?, 'i')", db.RegexpTextSearch("name"))
+
+	// SQLite
+	db = &DB{driverName: "sqlite"}
+	assert.Equal("'' LIKE ('%' || ? || '%')", db.RegexpTextSearch())
+	assert.Equal("name LIKE ('%' || ? || '%')", db.RegexpTextSearch("name"))
+	assert.Equal("CONCAT_WS(' ',name,email) LIKE ('%' || ? || '%')", db.RegexpTextSearch("name", "email"))
 
 	// Unknown driver
 	db = &DB{driverName: "unknown"}
@@ -311,6 +347,11 @@ func TestDB_UnpackQuery_NowUTC(t *testing.T) {
 	assert.NoError(err)
 	assert.Equal("UPDATE t SET updated_at=SYSUTCDATETIME() WHERE id=?", q)
 
+	db = newTestDB("sqlite")
+	q, err = db.UnpackQuery("UPDATE t SET updated_at=NOW_UTC() WHERE id=?")
+	assert.NoError(err)
+	assert.Equal("UPDATE t SET updated_at=STRFTIME('%Y-%m-%d %H:%M:%f', 'now') WHERE id=?", q)
+
 	// Case insensitive
 	db = newTestDB("mysql")
 	q, err = db.UnpackQuery("SELECT now_utc()")
@@ -332,6 +373,11 @@ func TestDB_UnpackQuery_RegexpTextSearch(t *testing.T) {
 	q, err = db.UnpackQuery("SELECT * FROM t WHERE REGEXP_TEXT_SEARCH(? IN name)")
 	assert.NoError(err)
 	assert.Equal("SELECT * FROM t WHERE REGEXP_LIKE(name, $1, 'i')", q)
+
+	db = newTestDB("sqlite")
+	q, err = db.UnpackQuery("SELECT * FROM t WHERE REGEXP_TEXT_SEARCH(? IN name, email)")
+	assert.NoError(err)
+	assert.Equal("SELECT * FROM t WHERE CONCAT_WS(' ',name,email) LIKE ('%' || ? || '%')", q)
 
 	// Missing IN
 	db = newTestDB("mysql")
@@ -358,6 +404,11 @@ func TestDB_UnpackQuery_DateAddMillis(t *testing.T) {
 	assert.NoError(err)
 	assert.Equal("SELECT DATEADD(MILLISECOND, 5000, created_at)", q)
 
+	db = newTestDB("sqlite")
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, 5000)")
+	assert.NoError(err)
+	assert.Equal("SELECT STRFTIME('%Y-%m-%d %H:%M:%f', created_at, '+' || ((5000) / 1000.0) || ' seconds')", q)
+
 	// Missing comma
 	db = newTestDB("mysql")
 	_, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at)")
@@ -382,6 +433,11 @@ func TestDB_UnpackQuery_DateDiffMillis(t *testing.T) {
 	q, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(updated_at, created_at)")
 	assert.NoError(err)
 	assert.Equal("SELECT DATEDIFF_BIG(MILLISECOND, created_at, updated_at)", q)
+
+	db = newTestDB("sqlite")
+	q, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(updated_at, created_at)")
+	assert.NoError(err)
+	assert.Equal("SELECT (JULIANDAY(updated_at) - JULIANDAY(created_at)) * 86400000.0", q)
 
 	// Missing comma
 	db = newTestDB("mysql")
@@ -412,6 +468,11 @@ func TestDB_UnpackQuery_LimitOffset(t *testing.T) {
 	q, err = db.UnpackQuery("SELECT * FROM users ORDER BY id LIMIT_OFFSET(?, ?)")
 	assert.NoError(err)
 	assert.Equal("SELECT * FROM users ORDER BY id OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", q)
+
+	db = newTestDB("sqlite")
+	q, err = db.UnpackQuery("SELECT * FROM users ORDER BY id LIMIT_OFFSET(10, 0)")
+	assert.NoError(err)
+	assert.Equal("SELECT * FROM users ORDER BY id LIMIT 10 OFFSET 0", q)
 
 	// Missing comma
 	db = newTestDB("mysql")

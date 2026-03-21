@@ -101,7 +101,7 @@ func (tx *Tx) InsertReturnID(ctx context.Context, idColumn string, stmt string, 
 	return insertReturnID(ctx, tx, tx.driverName, idColumn, stmt, args...)
 }
 
-// DriverName is the name of the driver: "mysql", "pgx" or "mssql".
+// DriverName is the name of the driver: "mysql", "pgx", "mssql" or "sqlite".
 func (tx *Tx) DriverName() string {
 	return tx.driverName
 }

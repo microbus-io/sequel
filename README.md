@@ -6,7 +6,7 @@ A Go library that enhances `sql.DB` for building SQL-backed CRUD microservices w
 
 - **Connection pool management** - Prevents database exhaustion in multi-microservice solutions
 - **Schema migration** - Concurrency-safe, incremental database migrations
-- **Cross-driver support** - MySQL, PostgreSQL, and SQL Server with unified API
+- **Cross-driver support** - MySQL, PostgreSQL, SQL Server, and SQLite with unified API
 - **Ephemeral test databases** - Isolated databases per test with automatic cleanup
 
 ## Quick Start
@@ -61,15 +61,18 @@ ALTER TABLE users ALTER COLUMN email TYPE VARCHAR(384);
 
 -- DRIVER: mssql
 ALTER TABLE users ALTER COLUMN email NVARCHAR(384) NOT NULL;
+
+-- DRIVER: sqlite
+-- SQLite does not support ALTER COLUMN; a table rebuild would be needed
 ```
 
 ## Cross-Driver Support
 
-Sequel supports MySQL, PostgreSQL, and SQL Server through a unified API. Write your SQL once using MySQL-style `?` placeholders and virtual functions, and Sequel automatically adapts queries for the active driver.
+Sequel supports MySQL, PostgreSQL, SQL Server, and SQLite through a unified API. Write your SQL once using MySQL-style `?` placeholders and virtual functions, and Sequel automatically adapts queries for the active driver.
 
 ### Automatic Placeholder Conversion
 
-All query methods (`Exec`, `Query`, `QueryRow`, `Prepare`, and their `Context` variants) automatically convert `?` placeholders to the driver's native syntax. For PostgreSQL, `?` becomes `$1`, `$2`, etc. For MySQL and SQL Server, `?` is left as-is. Placeholders inside quoted strings are left untouched.
+All query methods (`Exec`, `Query`, `QueryRow`, `Prepare`, and their `Context` variants) automatically convert `?` placeholders to the driver's native syntax. For PostgreSQL, `?` becomes `$1`, `$2`, etc. For MySQL, SQL Server, and SQLite, `?` is left as-is. Placeholders inside quoted strings are left untouched.
 
 ```go
 // Works on all drivers - placeholders are converted automatically
@@ -85,27 +88,30 @@ Virtual functions are driver-agnostic function calls in your SQL that Sequel exp
 
 **`NOW_UTC()`** returns the current UTC timestamp with millisecond precision.
 
-| Driver     | `NOW_UTC()` expands to        |
-|------------|-------------------------------|
-| MySQL      | `UTC_TIMESTAMP(3)`            |
-| PostgreSQL | `(NOW() AT TIME ZONE 'UTC')`  |
-| SQL Server | `SYSUTCDATETIME()`            |
+| Driver     | `NOW_UTC()` expands to                       |
+|------------|----------------------------------------------|
+| MySQL      | `UTC_TIMESTAMP(3)`                           |
+| PostgreSQL | `(NOW() AT TIME ZONE 'UTC')`                 |
+| SQL Server | `SYSUTCDATETIME()`                           |
+| SQLite     | `STRFTIME('%Y-%m-%d %H:%M:%f', 'now')`       |
 
 **`REGEXP_TEXT_SEARCH(expr IN col1, col2, ...)`** performs a case-insensitive regular expression search across one or more columns.
 
-| Driver     | `REGEXP_TEXT_SEARCH(? IN name, email)` expands to           |
-|------------|-------------------------------------------------------------|
-| MySQL      | `CONCAT_WS(' ',name,email) REGEXP ?`                       |
-| PostgreSQL | `REGEXP_LIKE(CONCAT_WS(' ',name,email), ?, 'i')`           |
-| SQL Server | `REGEXP_LIKE(CONCAT_WS(' ',name,email), ?, 'i')`           |
+| Driver     | `REGEXP_TEXT_SEARCH(? IN name, email)` expands to             |
+|------------|---------------------------------------------------------------|
+| MySQL      | `CONCAT_WS(' ',name,email) REGEXP ?`                         |
+| PostgreSQL | `REGEXP_LIKE(CONCAT_WS(' ',name,email), ?, 'i')`             |
+| SQL Server | `REGEXP_LIKE(CONCAT_WS(' ',name,email), ?, 'i')`             |
+| SQLite     | `CONCAT_WS(' ',name,email) LIKE '%' \|\| ? \|\| '%'`        |
 
 **`DATE_ADD_MILLIS(baseExpr, milliseconds)`** adds milliseconds to a timestamp expression.
 
-| Driver     | `DATE_ADD_MILLIS(created_at, ?)` expands to                        |
-|------------|--------------------------------------------------------------------|
-| MySQL      | `DATE_ADD(created_at, INTERVAL (?) * 1000 MICROSECOND)`           |
-| PostgreSQL | `created_at + MAKE_INTERVAL(secs => (?) / 1000.0)`               |
-| SQL Server | `DATEADD(MILLISECOND, ?, created_at)`                              |
+| Driver     | `DATE_ADD_MILLIS(created_at, ?)` expands to                                       |
+|------------|-----------------------------------------------------------------------------------|
+| MySQL      | `DATE_ADD(created_at, INTERVAL (?) * 1000 MICROSECOND)`                          |
+| PostgreSQL | `created_at + MAKE_INTERVAL(secs => (?) / 1000.0)`                              |
+| SQL Server | `DATEADD(MILLISECOND, ?, created_at)`                                             |
+| SQLite     | `STRFTIME('%Y-%m-%d %H:%M:%f', created_at, '+' \|\| ((?) / 1000.0) \|\| ' seconds')` |
 
 **`DATE_DIFF_MILLIS(a, b)`** returns the difference `(a - b)` in milliseconds.
 
@@ -114,6 +120,7 @@ Virtual functions are driver-agnostic function calls in your SQL that Sequel exp
 | MySQL      | `TIMESTAMPDIFF(MICROSECOND, created_at, updated_at) / 1000.0`          |
 | PostgreSQL | `EXTRACT(EPOCH FROM (updated_at - created_at)) * 1000.0`               |
 | SQL Server | `DATEDIFF_BIG(MILLISECOND, created_at, updated_at)`                     |
+| SQLite     | `(JULIANDAY(updated_at) - JULIANDAY(created_at)) * 86400000.0`         |
 
 **`LIMIT_OFFSET(limit, offset)`** provides cross-driver pagination. Note that SQL Server requires an `ORDER BY` clause.
 
@@ -122,6 +129,7 @@ Virtual functions are driver-agnostic function calls in your SQL that Sequel exp
 | MySQL      | `LIMIT 10 OFFSET 0`                                   |
 | PostgreSQL | `LIMIT 10 OFFSET 0`                                   |
 | SQL Server | `OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY`               |
+| SQLite     | `LIMIT 10 OFFSET 0`                                   |
 
 ```go
 db.Query("SELECT * FROM users ORDER BY id LIMIT_OFFSET(?, ?)", limit, offset)
@@ -144,7 +152,7 @@ Register your own virtual functions with `RegisterVirtualFunc`:
 ```go
 sequel.RegisterVirtualFunc("BOOL", func(driverName string, args string) (string, error) {
     switch driverName {
-    case "mysql", "pgx":
+    case "mysql", "pgx", "sqlite":
         return args, nil
     case "mssql":
         // SQL Server uses BIT, not BOOL
@@ -167,11 +175,12 @@ expanded, err := db.UnpackQuery("SELECT * FROM t WHERE updated_at > DATE_ADD_MIL
 
 `InsertReturnID` executes an INSERT statement and returns the auto-generated ID for the named ID column. Each driver uses its native mechanism:
 
-| Driver     | Mechanism                                |
-|------------|------------------------------------------|
-| MySQL      | `LastInsertId()` from the result          |
-| PostgreSQL | Appends `RETURNING <idColumn>` to the query |
+| Driver     | Mechanism                                         |
+|------------|---------------------------------------------------|
+| MySQL      | `LastInsertId()` from the result                  |
+| PostgreSQL | Appends `RETURNING <idColumn>` to the query       |
 | SQL Server | Injects `OUTPUT INSERTED.<idColumn>` before `VALUES` |
+| SQLite     | `LastInsertId()` from the result                  |
 
 ```go
 id, err := db.InsertReturnID(ctx, "id", "INSERT INTO users (name, email) VALUES (?, ?)", name, email)
@@ -179,7 +188,7 @@ id, err := db.InsertReturnID(ctx, "id", "INSERT INTO users (name, email) VALUES 
 
 ### DriverName()
 
-`DriverName()` returns the active driver name (`"mysql"`, `"pgx"`, or `"mssql"`) for cases where you need driver-specific logic in Go code.
+`DriverName()` returns the active driver name (`"mysql"`, `"pgx"`, `"mssql"`, or `"sqlite"`) for cases where you need driver-specific logic in Go code.
 
 ## Ephemeral Test Databases
 

@@ -133,6 +133,8 @@ func vfNowUTC(driverName string, args string) (string, error) {
 		return "(NOW() AT TIME ZONE 'UTC')", nil
 	case "mssql":
 		return "SYSUTCDATETIME()", nil
+	case "sqlite":
+		return "STRFTIME('%Y-%m-%d %H:%M:%f', 'now')", nil
 	default:
 		return "", errors.New("unsupported driver name: %s", driverName)
 	}
@@ -172,6 +174,8 @@ func vfRegexpTextSearch(driverName string, args string) (string, error) {
 		return "REGEXP_LIKE(" + concatenated + ", " + searchExpr + ", 'i')", nil
 	case "mssql":
 		return "REGEXP_LIKE(" + concatenated + ", " + searchExpr + ", 'i')", nil
+	case "sqlite":
+		return concatenated + " LIKE ('%' || " + searchExpr + " || '%')", nil
 	default:
 		return "", errors.New("unsupported driver name: %s", driverName)
 	}
@@ -202,6 +206,8 @@ func vfDateAddMillis(driverName string, args string) (string, error) {
 		return baseExpr + " + MAKE_INTERVAL(secs => (" + millis + ") / 1000.0)", nil
 	case "mssql":
 		return "DATEADD(MILLISECOND, " + millis + ", " + baseExpr + ")", nil
+	case "sqlite":
+		return "STRFTIME('%Y-%m-%d %H:%M:%f', " + baseExpr + ", '+' || ((" + millis + ") / 1000.0) || ' seconds')", nil
 	default:
 		return "", errors.New("unsupported driver name: %s", driverName)
 	}
@@ -231,6 +237,8 @@ func vfDateDiffMillis(driverName string, args string) (string, error) {
 		return "EXTRACT(EPOCH FROM (" + a + " - " + b + ")) * 1000.0", nil
 	case "mssql":
 		return "DATEDIFF_BIG(MILLISECOND, " + b + ", " + a + ")", nil
+	case "sqlite":
+		return "(JULIANDAY(" + a + ") - JULIANDAY(" + b + ")) * 86400000.0", nil
 	default:
 		return "", errors.New("unsupported driver name: %s", driverName)
 	}
@@ -255,7 +263,7 @@ func vfLimitOffset(driverName string, args string) (string, error) {
 		return "", errors.New("LIMIT_OFFSET requires syntax: LIMIT_OFFSET(limit, offset)")
 	}
 	switch driverName {
-	case "mysql", "pgx":
+	case "mysql", "pgx", "sqlite":
 		return "LIMIT " + limit + " OFFSET " + offset, nil
 	case "mssql":
 		return "OFFSET " + offset + " ROWS FETCH NEXT " + limit + " ROWS ONLY", nil

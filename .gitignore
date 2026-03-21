@@ -2,4 +2,5 @@
 /main/main
 /main/__debug_bin*
 .DS_Store
+*.sqlite
 !/codegen/bundle/*

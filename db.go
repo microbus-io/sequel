@@ -36,6 +36,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/microbus-io/errors"
+	_ "modernc.org/sqlite"
 )
 
 var (
@@ -67,12 +68,13 @@ type DB struct {
 Open returns a database connection to the named data source.
 
 If a driver name is not provided, it is inferred from the data source name on a best-effort basis.
-Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres) or "mssql" (SQL Server).
+Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres), "mssql" (SQL Server) or "sqlite" (SQLite).
 
 Example data source name for each of the supported drivers:
   - mysql: username:password@tcp(hostname:3306)/
   - pgx: postgres://username:password@hostname:5432/
   - mssql: sqlserver://username:password@hostname:1433
+  - sqlite: file:path/to/database.sqlite
 */
 func Open(driverName string, dataSourceName string) (db *DB, err error) {
 	if dataSourceName == "" {
@@ -80,6 +82,9 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 	}
 	if driverName == "mariadb" {
 		driverName = "mysql"
+	}
+	if driverName == "sqlite3" {
+		driverName = "sqlite"
 	}
 	if driverName == "" {
 		driverName = inferDriverName(dataSourceName)
@@ -245,7 +250,7 @@ func (db *DB) PrepareContext(ctx context.Context, query string) (*sql.Stmt, erro
 	return db.DB.PrepareContext(ctx, query)
 }
 
-// DriverName is the name of the driver: "mysql", "pgx" or "mssql".
+// DriverName is the name of the driver: "mysql", "pgx", "mssql" or "sqlite".
 func (db *DB) DriverName() string {
 	return db.driverName
 }
@@ -295,7 +300,7 @@ func (db *DB) InsertReturnID(ctx context.Context, idColumn string, stmt string, 
 // insertReturnID executes an INSERT statement and returns the auto-generated ID for the named ID column.
 func insertReturnID(ctx context.Context, qe Executor, driverName string, idColumn string, stmt string, args ...any) (int64, error) {
 	switch driverName {
-	case "mysql":
+	case "mysql", "sqlite":
 		res, err := qe.ExecContext(ctx, stmt, args...)
 		if err != nil {
 			return 0, errors.Trace(err)
@@ -370,6 +375,14 @@ func databaseNameFromDataSourceName(driverName string, dsn string) (databaseName
 			return "", errors.New("error parsing data source name %s", dsn, err)
 		}
 		return u.Query().Get("database"), nil
+	case "sqlite":
+		// The DSN is the file path, optionally prefixed with "file:" and with query params
+		path := dsn
+		path = strings.TrimPrefix(path, "file:")
+		if i := strings.Index(path, "?"); i >= 0 {
+			path = path[:i]
+		}
+		return path, nil
 	default:
 		return "", errors.New("unsupported driver name %s", driverName)
 	}
@@ -420,6 +433,16 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 		u.RawQuery = q.Encode()
 		alteredDSN = u.String()
 		return alteredDSN, nil
+	case "sqlite":
+		// Replace the file path in the DSN, preserving any "file:" prefix and query params
+		if strings.HasPrefix(dsn, "file:") {
+			rest := dsn[5:]
+			if i := strings.Index(rest, "?"); i >= 0 {
+				return "file:" + databaseName + rest[i:], nil
+			}
+			return "file:" + databaseName, nil
+		}
+		return databaseName, nil
 	default:
 		return "", errors.New("unsupported driver name %s", driverName)
 	}
@@ -435,6 +458,15 @@ func inferDriverName(dataSourceName string) (driverName string) {
 	}
 	if strings.HasPrefix(dataSourceName, "sqlserver://") {
 		return "mssql"
+	}
+	if strings.HasPrefix(dataSourceName, "file:") {
+		return "sqlite"
+	}
+	if dataSourceName == ":memory:" {
+		return "sqlite"
+	}
+	if strings.HasSuffix(dataSourceName, ".db") || strings.HasSuffix(dataSourceName, ".sqlite") || strings.HasSuffix(dataSourceName, ".sqlite3") {
+		return "sqlite"
 	}
 	if strings.Contains(dataSourceName, "tcp(") {
 		return "mysql"
@@ -456,10 +488,11 @@ OpenTesting opens a connection to a uniquely named database for testing purposes
 A database is created for each unique test at the database instance pointed to by the input DSN.
 
 If a driver name is not provided, it is inferred from the data source name on a best-effort basis.
-Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres) or "mssql" (SQL Server).
+Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres), "mssql" (SQL Server) or "sqlite" (SQLite).
 
 If a data source name is not provided, the following defaults are used based on the driver name:
-  - (empty): root:root@tcp(127.0.0.1:3306)/
+  - (empty): SQLite in-memory database
+  - sqlite: SQLite in-memory database
   - mysql: root:root@tcp(127.0.0.1:3306)/
   - pgx: postgres://postgres:postgres@127.0.0.1:5432/
   - mssql: sqlserver://sa:Password123@127.0.0.1:1433
@@ -468,7 +501,9 @@ func OpenTesting(driverName string, dataSourceName string, uniqueTestID string) 
 	// Set default connection to localhost
 	if dataSourceName == "" {
 		switch driverName {
-		case "", "mysql":
+		case "", "sqlite":
+			dataSourceName = ":memory:"
+		case "mysql":
 			dataSourceName = "root:root@tcp(127.0.0.1:3306)/"
 		case "pgx":
 			dataSourceName = "postgres://postgres:postgres@127.0.0.1:5432/"
@@ -515,87 +550,98 @@ func OpenTesting(driverName string, dataSourceName string, uniqueTestID string) 
 	testingDatabaseName := "testing_" + now.Format("15") + "_" + baseDatabaseName + strings.ToLower(uniqueTestID)
 	testingDatabaseName = regexp.MustCompile(`[^a-z0-9_]`).ReplaceAllString(testingDatabaseName, "_")
 
-	// Open the master database
-	masterDataSourceName, err := setDatabaseInDataSourceName(driverName, dataSourceName, "")
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	masterDB, err := Open(driverName, masterDataSourceName)
-	if err != nil {
-		return nil, errors.New("failed to open master database", err)
-	}
-	defer masterDB.Close()
+	// For server-based drivers, open the master database and CREATE/DROP DATABASE.
+	// SQLite uses in-memory databases for testing, so this step is skipped.
+	if driverName != "sqlite" {
+		masterDataSourceName, err := setDatabaseInDataSourceName(driverName, dataSourceName, "")
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		masterDB, err := Open(driverName, masterDataSourceName)
+		if err != nil {
+			return nil, errors.New("failed to open master database", err)
+		}
+		defer masterDB.Close()
 
-	// Create the testing database
-	_, err = masterDB.Exec("DROP DATABASE IF EXISTS " + testingDatabaseName)
-	if err != nil {
-		return nil, errors.New("failed to drop database %s", testingDatabaseName, err)
-	}
-	_, err = masterDB.Exec("CREATE DATABASE " + testingDatabaseName)
-	if err != nil {
-		return nil, errors.New("failed to create database %s", testingDatabaseName, err)
-	}
+		// Create the testing database
+		_, err = masterDB.Exec("DROP DATABASE IF EXISTS " + testingDatabaseName)
+		if err != nil {
+			return nil, errors.New("failed to drop database %s", testingDatabaseName, err)
+		}
+		_, err = masterDB.Exec("CREATE DATABASE " + testingDatabaseName)
+		if err != nil {
+			return nil, errors.New("failed to create database %s", testingDatabaseName, err)
+		}
 
-	// Cleanup leftover testing databases, on a best-effort basis.
-	// A testing database is considered leftover if it is more than 1 to 2 hours old.
-	stmt := ""
-	switch driverName {
-	case "mysql":
-		stmt = "SHOW DATABASES"
-	case "pgx":
-		stmt = "SELECT datname FROM pg_database"
-	case "mssql":
-		stmt = "SELECT name FROM sys.databases"
-	}
-	rows, err := masterDB.Query(stmt)
-	if err == nil {
-		defer rows.Close()
-		re := regexp.MustCompile(`^testing_[0-2][0-9]_`)
-		var leftoverDatabaseNames []string
-		h14 := now.Add(-time.Hour).Format("15")
-		h15 := now.Format("15")
-		h16 := now.Add(time.Hour).Format("15")
-		for rows.Next() {
-			var databaseName string
-			rows.Scan(&databaseName)
-			if re.MatchString(databaseName) &&
-				!strings.HasPrefix(databaseName, "testing_"+h14+"_") &&
-				!strings.HasPrefix(databaseName, "testing_"+h15+"_") &&
-				!strings.HasPrefix(databaseName, "testing_"+h16+"_") {
-				leftoverDatabaseNames = append(leftoverDatabaseNames, databaseName)
+		// Cleanup leftover testing databases, on a best-effort basis.
+		// A testing database is considered leftover if it is more than 1 to 2 hours old.
+		stmt := ""
+		switch driverName {
+		case "mysql":
+			stmt = "SHOW DATABASES"
+		case "pgx":
+			stmt = "SELECT datname FROM pg_database"
+		case "mssql":
+			stmt = "SELECT name FROM sys.databases"
+		}
+		rows, err := masterDB.Query(stmt)
+		if err == nil {
+			defer rows.Close()
+			re := regexp.MustCompile(`^testing_[0-2][0-9]_`)
+			var leftoverDatabaseNames []string
+			h14 := now.Add(-time.Hour).Format("15")
+			h15 := now.Format("15")
+			h16 := now.Add(time.Hour).Format("15")
+			for rows.Next() {
+				var databaseName string
+				rows.Scan(&databaseName)
+				if re.MatchString(databaseName) &&
+					!strings.HasPrefix(databaseName, "testing_"+h14+"_") &&
+					!strings.HasPrefix(databaseName, "testing_"+h15+"_") &&
+					!strings.HasPrefix(databaseName, "testing_"+h16+"_") {
+					leftoverDatabaseNames = append(leftoverDatabaseNames, databaseName)
+				}
+			}
+			for _, databaseName := range leftoverDatabaseNames {
+				masterDB.Exec("DROP DATABASE IF EXISTS " + databaseName)
 			}
 		}
-		for _, databaseName := range leftoverDatabaseNames {
-			masterDB.Exec("DROP DATABASE IF EXISTS " + databaseName)
-		}
+		masterDB.Close()
 	}
-	masterDB.Close()
 
 	// Open the new database
-	testingDataSourceName, err = setDatabaseInDataSourceName(driverName, dataSourceName, testingDatabaseName)
-	if err != nil {
-		return nil, errors.Trace(err)
+	if driverName == "sqlite" {
+		testingDataSourceName = dataSourceName
+	} else {
+		testingDataSourceName, err = setDatabaseInDataSourceName(driverName, dataSourceName, testingDatabaseName)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
 	}
 	testingDB, err := Open(driverName, testingDataSourceName)
 	if err != nil {
 		return nil, errors.New("failed to open testing database", err)
 	}
-	// Drop the database when it's no longer used
-	testingDB.dropTestingDatabase = func() (err error) {
-		masterDataSourceName, err := setDatabaseInDataSourceName(driverName, dataSourceName, "")
-		if err != nil {
-			return errors.Trace(err)
+
+	// Drop the testing database when it's no longer used.
+	// SQLite uses in-memory databases for testing, so this step is skipped.
+	if driverName != "sqlite" {
+		testingDB.dropTestingDatabase = func() (err error) {
+			masterDataSourceName, err := setDatabaseInDataSourceName(driverName, dataSourceName, "")
+			if err != nil {
+				return errors.Trace(err)
+			}
+			masterDB, err := Open(driverName, masterDataSourceName)
+			if err != nil {
+				return errors.New("failed to open master database", err)
+			}
+			defer masterDB.Close()
+			_, err = masterDB.Exec("DROP DATABASE IF EXISTS " + testingDatabaseName)
+			if err != nil {
+				return errors.New("failed to drop database %s", testingDatabaseName, err)
+			}
+			return nil
 		}
-		masterDB, err := Open(driverName, masterDataSourceName)
-		if err != nil {
-			return errors.New("failed to open master database", err)
-		}
-		defer masterDB.Close()
-		_, err = masterDB.Exec("DROP DATABASE IF EXISTS " + testingDatabaseName)
-		if err != nil {
-			return errors.New("failed to drop database %s", testingDatabaseName, err)
-		}
-		return nil
 	}
 
 	// Cache for other microservices running in the same test
@@ -669,6 +715,16 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 				PRIMARY KEY (seq_name, seq_num)
 			)
 		END`
+	case "sqlite":
+		stmt = `
+		CREATE TABLE IF NOT EXISTS sequel_migrations (
+			seq_name TEXT NOT NULL,
+			seq_num INTEGER NOT NULL,
+			completed INTEGER NOT NULL DEFAULT 0,
+			completed_on TEXT,
+			locked_before TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'now')),
+			PRIMARY KEY (seq_name, seq_num)
+		)`
 	default:
 		return errors.New("unsupported driver name: %s", db.driverName)
 	}
@@ -680,11 +736,9 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 	// Query for the high watermark
 	var nullableWatermark sql.NullInt32
 	switch db.driverName {
-	case "mysql":
+	case "mysql", "pgx":
 		stmt = `SELECT MAX(seq_num) FROM sequel_migrations WHERE seq_name=? AND completed=TRUE`
-	case "pgx":
-		stmt = `SELECT MAX(seq_num) FROM sequel_migrations WHERE seq_name=$1 AND completed=TRUE`
-	case "mssql":
+	case "mssql", "sqlite":
 		stmt = `SELECT MAX(seq_num) FROM sequel_migrations WHERE seq_name=? AND completed=1`
 	default:
 		return errors.New("unsupported driver name: %s", db.driverName)
@@ -739,7 +793,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		case "mysql":
 			stmt = `INSERT IGNORE INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
 		case "pgx":
-			stmt = `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES ($1, $2) ON CONFLICT DO NOTHING`
+			stmt = `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?) ON CONFLICT DO NOTHING`
 		case "mssql":
 			stmt = `
 			MERGE sequel_migrations AS tgt
@@ -748,6 +802,8 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			WHEN NOT MATCHED BY TARGET THEN
 				INSERT (seq_name, seq_num)
 				VALUES (src.seq_name, src.seq_num);`
+		case "sqlite":
+			stmt = `INSERT OR IGNORE INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
 		default:
 			return errors.New("unsupported driver name: %s", db.driverName)
 		}
@@ -757,16 +813,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		}
 
 		// See if completed by another process
-		switch db.driverName {
-		case "mysql":
-			stmt = `SELECT completed FROM sequel_migrations WHERE seq_name=? AND seq_num=?`
-		case "pgx":
-			stmt = `SELECT completed FROM sequel_migrations WHERE seq_name=$1 AND seq_num=$2`
-		case "mssql":
-			stmt = `SELECT completed FROM sequel_migrations WHERE seq_name=? AND seq_num=?`
-		default:
-			return errors.New("unsupported driver name: %s", db.driverName)
-		}
+		stmt = `SELECT completed FROM sequel_migrations WHERE seq_name=? AND seq_num=?`
 		row := db.QueryRow(stmt, sequenceName, seqNum)
 		var completed bool
 		err := row.Scan(&completed)
@@ -780,15 +827,12 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 
 		// Try to obtain a lock
 		switch db.driverName {
-		case "mysql":
-			stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 15 SECOND)
-					WHERE seq_name=? AND seq_num=? AND locked_before<UTC_TIMESTAMP(3) AND completed=FALSE`
-		case "pgx":
-			stmt = `UPDATE sequel_migrations SET locked_before=((NOW() + INTERVAL '15 seconds') AT TIME ZONE 'UTC')
-					WHERE seq_name=$1 AND seq_num=$2 AND locked_before<(NOW() AT TIME ZONE 'UTC') AND completed=FALSE`
-		case "mssql":
-			stmt = `UPDATE sequel_migrations SET locked_before=DATEADD(second, 15, SYSUTCDATETIME())
-					WHERE seq_name=? AND seq_num=? AND locked_before<SYSUTCDATETIME() AND completed=0`
+		case "mysql", "pgx":
+			stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000)
+					WHERE seq_name=? AND seq_num=? AND locked_before<NOW_UTC() AND completed=FALSE`
+		case "mssql", "sqlite":
+			stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000)
+					WHERE seq_name=? AND seq_num=? AND locked_before<NOW_UTC() AND completed=0`
 		default:
 			return errors.New("unsupported driver name: %s", db.driverName)
 		}
@@ -851,16 +895,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 				exit = true
 			case <-time.After(5 * time.Second):
 				// Extend the lock while the migration is in progress
-				switch db.driverName {
-				case "mysql":
-					stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD(UTC_TIMESTAMP(3), INTERVAL 15 SECOND) WHERE seq_name=? AND seq_num=?`
-				case "pgx":
-					stmt = `UPDATE sequel_migrations SET locked_before=((NOW() + INTERVAL '15 seconds') AT TIME ZONE 'UTC') WHERE seq_name=$1 AND seq_num=$2`
-				case "mssql":
-					stmt = `UPDATE sequel_migrations SET locked_before=DATEADD(second, 15, SYSUTCDATETIME()) WHERE seq_name=? AND seq_num=?`
-				default:
-					return errors.New("unsupported driver name: %s", db.driverName)
-				}
+				stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000) WHERE seq_name=? AND seq_num=?`
 				_, err = db.Exec(stmt, sequenceName, seqNum)
 				if err != nil {
 					exit = true
@@ -870,28 +905,17 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 
 		if err != nil {
 			// Release the lock
-			switch db.driverName {
-			case "mysql":
-				stmt = `UPDATE sequel_migrations SET locked_before=UTC_TIMESTAMP(3) WHERE seq_name=? AND seq_num=?`
-			case "pgx":
-				stmt = `UPDATE sequel_migrations SET locked_before=(NOW() AT TIME ZONE 'UTC') WHERE seq_name=$1 AND seq_num=$2`
-			case "mssql":
-				stmt = `UPDATE sequel_migrations SET locked_before=SYSUTCDATETIME() WHERE seq_name=? AND seq_num=?`
-			default:
-				return errors.New("unsupported driver name: %s", db.driverName)
-			}
+			stmt = `UPDATE sequel_migrations SET locked_before=NOW_UTC() WHERE seq_name=? AND seq_num=?`
 			_, _ = db.Exec(stmt, sequenceName, seqNum)
 			return errors.New("error running migration %s", fileNames[seqNum], err)
 		}
 
 		// Mark as complete
 		switch db.driverName {
-		case "mysql":
-			stmt = `UPDATE sequel_migrations SET locked_before=UTC_TIMESTAMP(3), completed_on=UTC_TIMESTAMP(3), completed=TRUE WHERE seq_name=? AND seq_num=?`
-		case "pgx":
-			stmt = `UPDATE sequel_migrations SET locked_before=(NOW() AT TIME ZONE 'UTC'), completed_on=(NOW() AT TIME ZONE 'UTC'), completed=TRUE WHERE seq_name=$1 AND seq_num=$2`
-		case "mssql":
-			stmt = `UPDATE sequel_migrations SET locked_before=SYSUTCDATETIME(), completed_on=SYSUTCDATETIME(), completed=1 WHERE seq_name=? AND seq_num=?`
+		case "mysql", "pgx":
+			stmt = `UPDATE sequel_migrations SET locked_before=NOW_UTC(), completed_on=NOW_UTC(), completed=TRUE WHERE seq_name=? AND seq_num=?`
+		case "mssql", "sqlite":
+			stmt = `UPDATE sequel_migrations SET locked_before=NOW_UTC(), completed_on=NOW_UTC(), completed=1 WHERE seq_name=? AND seq_num=?`
 		default:
 			return errors.New("unsupported driver name: %s", db.driverName)
 		}
@@ -984,6 +1008,8 @@ func (db *DB) NowUTC() string {
 		return "(NOW() AT TIME ZONE 'UTC')"
 	case "mssql":
 		return "SYSUTCDATETIME()"
+	case "sqlite":
+		return "STRFTIME('%Y-%m-%d %H:%M:%f', 'now')"
 	default:
 		return ""
 	}
@@ -1008,6 +1034,8 @@ func (db *DB) RegexpTextSearch(searchableColumns ...string) string {
 	case "mssql":
 		// The database compatibility level must be set to 170 or higher
 		return "REGEXP_LIKE(" + concatenated + ", ?, 'i')"
+	case "sqlite":
+		return concatenated + " LIKE ('%' || ? || '%')"
 	default:
 		return ""
 	}
