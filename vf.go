@@ -38,6 +38,7 @@ var (
 		newVirtualFunc("DATE_ADD_MILLIS", vfDateAddMillis),
 		newVirtualFunc("DATE_DIFF_MILLIS", vfDateDiffMillis),
 		newVirtualFunc("LIMIT_OFFSET", vfLimitOffset),
+		newVirtualFunc("FOR_UPDATE", vfForUpdate),
 	}
 )
 
@@ -267,6 +268,25 @@ func vfLimitOffset(driverName string, args string) (string, error) {
 		return "LIMIT " + limit + " OFFSET " + offset, nil
 	case "mssql":
 		return "OFFSET " + offset + " ROWS FETCH NEXT " + limit + " ROWS ONLY", nil
+	default:
+		return "", errors.New("unsupported driver name: %s", driverName)
+	}
+}
+
+// vfForUpdate is the handler for the FOR_UPDATE() virtual function.
+// It appends FOR UPDATE to a SELECT statement for row-level locking.
+// SQLite does not support FOR UPDATE; its transaction-level locking is sufficient,
+// so the function expands to an empty string.
+//
+//	SELECT * FROM users WHERE id=? FOR_UPDATE()
+func vfForUpdate(driverName string, args string) (string, error) {
+	switch driverName {
+	case "mysql", "pgx":
+		return "FOR UPDATE", nil
+	case "mssql":
+		return "WITH (UPDLOCK, ROWLOCK)", nil
+	case "sqlite":
+		return "", nil
 	default:
 		return "", errors.New("unsupported driver name: %s", driverName)
 	}
