@@ -502,7 +502,7 @@ func OpenTesting(driverName string, dataSourceName string, uniqueTestID string) 
 	if dataSourceName == "" {
 		switch driverName {
 		case "", "sqlite":
-			dataSourceName = ":memory:"
+			dataSourceName = "file:?mode=memory&cache=shared"
 		case "mysql":
 			dataSourceName = "root:root@tcp(127.0.0.1:3306)/"
 		case "pgx":
@@ -610,13 +610,9 @@ func OpenTesting(driverName string, dataSourceName string, uniqueTestID string) 
 	}
 
 	// Open the new database
-	if driverName == "sqlite" {
-		testingDataSourceName = dataSourceName
-	} else {
-		testingDataSourceName, err = setDatabaseInDataSourceName(driverName, dataSourceName, testingDatabaseName)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
+	testingDataSourceName, err = setDatabaseInDataSourceName(driverName, dataSourceName, testingDatabaseName)
+	if err != nil {
+		return nil, errors.Trace(err)
 	}
 	testingDB, err := Open(driverName, testingDataSourceName)
 	if err != nil {
@@ -624,7 +620,7 @@ func OpenTesting(driverName string, dataSourceName string, uniqueTestID string) 
 	}
 
 	// Drop the testing database when it's no longer used.
-	// SQLite uses in-memory databases for testing, so this step is skipped.
+	// SQLite uses in-memory databases that are automatically freed when all connections close.
 	if driverName != "sqlite" {
 		testingDB.dropTestingDatabase = func() (err error) {
 			masterDataSourceName, err := setDatabaseInDataSourceName(driverName, dataSourceName, "")
