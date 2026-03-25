@@ -496,6 +496,12 @@ func TestDB_UnpackQuery_Composed(t *testing.T) {
 	assert.NoError(err)
 	assert.Equal("SELECT EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - created_at)) * 1000.0", q)
 
+	// NOW_UTC inside DATE_DIFF_MILLIS on SQLite — the comma inside STRFTIME must not split the arguments
+	db = newTestDB("sqlite")
+	q, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(not_before, NOW_UTC())")
+	assert.NoError(err)
+	assert.Equal("SELECT (JULIANDAY(not_before) - JULIANDAY(STRFTIME('%Y-%m-%d %H:%M:%f', 'now'))) * 86400000.0", q)
+
 	// No virtual functions, just placeholders
 	db = newTestDB("pgx")
 	q, err = db.UnpackQuery("SELECT * FROM t WHERE a=? AND b=?")

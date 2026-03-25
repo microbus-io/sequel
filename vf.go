@@ -182,6 +182,30 @@ func vfRegexpTextSearch(driverName string, args string) (string, error) {
 	}
 }
 
+// lastTopLevelComma finds the last comma in s that is not inside parentheses or quotes.
+// Returns -1 if no top-level comma is found.
+func lastTopLevelComma(s string) int {
+	depth := 0
+	lastComma := -1
+	for i := 0; i < len(s); i++ {
+		ch := s[i]
+		if ch == '\'' || ch == '"' {
+			// Skip to closing quote
+			i++
+			for i < len(s) && s[i] != ch {
+				i++
+			}
+		} else if ch == '(' {
+			depth++
+		} else if ch == ')' {
+			depth--
+		} else if ch == ',' && depth == 0 {
+			lastComma = i
+		}
+	}
+	return lastComma
+}
+
 // vfDateAddMillis is the handler for the DATE_ADD_MILLIS() virtual function.
 // The syntax is DATE_ADD_MILLIS(baseExpr, milliseconds) where baseExpr is a timestamp
 // expression and milliseconds is a numeric value. The baseExpr is recursively unpacked,
@@ -191,7 +215,7 @@ func vfRegexpTextSearch(driverName string, args string) (string, error) {
 //	DATE_ADD_MILLIS(NOW_UTC(), ?)
 func vfDateAddMillis(driverName string, args string) (string, error) {
 	// Split by the last comma to separate baseExpr from milliseconds
-	lastComma := strings.LastIndex(args, ",")
+	lastComma := lastTopLevelComma(args)
 	if lastComma < 0 {
 		return "", errors.New("DATE_ADD_MILLIS requires syntax: DATE_ADD_MILLIS(baseExpr, milliseconds)")
 	}
@@ -222,7 +246,7 @@ func vfDateAddMillis(driverName string, args string) (string, error) {
 //	DATE_DIFF_MILLIS(updated_at, created_at)
 //	DATE_DIFF_MILLIS(NOW_UTC(), created_at)
 func vfDateDiffMillis(driverName string, args string) (string, error) {
-	lastComma := strings.LastIndex(args, ",")
+	lastComma := lastTopLevelComma(args)
 	if lastComma < 0 {
 		return "", errors.New("DATE_DIFF_MILLIS requires syntax: DATE_DIFF_MILLIS(a, b)")
 	}
@@ -254,7 +278,7 @@ func vfDateDiffMillis(driverName string, args string) (string, error) {
 //
 // Note: SQL Server requires an ORDER BY clause for OFFSET/FETCH to work.
 func vfLimitOffset(driverName string, args string) (string, error) {
-	comma := strings.LastIndex(args, ",")
+	comma := lastTopLevelComma(args)
 	if comma < 0 {
 		return "", errors.New("LIMIT_OFFSET requires syntax: LIMIT_OFFSET(limit, offset)")
 	}
