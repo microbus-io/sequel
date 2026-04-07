@@ -135,7 +135,7 @@ func vfNowUTC(driverName string, args string) (string, error) {
 	case "mssql":
 		return "SYSUTCDATETIME()", nil
 	case "sqlite":
-		return "STRFTIME('%Y-%m-%d %H:%M:%f', 'now')", nil
+		return "(STRFTIME('%Y-%m-%d %H:%M:%f', 'now'))", nil
 	default:
 		return "", errors.New("unsupported driver name: %s", driverName)
 	}
@@ -170,13 +170,13 @@ func vfRegexpTextSearch(driverName string, args string) (string, error) {
 	}
 	switch driverName {
 	case "mysql":
-		return concatenated + " REGEXP " + searchExpr, nil
+		return "(" + concatenated + " REGEXP " + searchExpr + ")", nil
 	case "pgx":
 		return "REGEXP_LIKE(" + concatenated + ", " + searchExpr + ", 'i')", nil
 	case "mssql":
 		return "REGEXP_LIKE(" + concatenated + ", " + searchExpr + ", 'i')", nil
 	case "sqlite":
-		return concatenated + " LIKE ('%' || " + searchExpr + " || '%')", nil
+		return "(" + concatenated + " LIKE ('%' || " + searchExpr + " || '%'))", nil
 	default:
 		return "", errors.New("unsupported driver name: %s", driverName)
 	}
@@ -228,11 +228,11 @@ func vfDateAddMillis(driverName string, args string) (string, error) {
 	case "mysql":
 		return "DATE_ADD(" + baseExpr + ", INTERVAL (" + millis + ") * 1000 MICROSECOND)", nil
 	case "pgx":
-		return baseExpr + " + MAKE_INTERVAL(secs => (" + millis + ") / 1000.0)", nil
+		return "(" + baseExpr + " + MAKE_INTERVAL(secs => (" + millis + ") / 1000.0))", nil
 	case "mssql":
 		return "DATEADD(MILLISECOND, " + millis + ", " + baseExpr + ")", nil
 	case "sqlite":
-		return "STRFTIME('%Y-%m-%d %H:%M:%f', " + baseExpr + ", '+' || ((" + millis + ") / 1000.0) || ' seconds')", nil
+		return "(STRFTIME('%Y-%m-%d %H:%M:%f', " + baseExpr + ", '+' || ((" + millis + ") / 1000.0) || ' seconds'))", nil
 	default:
 		return "", errors.New("unsupported driver name: %s", driverName)
 	}
@@ -257,13 +257,13 @@ func vfDateDiffMillis(driverName string, args string) (string, error) {
 	}
 	switch driverName {
 	case "mysql":
-		return "TIMESTAMPDIFF(MICROSECOND, " + b + ", " + a + ") / 1000.0", nil
+		return "(TIMESTAMPDIFF(MICROSECOND, " + b + ", " + a + ") / 1000.0)", nil
 	case "pgx":
-		return "EXTRACT(EPOCH FROM (" + a + " - " + b + ")) * 1000.0", nil
+		return "(EXTRACT(EPOCH FROM (" + a + " - " + b + ")) * 1000.0)", nil
 	case "mssql":
 		return "DATEDIFF_BIG(MILLISECOND, " + b + ", " + a + ")", nil
 	case "sqlite":
-		return "(JULIANDAY(" + a + ") - JULIANDAY(" + b + ")) * 86400000.0", nil
+		return "((JULIANDAY(" + a + ") - JULIANDAY(" + b + ")) * 86400000.0)", nil
 	default:
 		return "", errors.New("unsupported driver name: %s", driverName)
 	}

@@ -350,7 +350,7 @@ func TestDB_UnpackQuery_NowUTC(t *testing.T) {
 	db = newTestDB("sqlite")
 	q, err = db.UnpackQuery("UPDATE t SET updated_at=NOW_UTC() WHERE id=?")
 	assert.NoError(err)
-	assert.Equal("UPDATE t SET updated_at=STRFTIME('%Y-%m-%d %H:%M:%f', 'now') WHERE id=?", q)
+	assert.Equal("UPDATE t SET updated_at=(STRFTIME('%Y-%m-%d %H:%M:%f', 'now')) WHERE id=?", q)
 
 	// Case insensitive
 	db = newTestDB("mysql")
@@ -367,7 +367,7 @@ func TestDB_UnpackQuery_RegexpTextSearch(t *testing.T) {
 	db := newTestDB("mysql")
 	q, err := db.UnpackQuery("SELECT * FROM t WHERE REGEXP_TEXT_SEARCH(? IN name, email)")
 	assert.NoError(err)
-	assert.Equal("SELECT * FROM t WHERE CONCAT_WS(' ',name,email) REGEXP ?", q)
+	assert.Equal("SELECT * FROM t WHERE (CONCAT_WS(' ',name,email) REGEXP ?)", q)
 
 	db = newTestDB("pgx")
 	q, err = db.UnpackQuery("SELECT * FROM t WHERE REGEXP_TEXT_SEARCH(? IN name)")
@@ -377,7 +377,7 @@ func TestDB_UnpackQuery_RegexpTextSearch(t *testing.T) {
 	db = newTestDB("sqlite")
 	q, err = db.UnpackQuery("SELECT * FROM t WHERE REGEXP_TEXT_SEARCH(? IN name, email)")
 	assert.NoError(err)
-	assert.Equal("SELECT * FROM t WHERE CONCAT_WS(' ',name,email) LIKE ('%' || ? || '%')", q)
+	assert.Equal("SELECT * FROM t WHERE (CONCAT_WS(' ',name,email) LIKE ('%' || ? || '%'))", q)
 
 	// Missing IN
 	db = newTestDB("mysql")
@@ -397,7 +397,7 @@ func TestDB_UnpackQuery_DateAddMillis(t *testing.T) {
 	db = newTestDB("pgx")
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, ?)")
 	assert.NoError(err)
-	assert.Equal("SELECT created_at + MAKE_INTERVAL(secs => ($1) / 1000.0)", q)
+	assert.Equal("SELECT (created_at + MAKE_INTERVAL(secs => ($1) / 1000.0))", q)
 
 	db = newTestDB("mssql")
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, 5000)")
@@ -407,7 +407,7 @@ func TestDB_UnpackQuery_DateAddMillis(t *testing.T) {
 	db = newTestDB("sqlite")
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, 5000)")
 	assert.NoError(err)
-	assert.Equal("SELECT STRFTIME('%Y-%m-%d %H:%M:%f', created_at, '+' || ((5000) / 1000.0) || ' seconds')", q)
+	assert.Equal("SELECT (STRFTIME('%Y-%m-%d %H:%M:%f', created_at, '+' || ((5000) / 1000.0) || ' seconds'))", q)
 
 	// Missing comma
 	db = newTestDB("mysql")
@@ -422,12 +422,12 @@ func TestDB_UnpackQuery_DateDiffMillis(t *testing.T) {
 	db := newTestDB("mysql")
 	q, err := db.UnpackQuery("SELECT DATE_DIFF_MILLIS(updated_at, created_at)")
 	assert.NoError(err)
-	assert.Equal("SELECT TIMESTAMPDIFF(MICROSECOND, created_at, updated_at) / 1000.0", q)
+	assert.Equal("SELECT (TIMESTAMPDIFF(MICROSECOND, created_at, updated_at) / 1000.0)", q)
 
 	db = newTestDB("pgx")
 	q, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(updated_at, created_at)")
 	assert.NoError(err)
-	assert.Equal("SELECT EXTRACT(EPOCH FROM (updated_at - created_at)) * 1000.0", q)
+	assert.Equal("SELECT (EXTRACT(EPOCH FROM (updated_at - created_at)) * 1000.0)", q)
 
 	db = newTestDB("mssql")
 	q, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(updated_at, created_at)")
@@ -437,7 +437,7 @@ func TestDB_UnpackQuery_DateDiffMillis(t *testing.T) {
 	db = newTestDB("sqlite")
 	q, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(updated_at, created_at)")
 	assert.NoError(err)
-	assert.Equal("SELECT (JULIANDAY(updated_at) - JULIANDAY(created_at)) * 86400000.0", q)
+	assert.Equal("SELECT ((JULIANDAY(updated_at) - JULIANDAY(created_at)) * 86400000.0)", q)
 
 	// Missing comma
 	db = newTestDB("mysql")
@@ -494,13 +494,13 @@ func TestDB_UnpackQuery_Composed(t *testing.T) {
 	db = newTestDB("pgx")
 	q, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(NOW_UTC(), created_at)")
 	assert.NoError(err)
-	assert.Equal("SELECT EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - created_at)) * 1000.0", q)
+	assert.Equal("SELECT (EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - created_at)) * 1000.0)", q)
 
 	// NOW_UTC inside DATE_DIFF_MILLIS on SQLite — the comma inside STRFTIME must not split the arguments
 	db = newTestDB("sqlite")
 	q, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(not_before, NOW_UTC())")
 	assert.NoError(err)
-	assert.Equal("SELECT (JULIANDAY(not_before) - JULIANDAY(STRFTIME('%Y-%m-%d %H:%M:%f', 'now'))) * 86400000.0", q)
+	assert.Equal("SELECT ((JULIANDAY(not_before) - JULIANDAY((STRFTIME('%Y-%m-%d %H:%M:%f', 'now')))) * 86400000.0)", q)
 
 	// No virtual functions, just placeholders
 	db = newTestDB("pgx")
