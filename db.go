@@ -147,6 +147,22 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 			sqlDB.Close()
 			return nil, errors.Trace(err)
 		}
+	case "sqlite":
+		if !strings.Contains(dataSourceName, "busy_timeout") {
+			// Set a busy_timeout so that concurrent writers retry on lock contention
+			// instead of immediately returning SQLITE_BUSY. Without this, in-memory and
+			// shared-cache SQLite databases serialize write transactions but bare writes
+			// from concurrent connections fail rather than wait.
+			if strings.Contains(dataSourceName, "?") {
+				dataSourceName += "&_pragma=busy_timeout(1000)"
+			} else {
+				dataSourceName += "?_pragma=busy_timeout(1000)"
+			}
+		}
+		sqlDB, err = sql.Open(driverName, dataSourceName)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
 	default:
 		sqlDB, err = sql.Open(driverName, dataSourceName)
 		if err != nil {
@@ -159,6 +175,28 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 	singletonDB.refCount = 1
 	singletonDB.adjustConnectionLimits()
 	return singletonDB, nil
+}
+
+// IsLockContentionError returns true if the error indicates database lock contention or a deadlock.
+// Such errors are transient and the operation can typically be retried.
+// Recognizes lock errors from SQLite, MySQL, and PostgreSQL.
+func IsLockContentionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "SQLITE_BUSY"), strings.Contains(msg, "database is locked"): // SQLite
+		return true
+	case strings.Contains(msg, "Deadlock found"), strings.Contains(msg, "Lock wait timeout"): // MySQL
+		return true
+	case strings.Contains(msg, "deadlock detected"): // PostgreSQL
+		return true
+	case strings.Contains(msg, "deadlock victim"), strings.Contains(msg, "was deadlocked"), // SQL Server (1205)
+		strings.Contains(msg, "Lock request time out"): // SQL Server (1222)
+		return true
+	}
+	return false
 }
 
 // Close closes the database connection.
