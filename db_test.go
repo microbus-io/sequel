@@ -335,7 +335,7 @@ func TestDB_UnpackQuery_NowUTC(t *testing.T) {
 	db := newTestDB("mysql")
 	q, err := db.UnpackQuery("UPDATE t SET updated_at=NOW_UTC() WHERE id=?")
 	assert.NoError(err)
-	assert.Equal("UPDATE t SET updated_at=UTC_TIMESTAMP(3) WHERE id=?", q)
+	assert.Equal("UPDATE t SET updated_at=(UTC_TIMESTAMP(3)) WHERE id=?", q)
 
 	db = newTestDB("pgx")
 	q, err = db.UnpackQuery("UPDATE t SET updated_at=NOW_UTC() WHERE id=?")
@@ -356,7 +356,7 @@ func TestDB_UnpackQuery_NowUTC(t *testing.T) {
 	db = newTestDB("mysql")
 	q, err = db.UnpackQuery("SELECT now_utc()")
 	assert.NoError(err)
-	assert.Equal("SELECT UTC_TIMESTAMP(3)", q)
+	assert.Equal("SELECT (UTC_TIMESTAMP(3))", q)
 
 }
 
@@ -488,7 +488,7 @@ func TestDB_UnpackQuery_Composed(t *testing.T) {
 	db := newTestDB("mysql")
 	q, err := db.UnpackQuery("SELECT DATE_ADD_MILLIS(NOW_UTC(), ?)")
 	assert.NoError(err)
-	assert.Equal("SELECT DATE_ADD(UTC_TIMESTAMP(3), INTERVAL (?) * 1000 MICROSECOND)", q)
+	assert.Equal("SELECT DATE_ADD((UTC_TIMESTAMP(3)), INTERVAL (?) * 1000 MICROSECOND)", q)
 
 	// NOW_UTC inside DATE_DIFF_MILLIS
 	db = newTestDB("pgx")

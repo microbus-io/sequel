@@ -128,7 +128,7 @@ func expandVirtualFuncs(driverName string, query string) (string, error) {
 func vfNowUTC(driverName string, args string) (string, error) {
 	switch driverName {
 	case "mysql":
-		return "UTC_TIMESTAMP(3)", nil
+		return "(UTC_TIMESTAMP(3))", nil
 	case "pgx":
 		return "(NOW() AT TIME ZONE 'UTC')", nil
 	case "mssql":
