@@ -141,9 +141,9 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 			// shared-cache SQLite databases serialize write transactions but bare writes
 			// from concurrent connections fail rather than wait.
 			if strings.Contains(dataSourceName, "?") {
-				dataSourceName += "&_pragma=busy_timeout(1000)"
+				dataSourceName += "&_pragma=busy_timeout(2000)"
 			} else {
-				dataSourceName += "?_pragma=busy_timeout(1000)"
+				dataSourceName += "?_pragma=busy_timeout(2000)"
 			}
 		}
 		sqlDB, err = sql.Open(driverName, dataSourceName)
