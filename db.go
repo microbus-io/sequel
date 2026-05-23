@@ -45,6 +45,7 @@ var (
 	testingDSNs        = map[string]string{}
 	testingGlobalMutex sync.Mutex
 	testingMutexes     = map[string]*sync.Mutex{}
+	testingStartedAt   = time.Now().UTC()
 
 	valuesClausePattern = regexp.MustCompile(`(?i)\s+VALUES\s*`)
 )
@@ -521,6 +522,9 @@ If a data source name is not provided, the following defaults are used based on 
   - mysql: root:root@tcp(127.0.0.1:3306)/
   - pgx: postgres://postgres:postgres@127.0.0.1:5432/
   - mssql: sqlserver://sa:Password123@127.0.0.1:1433
+
+The unique test ID is used to create a distinct database name for each test so that connections opened
+by multiple actors in the same test share the same connection pool.
 */
 func OpenTesting(driverName string, dataSourceName string, uniqueTestID string) (db *DB, err error) {
 	// Set default connection to localhost
@@ -540,6 +544,13 @@ func OpenTesting(driverName string, dataSourceName string, uniqueTestID string) 
 	}
 	if driverName == "" {
 		driverName = inferDriverName(dataSourceName)
+	}
+	if driverName == "sqlite" && !strings.Contains(dataSourceName, "mode=memory") && !strings.Contains(dataSourceName, "cache=shared") {
+		if strings.Contains(dataSourceName, "?") {
+			dataSourceName += "&mode=memory&cache=shared"
+		} else {
+			dataSourceName += "?mode=memory&cache=shared"
+		}
 	}
 
 	cacheKey := hashStr(driverName + "|" + dataSourceName + "|" + uniqueTestID)
@@ -571,7 +582,7 @@ func OpenTesting(driverName string, dataSourceName string, uniqueTestID string) 
 	if baseDatabaseName != "" {
 		baseDatabaseName = strings.ToLower(baseDatabaseName) + "_"
 	}
-	now := time.Now().UTC()
+	now := testingStartedAt // Avoid hour change mid-run
 	testingDatabaseName := "testing_" + now.Format("15") + "_" + baseDatabaseName + strings.ToLower(uniqueTestID)
 	testingDatabaseName = regexp.MustCompile(`[^a-z0-9_]`).ReplaceAllString(testingDatabaseName, "_")
 
@@ -711,7 +722,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			seq_num INT NOT NULL,
 			completed BOOL NOT NULL DEFAULT FALSE,
 			completed_on DATETIME(3),
-			locked_before DATETIME(3) NOT NULL DEFAULT (UTC_TIMESTAMP(3)),
+			locked_before DATETIME(3) NOT NULL DEFAULT NOW_UTC(),
 			PRIMARY KEY (seq_name, seq_num)
 		)`
 	case "pgx":
@@ -721,7 +732,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			seq_num INT NOT NULL,
 			completed BOOL NOT NULL DEFAULT FALSE,
 			completed_on TIMESTAMP(3),
-			locked_before TIMESTAMP(3) NOT NULL DEFAULT (NOW() AT TIME ZONE 'UTC'),
+			locked_before TIMESTAMP(3) NOT NULL DEFAULT NOW_UTC(),
 			PRIMARY KEY (seq_name, seq_num)
 		)`
 	case "mssql":
@@ -732,7 +743,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 				seq_num INT NOT NULL,
 				completed BIT NOT NULL DEFAULT 0,
 				completed_on DATETIME2(3),
-				locked_before DATETIME2(3) NOT NULL DEFAULT (SYSUTCDATETIME()),
+				locked_before DATETIME2(3) NOT NULL DEFAULT NOW_UTC(),
 				PRIMARY KEY (seq_name, seq_num)
 			)
 		END`
@@ -743,7 +754,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			seq_num INTEGER NOT NULL,
 			completed INTEGER NOT NULL DEFAULT 0,
 			completed_on TEXT,
-			locked_before TEXT NOT NULL DEFAULT (STRFTIME('%Y-%m-%d %H:%M:%f', 'now')),
+			locked_before TEXT NOT NULL DEFAULT NOW_UTC(),
 			PRIMARY KEY (seq_name, seq_num)
 		)`
 	default:
