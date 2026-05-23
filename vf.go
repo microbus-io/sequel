@@ -25,20 +25,28 @@ import (
 )
 
 type virtualFunc struct {
-	name        string
-	namePattern *regexp.Regexp
-	handler     func(driverName string, args string) (string, error)
+	name    string
+	handler func(driverName string, args string) (string, error)
 }
+
+// virtualFuncCacheSize bounds the number of expanded queries retained in the LRU cache.
+const virtualFuncCacheSize = 4096
+
+// vfIdentPattern matches an identifier directly followed by '('.
+// It is intentionally a single, VF-list-independent pass over the query.
+var vfIdentPattern = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*\(`)
 
 var (
 	virtualFuncsMutex sync.RWMutex
-	virtualFuncsList  = []virtualFunc{
-		newVirtualFunc("NOW_UTC", vfNowUTC),
-		newVirtualFunc("REGEXP_TEXT_SEARCH", vfRegexpTextSearch),
-		newVirtualFunc("DATE_ADD_MILLIS", vfDateAddMillis),
-		newVirtualFunc("DATE_DIFF_MILLIS", vfDateDiffMillis),
-		newVirtualFunc("LIMIT_OFFSET", vfLimitOffset),
+	virtualFuncsMap   = map[string]virtualFunc{
+		"NOW_UTC":            {name: "NOW_UTC", handler: vfNowUTC},
+		"REGEXP_TEXT_SEARCH": {name: "REGEXP_TEXT_SEARCH", handler: vfRegexpTextSearch},
+		"DATE_ADD_MILLIS":    {name: "DATE_ADD_MILLIS", handler: vfDateAddMillis},
+		"DATE_DIFF_MILLIS":   {name: "DATE_DIFF_MILLIS", handler: vfDateDiffMillis},
+		"LIMIT_OFFSET":       {name: "LIMIT_OFFSET", handler: vfLimitOffset},
 	}
+
+	expandCache = newVFCache(virtualFuncCacheSize)
 )
 
 // RegisterVirtualFunc registers a virtual SQL function that will be replaced in queries
@@ -47,80 +55,132 @@ var (
 // The handler receives the driver name and the string found between the parentheses,
 // and returns the replacement SQL expression, or an error.
 func RegisterVirtualFunc(name string, handler func(driverName string, args string) (string, error)) {
+	upper := strings.ToUpper(name)
 	virtualFuncsMutex.Lock()
-	defer virtualFuncsMutex.Unlock()
-	vf := newVirtualFunc(name, handler)
-	// Replace existing entry with the same name, if any
-	for i, existing := range virtualFuncsList {
-		if existing.name == vf.name {
-			virtualFuncsList[i] = vf
-			return
-		}
-	}
-	virtualFuncsList = append(virtualFuncsList, vf)
-}
-
-// newVirtualFunc creates a virtualFunc with a compiled pattern for the given name.
-func newVirtualFunc(name string, handler func(driverName string, args string) (string, error)) virtualFunc {
-	return virtualFunc{
-		name:        strings.ToUpper(name),
-		namePattern: regexp.MustCompile(`(?i)` + regexp.QuoteMeta(name) + `\(`),
-		handler:     handler,
-	}
+	virtualFuncsMap[upper] = virtualFunc{name: upper, handler: handler}
+	virtualFuncsMutex.Unlock()
+	// Registration invalidates previously-cached expansions.
+	expandCache.clear()
 }
 
 // expandVirtualFuncs replaces virtual function calls in the query with driver-specific expressions.
 // Parentheses in arguments are balanced so that nested function calls (e.g. DATE_ADD_MILLIS(NOW_UTC(), ?)) work.
 // Multiple passes are performed until no more expansions occur, allowing inner virtual functions
 // to be expanded before outer ones that depend on them.
+//
+// The result is cached in a bounded LRU keyed on (driverName, query), so repeated calls with the
+// same literal query short-circuit to a map lookup.
 func expandVirtualFuncs(driverName string, query string) (string, error) {
-	virtualFuncsMutex.RLock()
-	vfs := virtualFuncsList
-	virtualFuncsMutex.RUnlock()
-	for {
-		prev := query
-		for _, vf := range vfs {
-			loc := vf.namePattern.FindStringIndex(query)
-			if loc == nil {
-				continue
-			}
-			// loc[1] points right after the opening '('
-			// Find the balanced closing ')', skipping quoted regions
-			depth := 1
-			closePos := -1
-			for i := loc[1]; i < len(query); i++ {
-				ch := query[i]
-				if ch == '\'' || ch == '"' {
-					// Skip to closing quote
-					i++
-					for i < len(query) && query[i] != ch {
-						i++
-					}
-				} else if ch == '(' {
-					depth++
-				} else if ch == ')' {
-					depth--
-					if depth == 0 {
-						closePos = i
-						break
-					}
-				}
-			}
-			if closePos < 0 {
-				continue // Unbalanced parens, skip
-			}
-			args := query[loc[1]:closePos]
-			result, err := vf.handler(driverName, args)
-			if err != nil {
-				return "", errors.Trace(err)
-			}
-			query = query[:loc[0]] + result + query[closePos+1:]
-		}
-		if query == prev {
-			break
+	return expandVirtualFuncsWithCache(driverName, query, expandCache)
+}
+
+// expandVirtualFuncsWithCache is the testable form of expandVirtualFuncs: it expands using the
+// given cache (or no cache if nil). The cache stores both successful expansions and errors, so a
+// query whose handler returns an error does not have to be re-scanned every time.
+func expandVirtualFuncsWithCache(driverName string, query string, cache *vfCache) (string, error) {
+	key := vfCacheKey{driver: driverName, query: query}
+	if cache != nil {
+		if v, ok := cache.get(key); ok {
+			return v.expanded, v.err
 		}
 	}
-	return query, nil
+	expanded, err := expandVirtualFuncsUncached(driverName, query)
+	if cache != nil {
+		cache.put(key, vfCacheValue{expanded: expanded, err: err})
+	}
+	return expanded, err
+}
+
+// expandVirtualFuncsUncached performs the actual macro expansion, with no caching.
+func expandVirtualFuncsUncached(driverName string, query string) (string, error) {
+	virtualFuncsMutex.RLock()
+	vfs := virtualFuncsMap
+	virtualFuncsMutex.RUnlock()
+
+	// Iterate until no further expansion happens. Each outer iteration runs a single
+	// left-to-right scan over the query, expanding every virtual function call it finds.
+	// Nested virtual functions inside an expansion result are picked up on the next pass.
+	for {
+		next, changed, err := expandOnce(driverName, query, vfs)
+		if err != nil {
+			return "", errors.Trace(err)
+		}
+		if !changed {
+			return next, nil
+		}
+		query = next
+	}
+}
+
+// expandOnce performs a single left-to-right scan, expanding every virtual function call.
+// It returns the (possibly new) query, whether any expansion occurred, and any error.
+func expandOnce(driverName, query string, vfs map[string]virtualFunc) (string, bool, error) {
+	var b strings.Builder
+	changed := false
+	i := 0
+	for i < len(query) {
+		loc := vfIdentPattern.FindStringIndex(query[i:])
+		if loc == nil {
+			b.WriteString(query[i:])
+			break
+		}
+		absStart := i + loc[0]
+		absEnd := i + loc[1] // position just after the opening '('
+		// Identifier excludes the trailing '('.
+		name := query[absStart : absEnd-1]
+		vf, ok := vfs[strings.ToUpper(name)]
+		if !ok {
+			// Not a virtual function — skip past the '(' and keep scanning.
+			b.WriteString(query[i:absEnd])
+			i = absEnd
+			continue
+		}
+		closePos := findBalancedClose(query, absEnd)
+		if closePos < 0 {
+			// Unbalanced; emit verbatim and continue scanning.
+			b.WriteString(query[i:absEnd])
+			i = absEnd
+			continue
+		}
+		args := query[absEnd:closePos]
+		result, err := vf.handler(driverName, args)
+		if err != nil {
+			return "", false, err
+		}
+		b.WriteString(query[i:absStart])
+		b.WriteString(result)
+		i = closePos + 1
+		changed = true
+	}
+	if !changed {
+		// Avoid an unnecessary allocation on the common no-VF path.
+		return query, false, nil
+	}
+	return b.String(), true, nil
+}
+
+// findBalancedClose returns the index of the ')' that closes the call whose opening '('
+// was at position start-1 (i.e. start is the first char after the opening paren).
+// It skips characters inside single- and double-quoted strings. Returns -1 if unbalanced.
+func findBalancedClose(s string, start int) int {
+	depth := 1
+	for i := start; i < len(s); i++ {
+		ch := s[i]
+		if ch == '\'' || ch == '"' {
+			i++
+			for i < len(s) && s[i] != ch {
+				i++
+			}
+		} else if ch == '(' {
+			depth++
+		} else if ch == ')' {
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 // vfNowUTC is the handler for the NOW_UTC() virtual function.
@@ -295,5 +355,3 @@ func vfLimitOffset(driverName string, args string) (string, error) {
 		return "", errors.New("unsupported driver name: %s", driverName)
 	}
 }
-
-
