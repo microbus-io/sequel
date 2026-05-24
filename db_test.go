@@ -37,7 +37,9 @@ func TestDB_AutoCreate(t *testing.T) {
 		t.Run(drv, func(t *testing.T) {
 			assert := testarossa.For(t)
 
-			db, err := OpenTesting(drv, dsn, t.Name())
+			testingDSN, err := CreateTestingDatabase(drv, dsn, t.Name())
+			assert.NoError(err)
+			db, err := OpenSingleton(drv, testingDSN)
 			assert.NoError(err)
 			if !assert.NotNil(db) {
 				return
@@ -654,6 +656,154 @@ func TestDB_OpenInferDriverFails(t *testing.T) {
 	// Unrecognizable DSN without explicit driver
 	_, err := Open("", "some-unknown-connection-string")
 	assert.Error(err)
+}
+
+func TestDB_OpenIndependentPools(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	dsn := "file:openindependentpools?mode=memory&cache=shared"
+
+	db1, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	if !assert.NotNil(db1) {
+		return
+	}
+	defer db1.Close()
+
+	db2, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	if !assert.NotNil(db2) {
+		return
+	}
+	defer db2.Close()
+
+	// Open does not coalesce: each call returns a distinct *DB.
+	assert.False(db1 == db2)
+
+	// Closing one pool must not affect the other.
+	err = db1.Close()
+	assert.NoError(err)
+	var x int
+	err = db2.QueryRow("SELECT 1").Scan(&x)
+	assert.NoError(err)
+	assert.Equal(1, x)
+}
+
+func TestDB_OpenNoAutoPoolSizing(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	dsn := "file:opennoautopool?mode=memory&cache=shared"
+
+	db, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	if !assert.NotNil(db) {
+		return
+	}
+	defer db.Close()
+
+	// Caller-managed pool size must stick. Open of the same DSN does not coalesce,
+	// so nothing else can touch this *DB's pool.
+	db.SetMaxOpenConns(7)
+
+	other, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	defer other.Close()
+
+	assert.Equal(7, db.Stats().MaxOpenConnections)
+}
+
+func TestDB_OpenSingletonCoalesces(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	dsn := "file:opensingletoncoalesces?mode=memory&cache=shared"
+
+	db1, err := OpenSingleton("sqlite", dsn)
+	assert.NoError(err)
+	if !assert.NotNil(db1) {
+		return
+	}
+	defer db1.Close()
+
+	db2, err := OpenSingleton("sqlite", dsn)
+	assert.NoError(err)
+	if !assert.NotNil(db2) {
+		return
+	}
+	defer db2.Close()
+
+	// OpenSingleton coalesces by DSN: both callers see the same *DB.
+	assert.True(db1 == db2)
+}
+
+func TestDB_CreateTestingDatabaseCached(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	// Repeated calls with the same (driver, baseDSN, uniqueTestID) return the
+	// same resolved DSN — the DROP+CREATE happens once.
+	dsn1, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	dsn2, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	assert.Equal(dsn1, dsn2)
+}
+
+func TestDB_CreateTestingDatabase_SharedSingleton(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	// Two consumers in the same test go through CreateTestingDatabase then
+	// OpenSingleton — they end up sharing one *DB and one pool.
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	db1, err := OpenSingleton("sqlite", dsn)
+	assert.NoError(err)
+	defer db1.Close()
+	db2, err := OpenSingleton("sqlite", dsn)
+	assert.NoError(err)
+	defer db2.Close()
+
+	assert.True(db1 == db2)
+
+	// Sanity: writes from one are visible to the other.
+	_, err = db1.Exec("CREATE TABLE IF NOT EXISTS shared_t (x INT)")
+	assert.NoError(err)
+	_, err = db1.Exec("INSERT INTO shared_t (x) VALUES (?)", 42)
+	assert.NoError(err)
+	var x int
+	err = db2.QueryRow("SELECT x FROM shared_t").Scan(&x)
+	assert.NoError(err)
+	assert.Equal(42, x)
+}
+
+func TestDB_CreateTestingDatabase_DistinctPools(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	// Two consumers using plain Open get distinct *DB instances and
+	// independent pools, while still talking to the same underlying database.
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	db1, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	defer db1.Close()
+	db2, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	defer db2.Close()
+
+	assert.False(db1 == db2)
+
+	_, err = db1.Exec("CREATE TABLE IF NOT EXISTS shared_t (x INT)")
+	assert.NoError(err)
+	_, err = db1.Exec("INSERT INTO shared_t (x) VALUES (?)", 7)
+	assert.NoError(err)
+	var x int
+	err = db2.QueryRow("SELECT x FROM shared_t").Scan(&x)
+	assert.NoError(err)
+	assert.Equal(7, x)
 }
 
 func TestDB_InjectOutputInserted(t *testing.T) {

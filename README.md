@@ -1,10 +1,10 @@
 # Sequel
 
-A Go library that enhances `sql.DB` for building SQL-backed CRUD microservices with the [Microbus](https://microbus.io) framework.
+A Go library that enhances `database/sql` with cross-driver SQL, schema migration, ephemeral test databases, and adaptive connection pooling.
 
 ## Features at a Glance
 
-- **Connection pool management** - Prevents database exhaustion in multi-microservice solutions
+- **Connection pool management** - Prevents database exhaustion when many consumers in one process share a DSN
 - **Schema migration** - Concurrency-safe, incremental database migrations
 - **Cross-driver support** - MySQL, PostgreSQL, SQL Server, and SQLite with unified API
 - **Ephemeral test databases** - Isolated databases per test with automatic cleanup
@@ -14,7 +14,7 @@ A Go library that enhances `sql.DB` for building SQL-backed CRUD microservices w
 ```go
 import "github.com/microbus-io/sequel"
 
-// Open a database connection
+// Open a database connection with its own pool
 db, err := sequel.Open("", "root:root@tcp(127.0.0.1:3306)/mydb")
 
 // Run migrations
@@ -26,12 +26,25 @@ rows, err := db.Query("SELECT * FROM users WHERE tenant_id=?", tenantID)
 
 ## Connection Pool Management
 
-When many microservices connect to the same database, connection exhaustion becomes a concern. Sequel limits the connection pool of a single executable based on client count using a sqrt-based formula:
+Sequel exposes two constructors so the connection-pool strategy is self-documenting at the call site:
 
-- `maxIdle ≈ sqrt(N)` where N is the number of clients
-- `maxOpen ≈ (sqrt(N) * 2) + 2`
+- **`Open(driver, dsn)`** returns a fresh `*DB` with its own pool. Each call returns a distinct instance; sequel does not coalesce by DSN and does not size the pool automatically. The standard `database/sql` defaults apply (unlimited open, 2 idle) until the caller adjusts them with `SetMaxOpenConns` / `SetMaxIdleConns`. Use this for a single heavy consumer (e.g. a long-running worker pool) where you want to size the pool to the workload.
 
-This prevents overwhelming the database while maintaining reasonable throughput.
+- **`OpenSingleton(driver, dsn)`** returns a coalesced `*DB`: multiple calls with the same `(driver, dsn)` share one `*sql.DB` and one connection pool. Sequel automatically sizes that pool based on the number of openers using a sqrt-based formula:
+  - `maxIdle ≈ sqrt(N)` where N is the number of openers
+  - `maxOpen ≈ (sqrt(N) * 2) + 2`
+
+  This is the right choice when many parts of the same process each open the same DSN occasionally — the pool grows gently with the number of openers and no caller has to think about pool sizing.
+
+```go
+// Single heavy consumer — caller manages the pool.
+db, err := sequel.Open("", dsn)
+db.SetMaxOpenConns(32)
+db.SetMaxIdleConns(8)
+
+// Multiple consumers sharing a DSN — sequel manages one pool across them.
+db, err := sequel.OpenSingleton("", dsn)
+```
 
 ## Schema Migration
 
@@ -192,16 +205,34 @@ id, err := db.InsertReturnID(ctx, "id", "INSERT INTO users (name, email) VALUES 
 
 ## Ephemeral Test Databases
 
-`OpenTesting` creates unique databases per test, providing isolation from other tests:
+Provisioning a per-test database is a separate step from opening a connection. `CreateTestingDatabase(driver, baseDSN, uniqueTestID)` creates (or reuses) a uniquely-named database and returns its DSN; pass that DSN to `Open` or `OpenSingleton` to connect.
 
 ```go
+// Test fixture
 func TestUserService(t *testing.T) {
-    // Creates database: testing_{hour}_mydb_{testID}
-    db, err := sequel.OpenTesting("", "root:root@tcp(127.0.0.1:3306)/mydb", t.Name())
-    // Database is deleted when closed
-    db.Close()
+    dsn, err := sequel.CreateTestingDatabase("", "root:root@tcp(127.0.0.1:3306)/mydb", t.Name())
+    if err != nil { t.Fatal(err) }
+    db, err := sequel.OpenSingleton("", dsn)
+    if err != nil { t.Fatal(err) }
+    defer db.Close()  // also drops the testing database
 }
 ```
+
+The same helper can be invoked from production startup paths that want to swap in a per-test database without rewriting the rest of the wiring:
+
+```go
+func startup(cfg Config) (*sequel.DB, error) {
+    dsn := cfg.DSN
+    if cfg.Testing {
+        var err error
+        dsn, err = sequel.CreateTestingDatabase("", cfg.DSN, cfg.TestID)
+        if err != nil { return nil, err }
+    }
+    return sequel.OpenSingleton("", dsn)
+}
+```
+
+Repeated calls within the same process with the same `(driver, baseDSN, uniqueTestID)` reuse the same testing database — the `DROP+CREATE` runs only once. The returned DSN points at a database whose name has the `testing_NN_` prefix; sequel inspects this on `Close` and drops the database automatically when the last referencing `*DB` is closed. There is no separate cleanup call to remember. If a process exits before `Close` runs, the leftover-cleanup sweep on the next `CreateTestingDatabase` call removes stale databases older than 1–2 hours.
 
 ## Legal
 

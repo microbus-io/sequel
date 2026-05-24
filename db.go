@@ -47,7 +47,8 @@ var (
 	testingMutexes     = map[string]*sync.Mutex{}
 	testingStartedAt   = time.Now().UTC()
 
-	valuesClausePattern = regexp.MustCompile(`(?i)\s+VALUES\s*`)
+	valuesClausePattern         = regexp.MustCompile(`(?i)\s+VALUES\s*`)
+	testingDatabaseNamePattern  = regexp.MustCompile(`^testing_\d{2}_`)
 )
 
 /*
@@ -58,18 +59,25 @@ DB is an enhanced database connection that
 */
 type DB struct {
 	*sql.DB
-	driverName          string
-	singletonKey        string
-	refCount            int
-	mutex               sync.Mutex
-	dropTestingDatabase func() (err error)
+	driverName     string
+	dataSourceName string
+	singletonKey   string
+	refCount       int
+	mutex          sync.Mutex
 }
 
 /*
-Open returns a database connection to the named data source.
+Open returns a database connection to the named data source with a dedicated
+connection pool. Each call returns a distinct *DB; sequel does not coalesce by DSN.
+The caller is responsible for sizing the pool via SetMaxOpenConns / SetMaxIdleConns
+if the database/sql defaults (unlimited open, 2 idle) don't fit.
 
-If a driver name is not provided, it is inferred from the data source name on a best-effort basis.
-Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres), "mssql" (SQL Server) or "sqlite" (SQLite).
+Use [OpenSingleton] when multiple consumers in the same process share a DSN and
+you want sequel to manage one pool across all of them.
+
+If a driver name is not provided, it is inferred from the data source name on a
+best-effort basis. Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres),
+"mssql" (SQL Server) or "sqlite" (SQLite).
 
 Example data source name for each of the supported drivers:
   - mysql: username:password@tcp(hostname:3306)/
@@ -78,20 +86,38 @@ Example data source name for each of the supported drivers:
   - sqlite: file:path/to/database.sqlite
 */
 func Open(driverName string, dataSourceName string) (db *DB, err error) {
-	if dataSourceName == "" {
-		return nil, errors.New("data source name is required")
+	driverName, dataSourceName, err = normalizeDriverAndDSN(driverName, dataSourceName)
+	if err != nil {
+		return nil, errors.Trace(err)
 	}
-	if driverName == "mariadb" {
-		driverName = "mysql"
+	sqlDB, err := sql.Open(driverName, dataSourceName)
+	if err != nil {
+		return nil, errors.Trace(err)
 	}
-	if driverName == "sqlite3" {
-		driverName = "sqlite"
-	}
-	if driverName == "" {
-		driverName = inferDriverName(dataSourceName)
-	}
-	if driverName == "" {
-		return nil, errors.New("driver name could not be inferred from data source name")
+	return &DB{
+		DB:             sqlDB,
+		driverName:     driverName,
+		dataSourceName: dataSourceName,
+		refCount:       1,
+	}, nil
+}
+
+/*
+OpenSingleton returns a per-DSN coalesced *DB whose connection pool sequel manages
+automatically based on the number of openers (sqrt-based growth, see
+[DB.adjustConnectionLimits]). Multiple OpenSingleton calls with the same
+(driverName, dataSourceName) return the same *DB and share its connection pool.
+This is the right choice when many parts of the same process each access the
+database occasionally.
+
+Use [Open] when you want a dedicated pool with explicit caller-managed sizing.
+
+Driver inference, DSN defaults, and supported drivers are the same as [Open].
+*/
+func OpenSingleton(driverName string, dataSourceName string) (db *DB, err error) {
+	driverName, dataSourceName, err = normalizeDriverAndDSN(driverName, dataSourceName)
+	if err != nil {
+		return nil, errors.Trace(err)
 	}
 	singletonKey := hashStr(driverName + "|" + dataSourceName)
 
@@ -99,10 +125,9 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 	singletonDB, ok := singletonsMap[singletonKey]
 	if !ok {
 		singletonDB = &DB{
-			DB:           nil,
-			driverName:   driverName,
-			singletonKey: singletonKey,
-			refCount:     0,
+			driverName:     driverName,
+			dataSourceName: dataSourceName,
+			singletonKey:   singletonKey,
 		}
 		singletonsMap[singletonKey] = singletonDB
 	}
@@ -116,12 +141,40 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 		return singletonDB, nil
 	}
 
-	var sqlDB *sql.DB
+	sqlDB, err := sql.Open(driverName, dataSourceName)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	singletonDB.DB = sqlDB
+	singletonDB.refCount = 1
+	singletonDB.adjustConnectionLimits()
+	return singletonDB, nil
+}
+
+// normalizeDriverAndDSN normalizes driver name aliases, infers the driver name when
+// missing, and applies driver-specific DSN tweaks (MySQL connection params, SQLite
+// busy_timeout pragma).
+func normalizeDriverAndDSN(driverName, dataSourceName string) (string, string, error) {
+	if dataSourceName == "" {
+		return "", "", errors.New("data source name is required")
+	}
+	if driverName == "mariadb" {
+		driverName = "mysql"
+	}
+	if driverName == "sqlite3" {
+		driverName = "sqlite"
+	}
+	if driverName == "" {
+		driverName = inferDriverName(dataSourceName)
+	}
+	if driverName == "" {
+		return "", "", errors.New("driver name could not be inferred from data source name")
+	}
 	switch driverName {
 	case "mysql":
 		cfg, err := mysql.ParseDSN(dataSourceName)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return "", "", errors.Trace(err)
 		}
 		if cfg.Params == nil {
 			cfg.Params = map[string]string{}
@@ -131,10 +184,7 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 		cfg.Params["timeout"] = "4s"
 		cfg.Params["readTimeout"] = "8s"
 		cfg.Params["writeTimeout"] = "8s"
-		sqlDB, err = sql.Open(driverName, cfg.FormatDSN())
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
+		dataSourceName = cfg.FormatDSN()
 	case "sqlite":
 		if !strings.Contains(dataSourceName, "busy_timeout") {
 			// Set a busy_timeout so that concurrent writers retry on lock contention
@@ -147,22 +197,8 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 				dataSourceName += "?_pragma=busy_timeout(2000)"
 			}
 		}
-		sqlDB, err = sql.Open(driverName, dataSourceName)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
-	default:
-		sqlDB, err = sql.Open(driverName, dataSourceName)
-		if err != nil {
-			return nil, errors.Trace(err)
-		}
 	}
-
-	// Prepare the database struct
-	singletonDB.DB = sqlDB
-	singletonDB.refCount = 1
-	singletonDB.adjustConnectionLimits()
-	return singletonDB, nil
+	return driverName, dataSourceName, nil
 }
 
 // IsLockContentionError returns true if the error indicates database lock contention or a deadlock.
@@ -188,6 +224,11 @@ func IsLockContentionError(err error) bool {
 }
 
 // Close closes the database connection.
+//
+// When the last reference closes and the underlying database name matches the
+// testing pattern (testing_NN_…), sequel drops the database from the server as
+// a best-effort cleanup. This makes [CreateTestingDatabase]-provisioned
+// databases self-cleaning on test teardown.
 func (db *DB) Close() (err error) {
 	if db == nil {
 		return nil
@@ -201,13 +242,35 @@ func (db *DB) Close() (err error) {
 	if db.refCount == 0 {
 		err = db.DB.Close()
 		db.DB = nil
-		if db.dropTestingDatabase != nil {
-			db.dropTestingDatabase()
-		}
+		db.maybeDropTestingDatabase()
 	} else {
 		db.adjustConnectionLimits()
 	}
 	return errors.Trace(err)
+}
+
+// maybeDropTestingDatabase drops the database backing this *DB if its database
+// name has the testing prefix produced by [CreateTestingDatabase]. Errors are
+// swallowed: the leftover-DB sweep on the next test run is the safety net.
+// No-op for SQLite (in-memory).
+func (db *DB) maybeDropTestingDatabase() {
+	if db.driverName == "sqlite" {
+		return
+	}
+	dbName, err := databaseNameFromDataSourceName(db.driverName, db.dataSourceName)
+	if err != nil || !testingDatabaseNamePattern.MatchString(dbName) {
+		return
+	}
+	masterDSN, err := setDatabaseInDataSourceName(db.driverName, db.dataSourceName, "")
+	if err != nil {
+		return
+	}
+	masterDB, err := OpenSingleton(db.driverName, masterDSN)
+	if err != nil {
+		return
+	}
+	defer masterDB.Close()
+	masterDB.Exec("DROP DATABASE IF EXISTS " + dbName)
 }
 
 // Exec shadows sql.DB.Exec and conforms arg placeholders for the driver.
@@ -510,74 +573,98 @@ func inferDriverName(dataSourceName string) (driverName string) {
 }
 
 /*
-OpenTesting opens a connection to a uniquely named database for testing purposes.
-A database is created for each unique test at the database instance pointed to by the input DSN.
+CreateTestingDatabase provisions a uniquely-named database (or returns a SQLite
+in-memory DSN) for testing and returns the resolved data source name. Pass the
+result to [Open] or [OpenSingleton] to open a connection.
 
-If a driver name is not provided, it is inferred from the data source name on a best-effort basis.
-Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres), "mssql" (SQL Server) or "sqlite" (SQLite).
+The returned DSN points at a database whose name has the testing_NN_ prefix. When
+the last *DB referencing that database is Closed, sequel drops it automatically —
+no separate cleanup call is required.
 
-If a data source name is not provided, the following defaults are used based on the driver name:
+uniqueTestID scopes the database so that independent tests don't collide. Pass
+t.Name() from a test, or an equivalent identifier from production startup code
+that wants a per-run database:
+
+	dsn := cfg.DSN
+	if cfg.Testing {
+	    dsn, err = sequel.CreateTestingDatabase("", cfg.DSN, cfg.TestID)
+	    if err != nil { return err }
+	}
+	db, err := sequel.OpenSingleton("", dsn)
+
+Within a single process, repeated calls with the same (driverName,
+baseDataSourceName, uniqueTestID) reuse the same testing database — the
+underlying DROP+CREATE only happens on the first call.
+
+If a driver name is not provided, it is inferred from the data source name on a
+best-effort basis. Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres),
+"mssql" (SQL Server) or "sqlite" (SQLite).
+
+If a base data source name is not provided, the following localhost defaults are
+used based on the driver name:
   - (empty): SQLite in-memory database
   - sqlite: SQLite in-memory database
   - mysql: root:root@tcp(127.0.0.1:3306)/
   - pgx: postgres://postgres:postgres@127.0.0.1:5432/
   - mssql: sqlserver://sa:Password123@127.0.0.1:1433
-
-The unique test ID is used to create a distinct database name for each test so that connections opened
-by multiple actors in the same test share the same connection pool.
 */
-func OpenTesting(driverName string, dataSourceName string, uniqueTestID string) (db *DB, err error) {
+func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueTestID string) (dsn string, err error) {
 	// Set default connection to localhost
-	if dataSourceName == "" {
+	if baseDataSourceName == "" {
 		switch driverName {
 		case "", "sqlite":
-			dataSourceName = "file:?mode=memory&cache=shared"
+			baseDataSourceName = "file:?mode=memory&cache=shared"
 		case "mysql":
-			dataSourceName = "root:root@tcp(127.0.0.1:3306)/"
+			baseDataSourceName = "root:root@tcp(127.0.0.1:3306)/"
 		case "pgx":
-			dataSourceName = "postgres://postgres:postgres@127.0.0.1:5432/"
+			baseDataSourceName = "postgres://postgres:postgres@127.0.0.1:5432/"
 		case "mssql":
-			dataSourceName = "sqlserver://sa:Password123@127.0.0.1:1433"
+			baseDataSourceName = "sqlserver://sa:Password123@127.0.0.1:1433"
 		default:
-			return nil, errors.New("unsupported driver name: %s", driverName)
+			return "", errors.New("unsupported driver name: %s", driverName)
 		}
 	}
 	if driverName == "" {
-		driverName = inferDriverName(dataSourceName)
+		driverName = inferDriverName(baseDataSourceName)
 	}
-	if driverName == "sqlite" && !strings.Contains(dataSourceName, "mode=memory") && !strings.Contains(dataSourceName, "cache=shared") {
-		if strings.Contains(dataSourceName, "?") {
-			dataSourceName += "&mode=memory&cache=shared"
+	if driverName == "sqlite" && !strings.Contains(baseDataSourceName, "mode=memory") && !strings.Contains(baseDataSourceName, "cache=shared") {
+		if strings.Contains(baseDataSourceName, "?") {
+			baseDataSourceName += "&mode=memory&cache=shared"
 		} else {
-			dataSourceName += "?mode=memory&cache=shared"
+			baseDataSourceName += "?mode=memory&cache=shared"
 		}
 	}
 
-	cacheKey := hashStr(driverName + "|" + dataSourceName + "|" + uniqueTestID)
+	cacheKey := hashStr(driverName + "|" + baseDataSourceName + "|" + uniqueTestID)
 
-	// Obtain the mutex for the unique test
 	testingGlobalMutex.Lock()
 	testingMux, ok := testingMutexes[cacheKey]
 	if !ok {
 		testingMux = &sync.Mutex{}
 		testingMutexes[cacheKey] = testingMux
 	}
-	testingDataSourceName, ok := testingDSNs[cacheKey]
+	cachedDSN, hasCached := testingDSNs[cacheKey]
 	testingGlobalMutex.Unlock()
-
-	// Check if a database was previously created for this test
-	if ok {
-		db, err = Open(driverName, testingDataSourceName)
-		return db, errors.Trace(err)
+	if hasCached {
+		return cachedDSN, nil
 	}
 
 	testingMux.Lock()
 	defer testingMux.Unlock()
 
-	// Generate a database name
-	baseDatabaseName, err := databaseNameFromDataSourceName(driverName, dataSourceName)
+	// Re-check after taking the per-test mutex in case another caller raced ahead.
+	testingGlobalMutex.Lock()
+	cachedDSN, hasCached = testingDSNs[cacheKey]
+	testingGlobalMutex.Unlock()
+	if hasCached {
+		return cachedDSN, nil
+	}
+
+	// Generate a database name. The testing_NN_ prefix is the contract that
+	// (*DB).maybeDropTestingDatabase uses to auto-drop on Close.
+	baseDatabaseName, err := databaseNameFromDataSourceName(driverName, baseDataSourceName)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return "", errors.Trace(err)
 	}
 	if baseDatabaseName != "" {
 		baseDatabaseName = strings.ToLower(baseDatabaseName) + "_"
@@ -589,28 +676,30 @@ func OpenTesting(driverName string, dataSourceName string, uniqueTestID string) 
 	// For server-based drivers, open the master database and CREATE/DROP DATABASE.
 	// SQLite uses in-memory databases for testing, so this step is skipped.
 	if driverName != "sqlite" {
-		masterDataSourceName, err := setDatabaseInDataSourceName(driverName, dataSourceName, "")
+		masterDataSourceName, err := setDatabaseInDataSourceName(driverName, baseDataSourceName, "")
 		if err != nil {
-			return nil, errors.Trace(err)
+			return "", errors.Trace(err)
 		}
-		masterDB, err := Open(driverName, masterDataSourceName)
+		masterDB, err := OpenSingleton(driverName, masterDataSourceName)
 		if err != nil {
-			return nil, errors.New("failed to open master database", err)
+			return "", errors.New("failed to open master database", err)
 		}
 		defer masterDB.Close()
 
 		// Create the testing database
 		_, err = masterDB.Exec("DROP DATABASE IF EXISTS " + testingDatabaseName)
 		if err != nil {
-			return nil, errors.New("failed to drop database %s", testingDatabaseName, err)
+			return "", errors.New("failed to drop database %s", testingDatabaseName, err)
 		}
 		_, err = masterDB.Exec("CREATE DATABASE " + testingDatabaseName)
 		if err != nil {
-			return nil, errors.New("failed to create database %s", testingDatabaseName, err)
+			return "", errors.New("failed to create database %s", testingDatabaseName, err)
 		}
 
-		// Cleanup leftover testing databases, on a best-effort basis.
-		// A testing database is considered leftover if it is more than 1 to 2 hours old.
+		// Cleanup leftover testing databases, on a best-effort basis. This is the
+		// safety net for tests that exited before Close had a chance to fire
+		// maybeDropTestingDatabase. A testing database is considered leftover if
+		// it's more than 1 to 2 hours old.
 		stmt := ""
 		switch driverName {
 		case "mysql":
@@ -642,46 +731,19 @@ func OpenTesting(driverName string, dataSourceName string, uniqueTestID string) 
 				masterDB.Exec("DROP DATABASE IF EXISTS " + databaseName)
 			}
 		}
-		masterDB.Close()
 	}
 
-	// Open the new database
-	testingDataSourceName, err = setDatabaseInDataSourceName(driverName, dataSourceName, testingDatabaseName)
+	testingDSN, err := setDatabaseInDataSourceName(driverName, baseDataSourceName, testingDatabaseName)
 	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	testingDB, err := Open(driverName, testingDataSourceName)
-	if err != nil {
-		return nil, errors.New("failed to open testing database", err)
+		return "", errors.Trace(err)
 	}
 
-	// Drop the testing database when it's no longer used.
-	// SQLite uses in-memory databases that are automatically freed when all connections close.
-	if driverName != "sqlite" {
-		testingDB.dropTestingDatabase = func() (err error) {
-			masterDataSourceName, err := setDatabaseInDataSourceName(driverName, dataSourceName, "")
-			if err != nil {
-				return errors.Trace(err)
-			}
-			masterDB, err := Open(driverName, masterDataSourceName)
-			if err != nil {
-				return errors.New("failed to open master database", err)
-			}
-			defer masterDB.Close()
-			_, err = masterDB.Exec("DROP DATABASE IF EXISTS " + testingDatabaseName)
-			if err != nil {
-				return errors.New("failed to drop database %s", testingDatabaseName, err)
-			}
-			return nil
-		}
-	}
-
-	// Cache for other microservices running in the same test
+	// Cache for other openers in the same test
 	testingGlobalMutex.Lock()
-	testingDSNs[cacheKey] = testingDataSourceName
+	testingDSNs[cacheKey] = testingDSN
 	testingGlobalMutex.Unlock()
 
-	return testingDB, nil
+	return testingDSN, nil
 }
 
 // adjustConnectionLimits adjusts the size of the connection pool based on the ref count.
