@@ -78,6 +78,12 @@ func TestDB_ConformArgPlaceholders(t *testing.T) {
 	stmt = `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
 	pgxStmt = db.ConformArgPlaceholders(stmt)
 	assert.Expect(pgxStmt, `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES ($1, $2)`)
+
+	// CockroachDB uses the Postgres wire protocol and therefore the same $N syntax.
+	crdb := &DB{driverName: "cockroachdb"}
+	stmt = `SELECT * FROM users WHERE id=? AND tenant_id=?`
+	crdbStmt := crdb.ConformArgPlaceholders(stmt)
+	assert.Expect(crdbStmt, `SELECT * FROM users WHERE id=$1 AND tenant_id=$2`)
 }
 
 func TestDB_ConformArgPlaceholders_Quotes(t *testing.T) {
@@ -134,6 +140,12 @@ func TestDB_DatabaseNameFromDataSourceName(t *testing.T) {
 	name, err = databaseNameFromDataSourceName("pgx", "postgres://user:pw@127.0.0.1:5432")
 	assert.Expect(name, "", err, nil)
 
+	// cockroachdb (uses the same Postgres DSN parser as pgx)
+	name, err = databaseNameFromDataSourceName("cockroachdb", "postgres://root@127.0.0.1:26257/my_database")
+	assert.Expect(name, "my_database", err, nil)
+	name, err = databaseNameFromDataSourceName("cockroachdb", "postgres://root@127.0.0.1:26257/")
+	assert.Expect(name, "", err, nil)
+
 	// mssql
 	name, err = databaseNameFromDataSourceName("mssql", "sqlserver://user:pw@127.0.0.1:1433?database=my_database")
 	assert.Expect(name, "my_database", err, nil)
@@ -181,6 +193,7 @@ func TestDB_InferDriverName(t *testing.T) {
 	// Port-based inference
 	assert.Equal("mysql", inferDriverName("root:root@127.0.0.1:3306/"))
 	assert.Equal("pgx", inferDriverName("user:pw@127.0.0.1:5432/"))
+	assert.Equal("cockroachdb", inferDriverName("user:pw@127.0.0.1:26257/"))
 	assert.Equal("mssql", inferDriverName("user:pw@127.0.0.1:1433"))
 
 	// Empty string
@@ -217,6 +230,12 @@ func TestDB_SetDatabaseInDataSourceName(t *testing.T) {
 	assert.NoError(err)
 	name, _ = databaseNameFromDataSourceName("pgx", dsn)
 	assert.Equal("", name)
+
+	// cockroachdb - set database (shares the pgx DSN parser)
+	dsn, err = setDatabaseInDataSourceName("cockroachdb", "postgres://root@127.0.0.1:26257/", "mydb")
+	assert.NoError(err)
+	name, _ = databaseNameFromDataSourceName("cockroachdb", dsn)
+	assert.Equal("mydb", name)
 
 	// mssql - set database
 	dsn, err = setDatabaseInDataSourceName("mssql", "sqlserver://user:pw@127.0.0.1:1433", "mydb")

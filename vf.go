@@ -189,7 +189,7 @@ func vfNowUTC(driverName string, args string) (string, error) {
 	switch driverName {
 	case "mysql":
 		return "(UTC_TIMESTAMP(3))", nil
-	case "pgx":
+	case "pgx", "cockroachdb":
 		return "(NOW() AT TIME ZONE 'UTC')", nil
 	case "mssql":
 		return "SYSUTCDATETIME()", nil
@@ -230,7 +230,7 @@ func vfRegexpTextSearch(driverName string, args string) (string, error) {
 	switch driverName {
 	case "mysql":
 		return "(" + concatenated + " REGEXP " + searchExpr + ")", nil
-	case "pgx":
+	case "pgx", "cockroachdb":
 		return "REGEXP_LIKE(" + concatenated + ", " + searchExpr + ", 'i')", nil
 	case "mssql":
 		return "REGEXP_LIKE(" + concatenated + ", " + searchExpr + ", 'i')", nil
@@ -286,7 +286,7 @@ func vfDateAddMillis(driverName string, args string) (string, error) {
 	switch driverName {
 	case "mysql":
 		return "DATE_ADD(" + baseExpr + ", INTERVAL (" + millis + ") * 1000 MICROSECOND)", nil
-	case "pgx":
+	case "pgx", "cockroachdb":
 		return "(" + baseExpr + " + MAKE_INTERVAL(secs => (" + millis + ") / 1000.0))", nil
 	case "mssql":
 		return "DATEADD(MILLISECOND, " + millis + ", " + baseExpr + ")", nil
@@ -317,7 +317,7 @@ func vfDateDiffMillis(driverName string, args string) (string, error) {
 	switch driverName {
 	case "mysql":
 		return "(TIMESTAMPDIFF(MICROSECOND, " + b + ", " + a + ") / 1000.0)", nil
-	case "pgx":
+	case "pgx", "cockroachdb":
 		return "(EXTRACT(EPOCH FROM (" + a + " - " + b + ")) * 1000.0)", nil
 	case "mssql":
 		return "DATEDIFF_BIG(MILLISECOND, " + b + ", " + a + ")", nil
@@ -347,7 +347,7 @@ func vfLimitOffset(driverName string, args string) (string, error) {
 		return "", errors.New("LIMIT_OFFSET requires syntax: LIMIT_OFFSET(limit, offset)")
 	}
 	switch driverName {
-	case "mysql", "pgx", "sqlite":
+	case "mysql", "pgx", "cockroachdb", "sqlite":
 		return "LIMIT " + limit + " OFFSET " + offset, nil
 	case "mssql":
 		return "OFFSET " + offset + " ROWS FETCH NEXT " + limit + " ROWS ONLY", nil

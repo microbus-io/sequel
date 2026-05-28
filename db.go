@@ -25,6 +25,7 @@ import (
 	"math"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,8 +48,8 @@ var (
 	testingMutexes     = map[string]*sync.Mutex{}
 	testingStartedAt   = time.Now().UTC()
 
-	valuesClausePattern         = regexp.MustCompile(`(?i)\s+VALUES\s*`)
-	testingDatabaseNamePattern  = regexp.MustCompile(`^testing_\d{2}_`)
+	valuesClausePattern        = regexp.MustCompile(`(?i)\s+VALUES\s*`)
+	testingDatabaseNamePattern = regexp.MustCompile(`^testing_\d{2}_`)
 )
 
 /*
@@ -77,11 +78,12 @@ you want sequel to manage one pool across all of them.
 
 If a driver name is not provided, it is inferred from the data source name on a
 best-effort basis. Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres),
-"mssql" (SQL Server) or "sqlite" (SQLite).
+"cockroachdb" (CockroachDB), "mssql" (SQL Server) or "sqlite" (SQLite).
 
 Example data source name for each of the supported drivers:
   - mysql: username:password@tcp(hostname:3306)/
   - pgx: postgres://username:password@hostname:5432/
+  - cockroachdb: postgres://username:password@hostname:26257/
   - mssql: sqlserver://username:password@hostname:1433
   - sqlite: file:path/to/database.sqlite
 */
@@ -90,7 +92,7 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	sqlDB, err := sql.Open(driverName, dataSourceName)
+	sqlDB, err := sql.Open(physicalDriverName(driverName), dataSourceName)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -141,7 +143,7 @@ func OpenSingleton(driverName string, dataSourceName string) (db *DB, err error)
 		return singletonDB, nil
 	}
 
-	sqlDB, err := sql.Open(driverName, dataSourceName)
+	sqlDB, err := sql.Open(physicalDriverName(driverName), dataSourceName)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -203,7 +205,7 @@ func normalizeDriverAndDSN(driverName, dataSourceName string) (string, string, e
 
 // IsLockContentionError returns true if the error indicates database lock contention or a deadlock.
 // Such errors are transient and the operation can typically be retried.
-// Recognizes lock errors from SQLite, MySQL, and PostgreSQL.
+// Recognizes lock errors from SQLite, MySQL, PostgreSQL, SQL Server, and CockroachDB.
 func IsLockContentionError(err error) bool {
 	if err == nil {
 		return false
@@ -218,6 +220,10 @@ func IsLockContentionError(err error) bool {
 		return true
 	case strings.Contains(msg, "deadlock victim"), strings.Contains(msg, "was deadlocked"), // SQL Server (1205)
 		strings.Contains(msg, "Lock request time out"): // SQL Server (1222)
+		return true
+	case strings.Contains(msg, "restart transaction"), // CockroachDB serialization retry (40001)
+		strings.Contains(msg, "RETRY_SERIALIZABLE"),
+		strings.Contains(msg, "RETRY_WRITE_TOO_OLD"):
 		return true
 	}
 	return false
@@ -339,7 +345,7 @@ func (db *DB) PrepareContext(ctx context.Context, query string) (*sql.Stmt, erro
 	return db.DB.PrepareContext(ctx, query)
 }
 
-// DriverName is the name of the driver: "mysql", "pgx", "mssql" or "sqlite".
+// DriverName is the name of the driver: "mysql", "pgx", "cockroachdb", "mssql" or "sqlite".
 func (db *DB) DriverName() string {
 	return db.driverName
 }
@@ -399,7 +405,7 @@ func insertReturnID(ctx context.Context, qe Executor, driverName string, idColum
 			return 0, errors.Trace(err)
 		}
 		return id, nil
-	case "pgx":
+	case "pgx", "cockroachdb":
 		var id int64
 		err := qe.QueryRowContext(ctx, stmt+" RETURNING "+idColumn, args...).Scan(&id)
 		if err != nil {
@@ -443,7 +449,7 @@ func databaseNameFromDataSourceName(driverName string, dsn string) (databaseName
 			return "", errors.New("error parsing data source name %s", dsn, err)
 		}
 		return cfg.DBName, nil
-	case "pgx":
+	case "pgx", "cockroachdb":
 		_, err = pgx.ParseConfig(dsn)
 		if err != nil {
 			return "", errors.New("error parsing data source name %s", dsn, err)
@@ -491,7 +497,7 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 		cfg.DBName = databaseName
 		alteredDSN = cfg.FormatDSN()
 		return alteredDSN, nil
-	case "pgx":
+	case "pgx", "cockroachdb":
 		_, err = pgx.ParseConfig(dsn)
 		if err != nil {
 			return "", errors.New("error parsing data source name %s", dsn, err)
@@ -537,6 +543,17 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 	}
 }
 
+// physicalDriverName maps a sequel driver name to the driver registered with database/sql.
+// CockroachDB shares the pgx driver since it speaks the PostgreSQL wire protocol; sequel
+// keeps "cockroachdb" as a distinct logical name for callers and dispatch but opens the
+// underlying connection with "pgx".
+func physicalDriverName(driverName string) string {
+	if driverName == "cockroachdb" {
+		return "pgx"
+	}
+	return driverName
+}
+
 // inferDriverName tries to infer the driver name from the data source name.
 func inferDriverName(dataSourceName string) (driverName string) {
 	if dataSourceName == "" {
@@ -565,6 +582,9 @@ func inferDriverName(dataSourceName string) (driverName string) {
 	}
 	if strings.Contains(dataSourceName, ":5432") {
 		return "pgx"
+	}
+	if strings.Contains(dataSourceName, ":26257") {
+		return "cockroachdb"
 	}
 	if strings.Contains(dataSourceName, ":1433") {
 		return "mssql"
@@ -598,14 +618,14 @@ underlying DROP+CREATE only happens on the first call.
 
 If a driver name is not provided, it is inferred from the data source name on a
 best-effort basis. Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres),
-"mssql" (SQL Server) or "sqlite" (SQLite).
+"cockroachdb" (CockroachDB), "mssql" (SQL Server) or "sqlite" (SQLite).
 
-If a base data source name is not provided, the following localhost defaults are
-used based on the driver name:
+If a base data source name is not provided, the following localhost defaults are used based on the driver name:
   - (empty): SQLite in-memory database
   - sqlite: SQLite in-memory database
   - mysql: root:root@tcp(127.0.0.1:3306)/
   - pgx: postgres://postgres:postgres@127.0.0.1:5432/
+  - cockroachdb: postgres://root@127.0.0.1:26257/?sslmode=disable
   - mssql: sqlserver://sa:Password123@127.0.0.1:1433
 */
 func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueTestID string) (dsn string, err error) {
@@ -618,6 +638,8 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 			baseDataSourceName = "root:root@tcp(127.0.0.1:3306)/"
 		case "pgx":
 			baseDataSourceName = "postgres://postgres:postgres@127.0.0.1:5432/"
+		case "cockroachdb":
+			baseDataSourceName = "postgres://root@127.0.0.1:26257/?sslmode=disable"
 		case "mssql":
 			baseDataSourceName = "sqlserver://sa:Password123@127.0.0.1:1433"
 		default:
@@ -704,7 +726,7 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 		switch driverName {
 		case "mysql":
 			stmt = "SHOW DATABASES"
-		case "pgx":
+		case "pgx", "cockroachdb":
 			stmt = "SELECT datname FROM pg_database"
 		case "mssql":
 			stmt = "SELECT name FROM sys.databases"
@@ -787,7 +809,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			locked_before DATETIME(3) NOT NULL DEFAULT NOW_UTC(),
 			PRIMARY KEY (seq_name, seq_num)
 		)`
-	case "pgx":
+	case "pgx", "cockroachdb":
 		stmt = `
 		CREATE TABLE IF NOT EXISTS sequel_migrations (
 			seq_name VARCHAR(256) NOT NULL,
@@ -830,7 +852,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 	// Query for the high watermark
 	var nullableWatermark sql.NullInt32
 	switch db.driverName {
-	case "mysql", "pgx":
+	case "mysql", "pgx", "cockroachdb":
 		stmt = `SELECT MAX(seq_num) FROM sequel_migrations WHERE seq_name=? AND completed=TRUE`
 	case "mssql", "sqlite":
 		stmt = `SELECT MAX(seq_num) FROM sequel_migrations WHERE seq_name=? AND completed=1`
@@ -886,7 +908,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		switch db.driverName {
 		case "mysql":
 			stmt = `INSERT IGNORE INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
-		case "pgx":
+		case "pgx", "cockroachdb":
 			stmt = `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?) ON CONFLICT DO NOTHING`
 		case "mssql":
 			stmt = `
@@ -921,7 +943,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 
 		// Try to obtain a lock
 		switch db.driverName {
-		case "mysql", "pgx":
+		case "mysql", "pgx", "cockroachdb":
 			stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000)
 					WHERE seq_name=? AND seq_num=? AND locked_before<NOW_UTC() AND completed=FALSE`
 		case "mssql", "sqlite":
@@ -960,8 +982,8 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 				}
 				p := strings.Index(stmt, "-- DRIVER:")
 				if p >= 0 {
-					driver, _, _ := strings.Cut(stmt[p+10:], "\n")
-					if !strings.Contains(driver, db.driverName) {
+					driverLine, _, _ := strings.Cut(stmt[p+10:], "\n")
+					if !slices.Contains(strings.Fields(driverLine), db.driverName) {
 						continue
 					}
 				}
@@ -1006,7 +1028,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 
 		// Mark as complete
 		switch db.driverName {
-		case "mysql", "pgx":
+		case "mysql", "pgx", "cockroachdb":
 			stmt = `UPDATE sequel_migrations SET locked_before=NOW_UTC(), completed_on=NOW_UTC(), completed=TRUE WHERE seq_name=? AND seq_num=?`
 		case "mssql", "sqlite":
 			stmt = `UPDATE sequel_migrations SET locked_before=NOW_UTC(), completed_on=NOW_UTC(), completed=1 WHERE seq_name=? AND seq_num=?`
@@ -1025,7 +1047,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 // conformPlaceholders replaces the ? arg placeholders in a SQL statement to $1, $2 etc. for a Postgres driver.
 // Question marks inside quoted strings (single or double quotes) are left as-is.
 func conformPlaceholders(driverName string, stmt string) string {
-	if driverName != "pgx" {
+	if driverName != "pgx" && driverName != "cockroachdb" {
 		return stmt
 	}
 	n := strings.Count(stmt, "?")
@@ -1098,7 +1120,7 @@ func (db *DB) NowUTC() string {
 	switch db.driverName {
 	case "mysql":
 		return "UTC_TIMESTAMP(3)"
-	case "pgx":
+	case "pgx", "cockroachdb":
 		return "(NOW() AT TIME ZONE 'UTC')"
 	case "mssql":
 		return "SYSUTCDATETIME()"
@@ -1123,7 +1145,7 @@ func (db *DB) RegexpTextSearch(searchableColumns ...string) string {
 	switch db.DriverName() {
 	case "mysql":
 		return concatenated + " REGEXP ?"
-	case "pgx":
+	case "pgx", "cockroachdb":
 		return "REGEXP_LIKE(" + concatenated + ", ?, 'i')"
 	case "mssql":
 		// The database compatibility level must be set to 170 or higher

@@ -2,12 +2,13 @@ module github.com/microbus-io/sequel
 
 go 1.25.0
 
+tool github.com/microbus-io/copyrighter
+
 require (
 	github.com/denisenkom/go-mssqldb v0.12.3
 	github.com/go-sql-driver/mysql v1.10.0
 	github.com/jackc/pgx/v5 v5.9.2
-	github.com/microbus-io/copyrighter v1.3.0
-	github.com/microbus-io/errors v1.0.0
+	github.com/microbus-io/errors v1.0.1
 	github.com/microbus-io/testarossa v0.7.3
 	modernc.org/sqlite v1.50.0
 )
@@ -23,6 +24,7 @@ require (
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	github.com/mattn/go-isatty v0.0.22 // indirect
+	github.com/microbus-io/copyrighter v1.4.0 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	golang.org/x/crypto v0.50.0 // indirect

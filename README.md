@@ -6,7 +6,7 @@ A Go library that enhances `database/sql` with cross-driver SQL, schema migratio
 
 - **Connection pool management** - Prevents database exhaustion when many consumers in one process share a DSN
 - **Schema migration** - Concurrency-safe, incremental database migrations
-- **Cross-driver support** - MySQL, PostgreSQL, SQL Server, and SQLite with unified API
+- **Cross-driver support** - MySQL, PostgreSQL, CockroachDB, SQL Server, and SQLite with unified API
 - **Ephemeral test databases** - Isolated databases per test with automatic cleanup
 
 ## Quick Start
@@ -52,7 +52,7 @@ Sequel performs incremental schema migration using numbered SQL files (`1.sql`, 
 
 - **Concurrency-safe** - Distributed locking ensures only one replica executes each migration
 - **Tracked** - A `sequel_migrations` table records completed migrations
-- **Driver-aware** - Use `-- DRIVER: drivername` comments for driver-specific SQL
+- **Driver-aware** - Use `-- DRIVER: drivername` comments for driver-specific SQL (list multiple, space-separated, to share a statement across drivers)
 
 ```go
 // Embed migration files
@@ -69,7 +69,7 @@ Example migration file with driver-specific syntax:
 -- DRIVER: mysql
 ALTER TABLE users MODIFY COLUMN email VARCHAR(384) NOT NULL;
 
--- DRIVER: pgx
+-- DRIVER: pgx cockroachdb
 ALTER TABLE users ALTER COLUMN email TYPE VARCHAR(384);
 
 -- DRIVER: mssql
@@ -81,7 +81,9 @@ ALTER TABLE users ALTER COLUMN email NVARCHAR(384) NOT NULL;
 
 ## Cross-Driver Support
 
-Sequel supports MySQL, PostgreSQL, SQL Server, and SQLite through a unified API. Write your SQL once using MySQL-style `?` placeholders and virtual functions, and Sequel automatically adapts queries for the active driver.
+Sequel supports MySQL, PostgreSQL, CockroachDB, SQL Server, and SQLite through a unified API. Write your SQL once using MySQL-style `?` placeholders and virtual functions, and Sequel automatically adapts queries for the active driver.
+
+CockroachDB speaks the PostgreSQL wire protocol and shares the `pgx` driver, but it is exposed as a distinct driver name (`cockroachdb`) because callers may need to branch on Cockroach-specific behavior — retry semantics and async schema changes in particular. Internally, every PostgreSQL expansion (placeholders, virtual functions, DSN parsing) applies identically to `cockroachdb`.
 
 ### Automatic Placeholder Conversion
 

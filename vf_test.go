@@ -43,6 +43,10 @@ func TestVF_BasicExpansion(t *testing.T) {
 	assert.NoError(err)
 	assert.Equal("SELECT (NOW() AT TIME ZONE 'UTC')", q)
 
+	q, err = callExpand("cockroachdb", "SELECT NOW_UTC()")
+	assert.NoError(err)
+	assert.Equal("SELECT (NOW() AT TIME ZONE 'UTC')", q)
+
 	q, err = callExpand("sqlite", "SELECT NOW_UTC()")
 	assert.NoError(err)
 	assert.Equal("SELECT (STRFTIME('%Y-%m-%d %H:%M:%f', 'now'))", q)
