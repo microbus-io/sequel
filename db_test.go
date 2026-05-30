@@ -53,13 +53,21 @@ func TestDB_AutoCreate(t *testing.T) {
 			stmt := "SELECT COUNT(id) FROM foo"
 			err = db.QueryRow(stmt).Scan(&count)
 			assert.NoError(err)
-			assert.Equal(3, count)
+			assert.Equal(4, count)
 
 			var id int
 			stmt = db.ConformArgPlaceholders("SELECT id FROM foo WHERE id=?")
 			err = db.QueryRow(stmt, 1).Scan(&id)
 			assert.NoError(err)
 			assert.Equal(1, id)
+
+			// 10.insert.sql sorts before 2.alter-table.sql by filename but must run after it
+			// (it uses the column 2 adds). Its row proves migrations ran in numeric order.
+			var updated int
+			stmt = db.ConformArgPlaceholders("SELECT updated FROM foo WHERE id=?")
+			err = db.QueryRow(stmt, 10).Scan(&updated)
+			assert.NoError(err)
+			assert.Equal(1, updated)
 		})
 	}
 }

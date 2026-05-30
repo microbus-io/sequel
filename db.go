@@ -898,6 +898,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		migrations[seqNum] = string(content)
 		fileNames[seqNum] = file.Name()
 	}
+	slices.Sort(sequenceNumbersToRun)
 
 	// Execute the migrations
 	for len(sequenceNumbersToRun) > 0 {
