@@ -32,13 +32,14 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/denisenkom/go-mssqldb"
+	mssql "github.com/denisenkom/go-mssqldb"
 	"github.com/denisenkom/go-mssqldb/msdsn"
 	"github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/microbus-io/errors"
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 var (
@@ -207,22 +208,65 @@ func normalizeDriverAndDSN(driverName, dataSourceName string) (string, string, e
 // IsLockContentionError returns true if the error indicates database lock contention or a deadlock.
 // Such errors are transient and the operation can typically be retried.
 // Recognizes lock errors from SQLite, MySQL, PostgreSQL, SQL Server, and CockroachDB.
+//
+// Classification prefers the driver's native error code (immune to message wording, localization, and
+// user data appearing in error messages); a substring match is used as a fallback for errors whose
+// driver type is not present in the chain (e.g. some wrapped or text-only CockroachDB retry errors).
 func IsLockContentionError(err error) bool {
 	if err == nil {
 		return false
 	}
-	msg := err.Error()
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		// 40P01 deadlock_detected, 40001 serialization_failure (PostgreSQL and CockroachDB).
+		if pgErr.Code == "40P01" || pgErr.Code == "40001" {
+			return true
+		}
+	}
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) {
+		// 1213 ER_LOCK_DEADLOCK, 1205 ER_LOCK_WAIT_TIMEOUT.
+		if myErr.Number == 1213 || myErr.Number == 1205 {
+			return true
+		}
+	}
+	var msErr mssql.Error
+	if errors.As(err, &msErr) {
+		// 1205 deadlock victim, 1222 lock request time out.
+		if msErr.Number == 1205 || msErr.Number == 1222 {
+			return true
+		}
+	}
+	var liteErr *sqlite.Error
+	if errors.As(err, &liteErr) {
+		// The low byte is the primary result code: 5 SQLITE_BUSY, 6 SQLITE_LOCKED (also covers the
+		// extended codes such as SQLITE_BUSY_SNAPSHOT and SQLITE_LOCKED_SHAREDCACHE).
+		switch liteErr.Code() & 0xff {
+		case 5, 6:
+			return true
+		}
+	}
+
+	return isLockContentionMessage(err.Error())
+}
+
+// isLockContentionMessage is the substring fallback for lock/deadlock errors whose native driver type
+// is not in the error chain.
+func isLockContentionMessage(msg string) bool {
 	switch {
-	case strings.Contains(msg, "SQLITE_BUSY"), strings.Contains(msg, "database is locked"): // SQLite
+	case strings.Contains(msg, "SQLITE_BUSY"), strings.Contains(msg, "database is locked"),
+		strings.Contains(msg, "SQLITE_LOCKED"), strings.Contains(msg, "database table is locked"),
+		strings.Contains(msg, "database is deadlocked"): // SQLite (BUSY / LOCKED)
 		return true
 	case strings.Contains(msg, "Deadlock found"), strings.Contains(msg, "Lock wait timeout"): // MySQL
 		return true
 	case strings.Contains(msg, "deadlock detected"): // PostgreSQL
 		return true
-	case strings.Contains(msg, "deadlock victim"), strings.Contains(msg, "was deadlocked"), // SQL Server (1205)
-		strings.Contains(msg, "Lock request time out"): // SQL Server (1222)
+	case strings.Contains(msg, "deadlock victim"), strings.Contains(msg, "was deadlocked"),
+		strings.Contains(msg, "Lock request time out"): // SQL Server
 		return true
-	case strings.Contains(msg, "restart transaction"), // CockroachDB serialization retry (40001)
+	case strings.Contains(msg, "restart transaction"), // CockroachDB
 		strings.Contains(msg, "RETRY_SERIALIZABLE"),
 		strings.Contains(msg, "RETRY_WRITE_TOO_OLD"):
 		return true

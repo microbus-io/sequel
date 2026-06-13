@@ -310,7 +310,7 @@ func TestDB_NowUTC(t *testing.T) {
 	assert.Equal("(NOW() AT TIME ZONE 'UTC')", db.NowUTC())
 
 	db = &DB{driverName: "mssql"}
-	assert.Equal("SYSUTCDATETIME()", db.NowUTC())
+	assert.Equal("(CONVERT(DATETIME2(3), SYSUTCDATETIME()))", db.NowUTC())
 
 	db = &DB{driverName: "sqlite"}
 	assert.Equal("STRFTIME('%Y-%m-%d %H:%M:%f', 'now')", db.NowUTC())
@@ -374,7 +374,7 @@ func TestDB_UnpackQuery_NowUTC(t *testing.T) {
 	db = newTestDB("mssql")
 	q, err = db.UnpackQuery("UPDATE t SET updated_at=NOW_UTC() WHERE id=?")
 	assert.NoError(err)
-	assert.Equal("UPDATE t SET updated_at=SYSUTCDATETIME() WHERE id=?", q)
+	assert.Equal("UPDATE t SET updated_at=(CONVERT(DATETIME2(3), SYSUTCDATETIME())) WHERE id=?", q)
 
 	db = newTestDB("sqlite")
 	q, err = db.UnpackQuery("UPDATE t SET updated_at=NOW_UTC() WHERE id=?")
