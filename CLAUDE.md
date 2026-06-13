@@ -101,7 +101,7 @@ choices below are the non-obvious ones.
 ### Providers via setters, not constructor options — because `Open` has nothing to instrument
 
 `Open`/`OpenSingleton` deliberately keep the standard `database/sql` signature; telemetry is attached with
-`SetTracerProvider` / `SetMeterProvider` / `SetLogger` / `SetVerbose` afterward. The reflexive worry is
+`SetTracerProvider` / `SetMeterProvider` / `SetLogger` afterward. The reflexive worry is
 that operations *inside* `Open` then go uninstrumented — but `sql.Open` is **lazy**: it validates arguments
 and builds the pool struct but performs **no network I/O**; the first real connection is established later,
 on the first query (or `Ping`). So there is no latency, no round trip, nothing inside `Open` worth a span —
@@ -116,16 +116,22 @@ never see a torn value. A `*Tx` captures the pointer at begin time. For an `Open
 pointer is process-wide for that pool — last writer wins — so callers are told to configure once from the
 owning caller rather than each opener racing to set its own.
 
-### Spans carry operation + table; full statement only in verbose mode
+### Spans carry operation + table, never the statement text
 
 `db.operation.name` (the leading SQL keyword) is always accurate. `db.collection.name` (the table) is
 emitted **only when `parseOperation` can determine it unambiguously** — a single target after
 `FROM`/`INTO`/`UPDATE`, with no join, multi-table list, or subquery. The alternative (best-effort table
 extraction from arbitrary SQL) would produce confident-looking but wrong attributes and would inflate
-span-name cardinality; omitting the table when unsure means a *present* table is trustworthy. The full
-statement (`db.query.text`) is attached only under `SetVerbose`, because most deployments do not want
-per-query text volume on every span. It is never a privacy risk: sequel always parameterizes arguments, so
-the captured text holds only `?`/`$1` placeholders, never argument values.
+span-name cardinality; omitting the table when unsure means a *present* table is trustworthy.
+
+Spans **never** attach the statement text (`db.query.text`). Sequel is a child span under the caller's own
+span, which is function-named, so operation + table + that parent identify the statement without paying
+per-span text volume on every operation. The full parameterized statement is available instead in the
+per-query Debug log (below), where the caller's logger level decides whether to pay for it. There was once a
+`SetVerbose` switch that attached `db.query.text` to spans and force-enabled the Debug log; it was removed
+because it duplicated `slog`'s own level filtering and put text on spans that the parent span already
+distinguishes. (Statement text is never a privacy risk either way: sequel always parameterizes arguments, so
+the text holds only `?`/`$1` placeholders, never argument values.)
 
 ### Lock contention is classified once, centrally
 
@@ -153,6 +159,8 @@ resource-leak shape as an unscanned `sql.Row`.
 Traces and metrics record per-operation errors (span error status; `status=error` on the duration
 histogram); `slog` does **not**. Every error is returned to the caller, who will log it — having the library
 log it too would double every failure in operators' logs. Logging is reserved for what the caller cannot
-already see at the call site: one-off lifecycle events (each migration as it is attempted, at Info) and, only
-under `SetVerbose`, per-query Debug lines. `Migrate` logs at *attempt* time regardless of outcome, so the log
-shows what was tried even when the migration then fails.
+already see at the call site: one-off lifecycle events (each migration as it is attempted, at Info) and
+per-query Debug lines. The Debug lines are gated on `logger.Enabled(ctx, slog.LevelDebug)`, so the caller's
+own logger level — not a separate sequel switch — decides whether to pay for per-query logging, and the gate
+keeps the string-building cost off the hot path when Debug is disabled. `Migrate` logs at *attempt* time
+regardless of outcome, so the log shows what was tried even when the migration then fails.

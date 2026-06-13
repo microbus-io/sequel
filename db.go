@@ -368,19 +368,12 @@ func (db *DB) SetMeterProvider(mp metric.MeterProvider) {
 }
 
 // SetLogger attaches an slog.Logger. The library does not log operation errors (they are returned to the
-// caller, who logs them); it logs one-off events such as schema migrations at Info, and — only when
-// [DB.SetVerbose] is enabled — each query at Debug. Pass nil to disable logging.
+// caller, who logs them); it logs one-off events such as schema migrations at Info, and — when the logger
+// is enabled at Debug level — each query at Debug. Per-query logging is therefore controlled by the
+// logger's own level, not a separate switch. Pass nil to disable logging.
 func (db *DB) SetLogger(logger *slog.Logger) {
 	db.updateTelemetry(func(t *telemetry) {
 		t.logger = logger
-	})
-}
-
-// SetVerbose toggles verbose observability. When enabled, spans gain the parameterized statement text
-// (db.query.text, never argument values) and each query is logged at Debug. Off by default.
-func (db *DB) SetVerbose(verbose bool) {
-	db.updateTelemetry(func(t *telemetry) {
-		t.verbose = verbose
 	})
 }
 

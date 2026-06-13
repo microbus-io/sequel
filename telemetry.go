@@ -42,15 +42,15 @@ never takes a lock. A nil *telemetry is the zero-overhead path — every method 
 DB without any provider does no extra work beyond one nil check.
 
 Spans follow OpenTelemetry database semantic conventions (db.system.name, db.operation.name,
-db.collection.name); metrics carry the sequel_ prefix. Statement text (db.query.text) is attached only in
-verbose mode and never includes argument values — sequel always parameterizes args, so the captured text
-holds only placeholders.
+db.collection.name); metrics carry the sequel_ prefix. Spans deliberately omit the statement text: the
+operation keyword and table, combined with the caller's own (function-named) parent span, identify the
+statement without per-span text volume. The full parameterized statement is available instead in the
+per-query Debug log, which the caller's logger level gates.
 */
 type telemetry struct {
-	tracer  trace.Tracer
-	meter   metric.Meter
-	logger  *slog.Logger
-	verbose bool
+	tracer trace.Tracer
+	meter  metric.Meter
+	logger *slog.Logger
 
 	// Instruments are created when a MeterProvider is set; each is nil-checked at use so a tracer-only or
 	// logger-only configuration works.
@@ -153,7 +153,8 @@ begin starts instrumentation for a single query-shaped operation and returns a (
 carrying the span plus a finish func to call with the operation's error. query is the executed (unpacked)
 SQL; its leading keyword and, when unambiguous, its table become the db.operation.name / db.collection.name
 attributes and the span name. The finish func records duration, classifies lock contention, sets the span
-status, and — in verbose mode — emits a Debug log. Safe to call on a nil *telemetry (no-op).
+status, and — when the logger is enabled at Debug level — emits a Debug log. Safe to call on a nil
+*telemetry (no-op).
 */
 func (t *telemetry) begin(ctx context.Context, driver, query string) (context.Context, func(err error)) {
 	if !t.enabled() {
@@ -174,9 +175,6 @@ func (t *telemetry) begin(ctx context.Context, driver, query string) (context.Co
 		}
 		if table != "" {
 			attrs = append(attrs, attribute.String("db.collection.name", table))
-		}
-		if t.verbose {
-			attrs = append(attrs, attribute.String("db.query.text", query))
 		}
 		ctx, span = t.tracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
 	}
@@ -207,7 +205,7 @@ func (t *telemetry) begin(ctx context.Context, driver, query string) (context.Co
 			}
 			span.End()
 		}
-		if t.verbose && t.logger != nil {
+		if t.logger != nil && t.logger.Enabled(ctx, slog.LevelDebug) {
 			args := []any{"driver", driver, "operation", op, "query", query, "duration_s", dur}
 			if err != nil {
 				// Logged at Debug, not Error: the library returns every error to the caller, who logs it.

@@ -106,46 +106,55 @@ func TestTelemetry_QuerySpans(t *testing.T) {
 	assert.Equal("sqlite", attrs["db.system.name"])
 	assert.Equal("SELECT", attrs["db.operation.name"])
 	assert.Equal("foo", attrs["db.collection.name"])
-	// Statement text is captured only in verbose mode; off by default.
+	// Statement text is never attached to spans; operation + table + the caller's parent span identify it.
 	_, hasText := attrs["db.query.text"]
 	assert.False(hasText)
 }
 
-func TestTelemetry_VerboseStatementAndLogs(t *testing.T) {
+func TestTelemetry_StatementLogsGatedByLevel(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)
 
-	sr := tracetest.NewSpanRecorder()
-	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
-	var logBuf bytes.Buffer
-	logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	// A Debug-level logger captures the per-query statement; an Info-level logger does not, and never
+	// the span text — per-query logging is controlled by the logger's level, not a separate switch.
+	run := func(name string, level slog.Level) string {
+		var logBuf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: level}))
+		sr := tracetest.NewSpanRecorder()
+		tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
 
-	db := newSQLiteDB(t)
-	db.SetTracerProvider(tp)
-	db.SetLogger(logger)
-	db.SetVerbose(true)
-	assert.NoError(db.Migrate(t.Name(), testdata.FS))
+		// Each run gets its own isolated database so both can apply the migration from scratch.
+		dsn, err := CreateTestingDatabase("sqlite", "", t.Name()+"_"+name)
+		assert.NoError(err)
+		db, err := OpenSingleton("sqlite", dsn)
+		assert.NoError(err)
+		t.Cleanup(func() { db.Close() })
+		db.SetTracerProvider(tp)
+		db.SetLogger(logger)
+		assert.NoError(db.Migrate(t.Name(), testdata.FS))
 
-	var count int
-	assert.NoError(db.QueryRow("SELECT COUNT(id) FROM foo").Scan(&count))
+		var count int
+		assert.NoError(db.QueryRow("SELECT COUNT(id) FROM foo").Scan(&count))
 
-	// Span carries the parameterized statement text.
-	var stmtText string
-	for _, s := range tracetest.SpanStubsFromReadOnlySpans(sr.Ended()) {
-		if s.Name == "SELECT foo" {
+		// The statement text is never attached to a span, regardless of log level.
+		for _, s := range tracetest.SpanStubsFromReadOnlySpans(sr.Ended()) {
 			for _, kv := range s.Attributes {
-				if string(kv.Key) == "db.query.text" {
-					stmtText = kv.Value.AsString()
-				}
+				assert.NotEqual("db.query.text", string(kv.Key))
 			}
 		}
+		return logBuf.String()
 	}
-	assert.Contains(stmtText, "SELECT COUNT(id) FROM foo")
 
-	logs := logBuf.String()
-	// Migration attempts logged at Info, queries at Debug in verbose mode.
-	assert.Contains(logs, "running database migration")
-	assert.Contains(logs, "sequel query")
+	debugLogs := run("debugrun", slog.LevelDebug)
+	// Migration attempts log at Info; queries log at Debug, carrying the parameterized statement.
+	assert.Contains(debugLogs, "running database migration")
+	assert.Contains(debugLogs, "sequel query")
+	assert.Contains(debugLogs, "SELECT COUNT(id) FROM foo")
+
+	infoLogs := run("inforun", slog.LevelInfo)
+	// At Info the migration event still logs, but per-query Debug lines are suppressed by the logger.
+	assert.Contains(infoLogs, "running database migration")
+	assert.NotContains(infoLogs, "sequel query")
 }
 
 func TestTelemetry_Metrics(t *testing.T) {
