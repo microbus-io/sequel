@@ -50,6 +50,10 @@ func TestVF_BasicExpansion(t *testing.T) {
 	q, err = callExpand("sqlite", "SELECT NOW_UTC()")
 	assert.NoError(err)
 	assert.Equal("SELECT (STRFTIME('%Y-%m-%d %H:%M:%f', 'now'))", q)
+
+	q, err = callExpand("mssql", "SELECT NOW_UTC()")
+	assert.NoError(err)
+	assert.Equal("SELECT (CONVERT(DATETIME2(3), SYSUTCDATETIME()))", q)
 }
 
 func TestVF_CaseInsensitive(t *testing.T) {

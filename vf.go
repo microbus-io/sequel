@@ -192,7 +192,7 @@ func vfNowUTC(driverName string, args string) (string, error) {
 	case "pgx", "cockroachdb":
 		return "(NOW() AT TIME ZONE 'UTC')", nil
 	case "mssql":
-		return "SYSUTCDATETIME()", nil
+		return "(CONVERT(DATETIME2(3), SYSUTCDATETIME()))", nil
 	case "sqlite":
 		return "(STRFTIME('%Y-%m-%d %H:%M:%f', 'now'))", nil
 	default:

@@ -1124,7 +1124,7 @@ func (db *DB) NowUTC() string {
 	case "pgx", "cockroachdb":
 		return "(NOW() AT TIME ZONE 'UTC')"
 	case "mssql":
-		return "SYSUTCDATETIME()"
+		return "(CONVERT(DATETIME2(3), SYSUTCDATETIME()))"
 	case "sqlite":
 		return "STRFTIME('%Y-%m-%d %H:%M:%f', 'now')"
 	default:
