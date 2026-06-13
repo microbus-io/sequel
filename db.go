@@ -1188,6 +1188,10 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 				}
 				stmt = strings.Join(lines, "\n")
 				stmt = strings.TrimSpace(stmt)
+				if stmt == "" {
+					// Empty after stripping comments (e.g. a comment-only segment); skip to avoid erroring out
+					continue
+				}
 				_, e := db.Exec(stmt)
 				if e != nil {
 					done <- e
