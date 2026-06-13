@@ -92,3 +92,67 @@ touching the database. Three reasons, in priority order:
 Recording is opt-in via an internal `autoErr` flag set only by `Transact`; a `Tx` from `BeginTx` records
 nothing and short-circuits nothing, so existing direct-transaction callers see identical behavior.
 `Tx.Err()` exposes the recorded error for callers that want to inspect it.
+
+## Observability (`telemetry.go`)
+
+Sequel emits OpenTelemetry traces/metrics and `slog` logs when the caller supplies providers. The design
+choices below are the non-obvious ones.
+
+### Providers via setters, not constructor options — because `Open` has nothing to instrument
+
+`Open`/`OpenSingleton` deliberately keep the standard `database/sql` signature; telemetry is attached with
+`SetTracerProvider` / `SetMeterProvider` / `SetLogger` / `SetVerbose` afterward. The reflexive worry is
+that operations *inside* `Open` then go uninstrumented — but `sql.Open` is **lazy**: it validates arguments
+and builds the pool struct but performs **no network I/O**; the first real connection is established later,
+on the first query (or `Ping`). So there is no latency, no round trip, nothing inside `Open` worth a span —
+only a possible argument error, which the caller already receives as a return value. Deferring configuration
+to a setter therefore loses nothing real, and keeps the two constructors drop-in compatible with
+`database/sql`.
+
+The telemetry is held in a single `atomic.Pointer[telemetry]` on `*DB`. The hot path is one atomic load
+plus a nil check (`enabled()`), so a `*DB` with no providers pays essentially nothing. Setters build a new
+`telemetry` value under `db.mutex` (copy-on-write via `clone`) and swap the pointer, so reads never lock and
+never see a torn value. A `*Tx` captures the pointer at begin time. For an `OpenSingleton`-shared `*DB` the
+pointer is process-wide for that pool — last writer wins — so callers are told to configure once from the
+owning caller rather than each opener racing to set its own.
+
+### Spans carry operation + table; full statement only in verbose mode
+
+`db.operation.name` (the leading SQL keyword) is always accurate. `db.collection.name` (the table) is
+emitted **only when `parseOperation` can determine it unambiguously** — a single target after
+`FROM`/`INTO`/`UPDATE`, with no join, multi-table list, or subquery. The alternative (best-effort table
+extraction from arbitrary SQL) would produce confident-looking but wrong attributes and would inflate
+span-name cardinality; omitting the table when unsure means a *present* table is trustworthy. The full
+statement (`db.query.text`) is attached only under `SetVerbose`, because most deployments do not want
+per-query text volume on every span. It is never a privacy risk: sequel always parameterizes arguments, so
+the captured text holds only `?`/`$1` placeholders, never argument values.
+
+### Lock contention is classified once, centrally
+
+Every query funnels through one `instrument(...)` wrapper, which is the *only* place an operation's error is
+classified for the `sequel_lock_contention_total` counter. Classifying opportunistically wherever
+`IsLockContentionError` happens to be called would be unreliable — that function may be called zero times or
+several times per error. `Transact` does **not** separately increment the counter; it only reads the error
+to decide whether to retry. Each failed attempt still counts exactly once (at the statement level), which is
+the correct semantics: N contended attempts → N increments. Statements short-circuited in `Transact` mode
+return before the wrapper, so they emit no span, metric, or log.
+
+### `QueryRow` returns `*sequel.Row` to capture the deferred error
+
+`database/sql` defers a `QueryRow` error to `Scan`, so timing the call alone cannot observe success/failure.
+`QueryRow`/`QueryRowContext` therefore return a `*sequel.Row` that embeds `*sql.Row` and overrides `Scan`
+(and `Err`) to end the span, record duration, and classify contention at the moment the error becomes
+available. This is the same shadowing technique already used for `sql.Tx` and the `DB` query methods, so it
+introduces no new pattern. Embedding keeps `QueryRow(...).Scan(...)` source-compatible; only code that
+explicitly stores the result as `*sql.Row` must change. The trade-off, documented on the type: duration is
+measured until `Scan`, and a `Row` whose `Scan`/`Err` is never called leaves its span unended — the same
+resource-leak shape as an unscanned `sql.Row`.
+
+### Logs never carry operation errors
+
+Traces and metrics record per-operation errors (span error status; `status=error` on the duration
+histogram); `slog` does **not**. Every error is returned to the caller, who will log it — having the library
+log it too would double every failure in operators' logs. Logging is reserved for what the caller cannot
+already see at the call site: one-off lifecycle events (each migration as it is attempted, at Info) and, only
+under `SetVerbose`, per-query Debug lines. `Migrate` logs at *attempt* time regardless of outcome, so the log
+shows what was tried even when the migration then fails.

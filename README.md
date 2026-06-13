@@ -261,6 +261,60 @@ func startup(cfg Config) (*sequel.DB, error) {
 
 Repeated calls within the same process with the same `(driver, baseDSN, uniqueTestID)` reuse the same testing database — the `DROP+CREATE` runs only once. The returned DSN points at a database whose name has the `testing_NN_` prefix; sequel inspects this on `Close` and drops the database automatically when the last referencing `*DB` is closed. There is no separate cleanup call to remember. If a process exits before `Close` runs, the leftover-cleanup sweep on the next `CreateTestingDatabase` call removes stale databases older than 1–2 hours.
 
+## Observability
+
+Sequel emits OpenTelemetry traces and metrics and `slog` logs when you supply the corresponding providers. Everything is opt-in and off by default — a `*DB` with no providers configured does no extra work beyond a single atomic-pointer check on the hot path.
+
+Providers are attached **after** `Open`/`OpenSingleton` (which keep the standard `database/sql` signature) rather than at construction. Nothing is lost by this: `sql.Open` does no I/O — it only prepares a lazy pool — so there is no work inside `Open` worth instrumenting; every operation that does real work happens later on the returned `*DB`.
+
+```go
+db, _ := sequel.Open("", dsn)
+db.SetTracerProvider(tracerProvider) // trace.TracerProvider — client spans per query/transaction/migration
+db.SetMeterProvider(meterProvider)   // metric.MeterProvider — sequel_* metrics
+db.SetLogger(logger)                 // *slog.Logger — migration events; per-query in verbose mode
+db.SetVerbose(true)                  // optional: add statement text to spans, log each query at Debug
+```
+
+Configure once, before the `*DB` is used concurrently. For an `OpenSingleton`-shared `*DB`, the providers are process-wide for that pool; set them from the owning caller (last writer wins). Pass `nil` to any setter to disable that signal.
+
+### Spans
+
+Each query, `Transact`, and `Migrate` gets a client span following OpenTelemetry database semantic conventions:
+
+- `db.system.name` — the driver (`mysql`, `pgx`, `cockroachdb`, `mssql`, `sqlite`)
+- `db.operation.name` — the SQL verb (`SELECT`, `INSERT`, …)
+- `db.collection.name` — the table, **only when it can be determined unambiguously** (omitted for joins, multi-table `FROM` lists, and subqueries, so a present value is trustworthy)
+- `db.query.text` — the parameterized statement, **only in verbose mode** (placeholders only; argument values are never captured)
+
+The span name is `"{operation} {table}"` (e.g. `SELECT users`), or just the operation when no table is captured.
+
+### Metrics
+
+All metric names carry the `sequel_` prefix:
+
+| Metric | Type | Notes |
+|--------|------|-------|
+| `sequel_query_duration` | histogram (s) | attrs: `db.system.name`, `db.operation.name`, `status` (ok/error) |
+| `sequel_transaction_duration` | histogram (s) | attrs: `db.system.name`, `outcome` (committed/rolledback) |
+| `sequel_lock_contention_total` | counter | incremented once per surfaced lock-contention/deadlock error |
+| `sequel_migration_runs_total` | counter | counts migrations that actually ran (skipped ones excluded); attrs include `status` |
+| `sequel_pool_open_connections` | gauge | from `sql.DBStats`, attr `database` (never the raw DSN) |
+| `sequel_pool_in_use_connections` | gauge | |
+| `sequel_pool_idle_connections` | gauge | |
+| `sequel_pool_wait_count` | gauge | |
+| `sequel_pool_wait_duration_seconds` | gauge | |
+
+### Logs
+
+The library **does not log operation errors** — every error is returned to the caller, who is best placed to log it. Logging is reserved for:
+
+- **Info** — one-off events: each schema migration as it is attempted (regardless of outcome).
+- **Debug** — every query, but only when `SetVerbose(true)` is set.
+
+### `QueryRow` returns `*sequel.Row`
+
+To instrument single-row queries, `QueryRow`/`QueryRowContext` return a `*sequel.Row` (which embeds `*sql.Row`) rather than `*sql.Row`. `database/sql` defers a `QueryRow` error to `Scan`, so the shadow captures it there. The common `db.QueryRow(q).Scan(&x)` call site is unchanged; only code that explicitly stores the result as `*sql.Row` needs adjustment.
+
 ## Legal
 
 Sequel is the copyrighted work of various contributors. It is licensed to you free of charge by Microbus LLC - a Delaware limited liability company formed to hold rights to the combined intellectual property of all contributors - under the [Apache License 2.0](http://www.apache.org/licenses/LICENSE-2.0).

@@ -32,8 +32,8 @@ type Executor interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 	Query(query string, args ...any) (*sql.Rows, error)
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-	QueryRow(query string, args ...any) *sql.Row
-	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+	QueryRow(query string, args ...any) *Row
+	QueryRowContext(ctx context.Context, query string, args ...any) *Row
 	Prepare(query string) (*sql.Stmt, error)
 	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
 	InsertReturnID(ctx context.Context, idColumn string, stmt string, args ...any) (int64, error)

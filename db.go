@@ -22,6 +22,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"io/fs"
+	"log/slog"
 	"math"
 	"math/rand/v2"
 	"net/url"
@@ -30,6 +31,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	mssql "github.com/denisenkom/go-mssqldb"
@@ -39,6 +41,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/microbus-io/errors"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	sqlite "modernc.org/sqlite"
 )
 
@@ -67,6 +71,7 @@ type DB struct {
 	singletonKey   string
 	refCount       int
 	mutex          sync.Mutex
+	telemetry      atomic.Pointer[telemetry]
 }
 
 /*
@@ -324,70 +329,146 @@ func (db *DB) maybeDropTestingDatabase() {
 	masterDB.Exec("DROP DATABASE IF EXISTS " + dbName)
 }
 
+/*
+SetTracerProvider attaches an OpenTelemetry TracerProvider so sequel emits a client span around each query,
+transaction, and migration. Pass nil to disable tracing.
+
+Observability is configured after Open/OpenSingleton (which keep the standard database/sql signature) rather
+than at construction. This loses nothing: sql.Open does no I/O — it only prepares a lazy pool — so there is
+no work inside Open worth a span; every operation that does real work happens later on the returned *DB.
+
+Configure before the *DB is used concurrently. For an OpenSingleton-shared *DB the providers are process-
+wide for that pool; the last setter wins, so configure once from the owning caller.
+*/
+func (db *DB) SetTracerProvider(tp trace.TracerProvider) {
+	db.updateTelemetry(func(t *telemetry) {
+		if tp == nil {
+			t.tracer = nil
+			return
+		}
+		t.tracer = tp.Tracer(instrumentationName)
+	})
+}
+
+// SetMeterProvider attaches an OpenTelemetry MeterProvider so sequel emits sequel_ metrics (query and
+// transaction duration, lock-contention count, migration count, and connection-pool gauges). Pass nil to
+// disable metrics. See [DB.SetTracerProvider] for when to call this.
+func (db *DB) SetMeterProvider(mp metric.MeterProvider) {
+	db.mutex.Lock()
+	defer db.mutex.Unlock()
+	nt := db.telemetry.Load().clone()
+	nt.clearInstruments() // unregisters any prior pool callback
+	if mp != nil {
+		nt.meter = mp.Meter(instrumentationName)
+		nt.initInstruments(db)
+	} else {
+		nt.meter = nil
+	}
+	db.telemetry.Store(nt)
+}
+
+// SetLogger attaches an slog.Logger. The library does not log operation errors (they are returned to the
+// caller, who logs them); it logs one-off events such as schema migrations at Info, and — only when
+// [DB.SetVerbose] is enabled — each query at Debug. Pass nil to disable logging.
+func (db *DB) SetLogger(logger *slog.Logger) {
+	db.updateTelemetry(func(t *telemetry) {
+		t.logger = logger
+	})
+}
+
+// SetVerbose toggles verbose observability. When enabled, spans gain the parameterized statement text
+// (db.query.text, never argument values) and each query is logged at Debug. Off by default.
+func (db *DB) SetVerbose(verbose bool) {
+	db.updateTelemetry(func(t *telemetry) {
+		t.verbose = verbose
+	})
+}
+
+// updateTelemetry applies a mutation to a fresh copy of the current telemetry and swaps it in atomically,
+// so the hot read path stays lock-free. Used for the setters that do not touch metric instruments.
+func (db *DB) updateTelemetry(mutate func(*telemetry)) {
+	db.mutex.Lock()
+	defer db.mutex.Unlock()
+	nt := db.telemetry.Load().clone()
+	mutate(nt)
+	db.telemetry.Store(nt)
+}
+
+// snapshotStats returns a connection-pool stats snapshot, or ok=false if the pool has been closed. Used by
+// the pool-gauge callback, which must tolerate a singleton *DB whose underlying pool was closed.
+func (db *DB) snapshotStats() (sql.DBStats, bool) {
+	db.mutex.Lock()
+	defer db.mutex.Unlock()
+	if db.DB == nil {
+		return sql.DBStats{}, false
+	}
+	return db.DB.Stats(), true
+}
+
 // Exec shadows sql.DB.Exec and conforms arg placeholders for the driver.
 func (db *DB) Exec(query string, args ...any) (sql.Result, error) {
-	query, err := db.UnpackQuery(query)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return db.DB.Exec(query, args...)
+	return instrumentExec(db.telemetry.Load(), context.Background(), db.driverName, query,
+		func(_ context.Context, q string) (sql.Result, error) {
+			return db.DB.Exec(q, args...)
+		})
 }
 
 // ExecContext shadows sql.DB.ExecContext and conforms arg placeholders for the driver.
 func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	query, err := db.UnpackQuery(query)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return db.DB.ExecContext(ctx, query, args...)
+	return instrumentExec(db.telemetry.Load(), ctx, db.driverName, query,
+		func(ctx context.Context, q string) (sql.Result, error) {
+			return db.DB.ExecContext(ctx, q, args...)
+		})
 }
 
 // Query shadows sql.DB.Query and conforms arg placeholders for the driver.
 func (db *DB) Query(query string, args ...any) (*sql.Rows, error) {
-	query, err := db.UnpackQuery(query)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return db.DB.Query(query, args...)
+	return instrumentExec(db.telemetry.Load(), context.Background(), db.driverName, query,
+		func(_ context.Context, q string) (*sql.Rows, error) {
+			return db.DB.Query(q, args...)
+		})
 }
 
 // QueryContext shadows sql.DB.QueryContext and conforms arg placeholders for the driver.
 func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	query, err := db.UnpackQuery(query)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return db.DB.QueryContext(ctx, query, args...)
+	return instrumentExec(db.telemetry.Load(), ctx, db.driverName, query,
+		func(ctx context.Context, q string) (*sql.Rows, error) {
+			return db.DB.QueryContext(ctx, q, args...)
+		})
 }
 
-// QueryRow shadows sql.DB.QueryRow and conforms arg placeholders for the driver.
-func (db *DB) QueryRow(query string, args ...any) *sql.Row {
-	query, _ = db.UnpackQuery(query)
-	return db.DB.QueryRow(query, args...)
+// QueryRow shadows sql.DB.QueryRow and conforms arg placeholders for the driver. It returns a [Row], which
+// embeds *sql.Row so existing QueryRow(...).Scan(...) call sites are unchanged.
+func (db *DB) QueryRow(query string, args ...any) *Row {
+	return instrumentQueryRow(db.telemetry.Load(), context.Background(), db.driverName, query,
+		func(_ context.Context, q string) *sql.Row {
+			return db.DB.QueryRow(q, args...)
+		})
 }
 
-// QueryRowContext shadows sql.DB.QueryRowContext and conforms arg placeholders for the driver.
-func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
-	query, _ = db.UnpackQuery(query)
-	return db.DB.QueryRowContext(ctx, query, args...)
+// QueryRowContext shadows sql.DB.QueryRowContext and conforms arg placeholders for the driver. It returns a
+// [Row], which embeds *sql.Row so existing QueryRowContext(...).Scan(...) call sites are unchanged.
+func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *Row {
+	return instrumentQueryRow(db.telemetry.Load(), ctx, db.driverName, query,
+		func(ctx context.Context, q string) *sql.Row {
+			return db.DB.QueryRowContext(ctx, q, args...)
+		})
 }
 
 // Prepare shadows sql.DB.Prepare and conforms arg placeholders for the driver.
 func (db *DB) Prepare(query string) (*sql.Stmt, error) {
-	query, err := db.UnpackQuery(query)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return db.DB.Prepare(query)
+	return instrumentExec(db.telemetry.Load(), context.Background(), db.driverName, query,
+		func(_ context.Context, q string) (*sql.Stmt, error) {
+			return db.DB.Prepare(q)
+		})
 }
 
 // PrepareContext shadows sql.DB.PrepareContext and conforms arg placeholders for the driver.
 func (db *DB) PrepareContext(ctx context.Context, query string) (*sql.Stmt, error) {
-	query, err := db.UnpackQuery(query)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return db.DB.PrepareContext(ctx, query)
+	return instrumentExec(db.telemetry.Load(), ctx, db.driverName, query,
+		func(ctx context.Context, q string) (*sql.Stmt, error) {
+			return db.DB.PrepareContext(ctx, q)
+		})
 }
 
 // DriverName is the name of the driver: "mysql", "pgx", "cockroachdb", "mssql" or "sqlite".
@@ -419,7 +500,7 @@ func (db *DB) Begin() (*Tx, error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	return &Tx{Tx: sqlTx, driverName: db.driverName}, nil
+	return &Tx{Tx: sqlTx, driverName: db.driverName, t: db.telemetry.Load()}, nil
 }
 
 // BeginTx starts a transaction with the given options and returns a sequel.Tx that
@@ -429,7 +510,7 @@ func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	return &Tx{Tx: sqlTx, driverName: db.driverName}, nil
+	return &Tx{Tx: sqlTx, driverName: db.driverName, t: db.telemetry.Load()}, nil
 }
 
 // transactMaxAttempts bounds how many times Transact reruns a transaction that keeps losing to lock
@@ -444,18 +525,22 @@ const transactMaxAttempts = 8
 // The Tx passed to fn records the first statement error and short-circuits the remaining statements, so
 // fn cannot commit partial work even if it does not check every statement's error. For SQL Server,
 // SET XACT_ABORT ON is applied so that any statement error aborts the whole transaction.
-func (db *DB) Transact(ctx context.Context, fn func(tx *Tx) error) error {
-	var err error
+func (db *DB) Transact(ctx context.Context, fn func(tx *Tx) error) (err error) {
+	ctx, finish := db.telemetry.Load().beginTransact(ctx, db.driverName)
+	attempts := 0
+	defer func() { finish(attempts, err) }()
 	for attempt := range transactMaxAttempts {
 		if attempt > 0 {
 			time.Sleep(time.Duration(attempt)*time.Millisecond + time.Duration(rand.IntN(3))*time.Millisecond)
 		}
+		attempts++
 		err = db.transactOnce(ctx, fn)
 		if err == nil || !IsLockContentionError(err) {
 			return err
 		}
 	}
-	return errors.Trace(err)
+	err = errors.Trace(err)
+	return err
 }
 
 // transactOnce executes one attempt of a Transact: begin, run fn, commit, rolling back on any failure.
@@ -464,7 +549,7 @@ func (db *DB) transactOnce(ctx context.Context, fn func(tx *Tx) error) error {
 	if err != nil {
 		return errors.Trace(err)
 	}
-	tx := &Tx{Tx: sqlTx, driverName: db.driverName, autoErr: true}
+	tx := &Tx{Tx: sqlTx, driverName: db.driverName, autoErr: true, t: db.telemetry.Load()}
 	committed := false
 	defer func() {
 		if !committed {
@@ -900,6 +985,9 @@ func (db *DB) adjustConnectionLimits() {
 // Migrate reads all #.sql files from the FS, and executes any new migrations in order of their file name.
 // The order of execution is guaranteed only within the context of a sequence name.
 func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
+	ctx, finishMigrate := db.telemetry.Load().beginMigrate(context.Background(), db.driverName, sequenceName)
+	defer func() { finishMigrate(err) }()
+
 	// Init the schema migration table
 	stmt := ""
 	switch db.driverName {
@@ -1071,6 +1159,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		}
 
 		// Obtained lock, execute migration in a goroutine
+		db.telemetry.Load().logMigrationAttempt(ctx, db.driverName, sequenceName, fileNames[seqNum])
 		statement := migrations[seqNum]
 		lines := strings.Split(statement, "\n")
 		for i := range lines {
@@ -1123,6 +1212,8 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 				}
 			}
 		}
+
+		db.telemetry.Load().recordMigration(ctx, db.driverName, sequenceName, err)
 
 		if err != nil {
 			// Release the lock

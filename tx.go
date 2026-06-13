@@ -19,8 +19,6 @@ package sequel
 import (
 	"context"
 	"database/sql"
-
-	"github.com/microbus-io/errors"
 )
 
 // Tx is an in-progress database transaction that shadows sql.Tx methods
@@ -35,8 +33,9 @@ import (
 type Tx struct {
 	*sql.Tx
 	driverName string
-	autoErr    bool  // set by Transact: record first statement error and short-circuit thereafter
-	err        error // first recorded statement error (autoErr mode only)
+	autoErr    bool       // set by Transact: record first statement error and short-circuit thereafter
+	err        error      // first recorded statement error (autoErr mode only)
+	t          *telemetry // observability snapshot taken when the transaction began (may be nil)
 }
 
 // recordErr remembers the first statement error in Transact (autoErr) mode and returns err unchanged,
@@ -67,11 +66,10 @@ func (tx *Tx) Exec(query string, args ...any) (sql.Result, error) {
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	query, err := tx.UnpackQuery(query)
-	if err != nil {
-		return nil, tx.recordErr(errors.Trace(err))
-	}
-	res, err := tx.Tx.Exec(query, args...)
+	res, err := instrumentExec(tx.t, context.Background(), tx.driverName, query,
+		func(_ context.Context, q string) (sql.Result, error) {
+			return tx.Tx.Exec(q, args...)
+		})
 	return res, tx.recordErr(err)
 }
 
@@ -80,11 +78,10 @@ func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.R
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	query, err := tx.UnpackQuery(query)
-	if err != nil {
-		return nil, tx.recordErr(errors.Trace(err))
-	}
-	res, err := tx.Tx.ExecContext(ctx, query, args...)
+	res, err := instrumentExec(tx.t, ctx, tx.driverName, query,
+		func(ctx context.Context, q string) (sql.Result, error) {
+			return tx.Tx.ExecContext(ctx, q, args...)
+		})
 	return res, tx.recordErr(err)
 }
 
@@ -93,11 +90,10 @@ func (tx *Tx) Query(query string, args ...any) (*sql.Rows, error) {
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	query, err := tx.UnpackQuery(query)
-	if err != nil {
-		return nil, tx.recordErr(errors.Trace(err))
-	}
-	rows, err := tx.Tx.Query(query, args...)
+	rows, err := instrumentExec(tx.t, context.Background(), tx.driverName, query,
+		func(_ context.Context, q string) (*sql.Rows, error) {
+			return tx.Tx.Query(q, args...)
+		})
 	return rows, tx.recordErr(err)
 }
 
@@ -106,24 +102,29 @@ func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	query, err := tx.UnpackQuery(query)
-	if err != nil {
-		return nil, tx.recordErr(errors.Trace(err))
-	}
-	rows, err := tx.Tx.QueryContext(ctx, query, args...)
+	rows, err := instrumentExec(tx.t, ctx, tx.driverName, query,
+		func(ctx context.Context, q string) (*sql.Rows, error) {
+			return tx.Tx.QueryContext(ctx, q, args...)
+		})
 	return rows, tx.recordErr(err)
 }
 
-// QueryRow shadows sql.Tx.QueryRow and conforms arg placeholders for the driver.
-func (tx *Tx) QueryRow(query string, args ...any) *sql.Row {
-	query, _ = tx.UnpackQuery(query)
-	return tx.Tx.QueryRow(query, args...)
+// QueryRow shadows sql.Tx.QueryRow and conforms arg placeholders for the driver. It returns a [Row], which
+// embeds *sql.Row so existing QueryRow(...).Scan(...) call sites are unchanged.
+func (tx *Tx) QueryRow(query string, args ...any) *Row {
+	return instrumentQueryRow(tx.t, context.Background(), tx.driverName, query,
+		func(_ context.Context, q string) *sql.Row {
+			return tx.Tx.QueryRow(q, args...)
+		})
 }
 
-// QueryRowContext shadows sql.Tx.QueryRowContext and conforms arg placeholders for the driver.
-func (tx *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row {
-	query, _ = tx.UnpackQuery(query)
-	return tx.Tx.QueryRowContext(ctx, query, args...)
+// QueryRowContext shadows sql.Tx.QueryRowContext and conforms arg placeholders for the driver. It returns a
+// [Row], which embeds *sql.Row so existing QueryRowContext(...).Scan(...) call sites are unchanged.
+func (tx *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *Row {
+	return instrumentQueryRow(tx.t, ctx, tx.driverName, query,
+		func(ctx context.Context, q string) *sql.Row {
+			return tx.Tx.QueryRowContext(ctx, q, args...)
+		})
 }
 
 // Prepare shadows sql.Tx.Prepare and conforms arg placeholders for the driver.
@@ -131,11 +132,10 @@ func (tx *Tx) Prepare(query string) (*sql.Stmt, error) {
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	query, err := tx.UnpackQuery(query)
-	if err != nil {
-		return nil, tx.recordErr(errors.Trace(err))
-	}
-	stmt, err := tx.Tx.Prepare(query)
+	stmt, err := instrumentExec(tx.t, context.Background(), tx.driverName, query,
+		func(_ context.Context, q string) (*sql.Stmt, error) {
+			return tx.Tx.Prepare(q)
+		})
 	return stmt, tx.recordErr(err)
 }
 
@@ -144,11 +144,10 @@ func (tx *Tx) PrepareContext(ctx context.Context, query string) (*sql.Stmt, erro
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	query, err := tx.UnpackQuery(query)
-	if err != nil {
-		return nil, tx.recordErr(errors.Trace(err))
-	}
-	stmt, err := tx.Tx.PrepareContext(ctx, query)
+	stmt, err := instrumentExec(tx.t, ctx, tx.driverName, query,
+		func(ctx context.Context, q string) (*sql.Stmt, error) {
+			return tx.Tx.PrepareContext(ctx, q)
+		})
 	return stmt, tx.recordErr(err)
 }
 
