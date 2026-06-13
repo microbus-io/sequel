@@ -6,3 +6,4 @@
 *.sqlite
 *.sqlite3
 !/codegen/bundle/*
+/_*.md
