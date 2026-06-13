@@ -23,6 +23,7 @@ import (
 	"encoding/hex"
 	"io/fs"
 	"math"
+	"math/rand/v2"
 	"net/url"
 	"regexp"
 	"slices"
@@ -385,6 +386,65 @@ func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
 		return nil, errors.Trace(err)
 	}
 	return &Tx{Tx: sqlTx, driverName: db.driverName}, nil
+}
+
+// transactMaxAttempts bounds how many times Transact reruns a transaction that keeps losing to lock
+// contention before giving up and returning the last error.
+const transactMaxAttempts = 8
+
+// Transact runs fn inside a transaction, committing on success and rolling back on error. If the
+// transaction fails on lock contention or a deadlock, it is retried with a short jittered backoff.
+// Because a retry re-executes fn from the start in a new transaction, fn must be safe to run more than
+// once; any non-transactional side effects it performs (in-memory changes, channel sends) may repeat.
+//
+// The Tx passed to fn records the first statement error and short-circuits the remaining statements, so
+// fn cannot commit partial work even if it does not check every statement's error. For SQL Server,
+// SET XACT_ABORT ON is applied so that any statement error aborts the whole transaction.
+func (db *DB) Transact(ctx context.Context, fn func(tx *Tx) error) error {
+	var err error
+	for attempt := range transactMaxAttempts {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt)*time.Millisecond + time.Duration(rand.IntN(3))*time.Millisecond)
+		}
+		err = db.transactOnce(ctx, fn)
+		if err == nil || !IsLockContentionError(err) {
+			return err
+		}
+	}
+	return errors.Trace(err)
+}
+
+// transactOnce executes one attempt of a Transact: begin, run fn, commit, rolling back on any failure.
+func (db *DB) transactOnce(ctx context.Context, fn func(tx *Tx) error) error {
+	sqlTx, err := db.DB.BeginTx(ctx, nil)
+	if err != nil {
+		return errors.Trace(err)
+	}
+	tx := &Tx{Tx: sqlTx, driverName: db.driverName, autoErr: true}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = sqlTx.Rollback()
+		}
+	}()
+	if db.driverName == "mssql" {
+		// XACT_ABORT ON makes any statement error abort the whole transaction server-side, so a deadlock
+		// or constraint failure cannot leave the transaction in a half-applied, committable state.
+		if _, err := sqlTx.ExecContext(ctx, "SET XACT_ABORT ON"); err != nil {
+			return errors.Trace(err)
+		}
+	}
+	if err := fn(tx); err != nil {
+		return errors.Trace(err)
+	}
+	if tx.err != nil {
+		return errors.Trace(tx.err)
+	}
+	if err := sqlTx.Commit(); err != nil {
+		return errors.Trace(err)
+	}
+	committed = true
+	return nil
 }
 
 // InsertReturnID executes an INSERT statement and returns the auto-generated ID for the named ID column.

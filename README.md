@@ -7,6 +7,7 @@ A Go library that enhances `database/sql` with cross-driver SQL, schema migratio
 - **Connection pool management** - Prevents database exhaustion when many consumers in one process share a DSN
 - **Schema migration** - Concurrency-safe, incremental database migrations
 - **Cross-driver support** - MySQL, PostgreSQL, CockroachDB, SQL Server, and SQLite with unified API
+- **Retrying transactions** - `Transact` runs a closure in a transaction, retries on deadlock/lock contention, and never commits partial work
 - **Ephemeral test databases** - Isolated databases per test with automatic cleanup
 
 ## Quick Start
@@ -105,10 +106,12 @@ Virtual functions are driver-agnostic function calls in your SQL that Sequel exp
 
 | Driver     | `NOW_UTC()` expands to                       |
 |------------|----------------------------------------------|
-| MySQL      | `UTC_TIMESTAMP(3)`                           |
+| MySQL      | `(UTC_TIMESTAMP(3))`                         |
 | PostgreSQL | `(NOW() AT TIME ZONE 'UTC')`                 |
-| SQL Server | `SYSUTCDATETIME()`                           |
+| SQL Server | `(CONVERT(DATETIME2(3), SYSUTCDATETIME()))` |
 | SQLite     | `STRFTIME('%Y-%m-%d %H:%M:%f', 'now')`       |
+
+On SQL Server the value is rounded to millisecond precision so it matches the other drivers and the precision of a `DATETIME2(3)` column. `SYSUTCDATETIME()` alone is 100-nanosecond precision, which rounds *up* when stored into a millisecond column and can leave a just-written "now" timestamp slightly in the future relative to a later `NOW_UTC()` comparison.
 
 **`REGEXP_TEXT_SEARCH(expr IN col1, col2, ...)`** performs a case-insensitive regular expression search across one or more columns.
 
@@ -204,6 +207,28 @@ id, err := db.InsertReturnID(ctx, "id", "INSERT INTO users (name, email) VALUES 
 ### DriverName()
 
 `DriverName()` returns the active driver name (`"mysql"`, `"pgx"`, `"mssql"`, or `"sqlite"`) for cases where you need driver-specific logic in Go code.
+
+## Transactions
+
+`db.BeginTx` returns a `sequel.Tx` that shadows `sql.Tx` with virtual-function expansion and placeholder conforming — use it exactly like `sql.Tx`.
+
+For transactions that must survive contention, `db.Transact` runs a closure in a transaction, commits on success, and **retries the whole closure on a deadlock or lock-contention error** with a short jittered backoff:
+
+```go
+err := db.Transact(ctx, func(tx *sequel.Tx) error {
+    if _, err := tx.ExecContext(ctx, "UPDATE accounts SET balance = balance - ? WHERE id = ?", amt, from); err != nil {
+        return err
+    }
+    _, err := tx.ExecContext(ctx, "UPDATE accounts SET balance = balance + ? WHERE id = ?", amt, to)
+    return err
+})
+```
+
+- **Retry-safe by re-running.** A retried attempt re-executes the closure from the start in a new transaction (the previous attempt is rolled back), so the closure must be safe to run more than once — any non-transactional side effects it performs may repeat. Because retries re-run the Go code rather than replay recorded statements, a transaction whose control flow depends on data committed by another transaction between attempts stays correct.
+- **No partial commits.** The `Tx` passed to the closure records the first statement error and short-circuits the rest, so the transaction never commits half its work even if the closure forgets to check a statement's error.
+- **SQL Server `XACT_ABORT ON`.** Applied automatically inside `Transact` so any statement error aborts the whole transaction server-side.
+
+A `Tx` from `BeginTx` does neither error-recording nor retry — it behaves exactly like `sql.Tx`.
 
 ## Ephemeral Test Databases
 
