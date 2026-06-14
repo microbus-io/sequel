@@ -287,14 +287,8 @@ func TestVF_CacheInvalidatedOnRegister(t *testing.T) {
 
 	// Use a unique VF name so other tests are not affected.
 	const vfName = "TEST_VF_INVALIDATION_ABCXYZ"
-	upper := strings.ToUpper(vfName)
 
-	t.Cleanup(func() {
-		virtualFuncsMutex.Lock()
-		delete(virtualFuncsMap, upper)
-		virtualFuncsMutex.Unlock()
-		expandCache.clear()
-	})
+	t.Cleanup(func() { unregisterVirtualFunc(vfName) })
 
 	// Prime the global cache with at least one entry.
 	_, err := expandVirtualFuncs("mysql", "SELECT NOW_UTC() /* TestVF_CacheInvalidatedOnRegister */")
@@ -318,13 +312,7 @@ func TestVF_NewlyRegisteredVFExpanded(t *testing.T) {
 	assert := testarossa.For(t)
 
 	const vfName = "TEST_VF_DOUBLE_XYZ"
-	upper := strings.ToUpper(vfName)
-	t.Cleanup(func() {
-		virtualFuncsMutex.Lock()
-		delete(virtualFuncsMap, upper)
-		virtualFuncsMutex.Unlock()
-		expandCache.clear()
-	})
+	t.Cleanup(func() { unregisterVirtualFunc(vfName) })
 
 	RegisterVirtualFunc(vfName, func(driverName, args string) (string, error) {
 		return "DOUBLE(" + args + ")", nil

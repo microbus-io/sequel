@@ -31,7 +31,7 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
       - name: Test (SQLite in-memory)
-        run: go test ./... -count=1 -timeout 20m
+        run: go test -race ./... -count=1 -timeout 20m
 
   mysql:
     name: MySQL
@@ -58,7 +58,7 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
       - name: Test (MySQL)
-        run: go test ./... -count=1 -timeout 20m
+        run: go test -race ./... -count=1 -timeout 20m
 
   postgres:
     name: PostgreSQL
@@ -85,7 +85,7 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
       - name: Test (PostgreSQL)
-        run: go test ./... -count=1 -timeout 20m
+        run: go test -race ./... -count=1 -timeout 20m
 
   sqlserver:
     name: SQL Server
@@ -114,4 +114,4 @@ jobs:
           cache: true
           cache-dependency-path: go.sum
       - name: Test (SQL Server)
-        run: go test ./... -count=1 -timeout 20m
+        run: go test -race ./... -count=1 -timeout 20m

@@ -20,6 +20,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/microbus-io/errors"
 )
@@ -36,18 +37,28 @@ const virtualFuncCacheSize = 4096
 // It is intentionally a single, VF-list-independent pass over the query.
 var vfIdentPattern = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*\(`)
 
+// virtualFuncs holds the registered virtual functions as a copy-on-write map. Reads are lock-free (a single
+// atomic load), which matters because every query that may contain a virtual function reads it; writes are
+// rare (process startup, occasional RegisterVirtualFunc) and clone-then-swap under virtualFuncsMutex. A
+// reader that loads the pointer is reading an immutable snapshot, so it can never race a concurrent
+// registration — the pattern sequel also uses for per-DB telemetry.
 var (
-	virtualFuncsMutex sync.RWMutex
-	virtualFuncsMap   = map[string]virtualFunc{
+	virtualFuncsMutex sync.Mutex // serializes writers so concurrent registrations don't lose updates
+	virtualFuncs      atomic.Pointer[map[string]virtualFunc]
+
+	expandCache = newVFCache(virtualFuncCacheSize)
+)
+
+func init() {
+	m := map[string]virtualFunc{
 		"NOW_UTC":            {name: "NOW_UTC", handler: vfNowUTC},
 		"REGEXP_TEXT_SEARCH": {name: "REGEXP_TEXT_SEARCH", handler: vfRegexpTextSearch},
 		"DATE_ADD_MILLIS":    {name: "DATE_ADD_MILLIS", handler: vfDateAddMillis},
 		"DATE_DIFF_MILLIS":   {name: "DATE_DIFF_MILLIS", handler: vfDateDiffMillis},
 		"LIMIT_OFFSET":       {name: "LIMIT_OFFSET", handler: vfLimitOffset},
 	}
-
-	expandCache = newVFCache(virtualFuncCacheSize)
-)
+	virtualFuncs.Store(&m)
+}
 
 // RegisterVirtualFunc registers a virtual SQL function that will be replaced in queries
 // before execution. The name is matched case-insensitively, e.g. registering "NOW_UTC"
@@ -57,9 +68,34 @@ var (
 func RegisterVirtualFunc(name string, handler func(driverName string, args string) (string, error)) {
 	upper := strings.ToUpper(name)
 	virtualFuncsMutex.Lock()
-	virtualFuncsMap[upper] = virtualFunc{name: upper, handler: handler}
+	// Clone-then-swap: readers hold a pointer to the old map and must never see it mutated.
+	old := *virtualFuncs.Load()
+	clone := make(map[string]virtualFunc, len(old)+1)
+	for k, v := range old {
+		clone[k] = v
+	}
+	clone[upper] = virtualFunc{name: upper, handler: handler}
+	virtualFuncs.Store(&clone)
 	virtualFuncsMutex.Unlock()
 	// Registration invalidates previously-cached expansions.
+	expandCache.clear()
+}
+
+// unregisterVirtualFunc removes a registered virtual function. It follows the same clone-then-swap
+// discipline as RegisterVirtualFunc so readers never see a mutated map. Currently used only by tests to
+// undo a throwaway registration.
+func unregisterVirtualFunc(name string) {
+	upper := strings.ToUpper(name)
+	virtualFuncsMutex.Lock()
+	old := *virtualFuncs.Load()
+	clone := make(map[string]virtualFunc, len(old))
+	for k, v := range old {
+		if k != upper {
+			clone[k] = v
+		}
+	}
+	virtualFuncs.Store(&clone)
+	virtualFuncsMutex.Unlock()
 	expandCache.clear()
 }
 
@@ -93,9 +129,9 @@ func expandVirtualFuncsWithCache(driverName string, query string, cache *vfCache
 
 // expandVirtualFuncsUncached performs the actual macro expansion, with no caching.
 func expandVirtualFuncsUncached(driverName string, query string) (string, error) {
-	virtualFuncsMutex.RLock()
-	vfs := virtualFuncsMap
-	virtualFuncsMutex.RUnlock()
+	// Lock-free load of an immutable snapshot; a concurrent RegisterVirtualFunc swaps in a new map and
+	// leaves this one untouched, so the scan below can read vfs without holding any lock.
+	vfs := *virtualFuncs.Load()
 
 	// Iterate until no further expansion happens. Each outer iteration runs a single
 	// left-to-right scan over the query, expanding every virtual function call it finds.
