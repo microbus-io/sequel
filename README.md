@@ -261,6 +261,30 @@ func startup(cfg Config) (*sequel.DB, error) {
 
 Repeated calls within the same process with the same `(driver, baseDSN, uniqueTestID)` reuse the same testing database — the `DROP+CREATE` runs only once. The returned DSN points at a database whose name has the `testing_NN_` prefix; sequel inspects this on `Close` and drops the database automatically when the last referencing `*DB` is closed. There is no separate cleanup call to remember. If a process exits before `Close` runs, the leftover-cleanup sweep on the next `CreateTestingDatabase` call removes stale databases older than 1–2 hours.
 
+### Choosing the server with `SEQUEL_TESTING_DSN`
+
+When `CreateTestingDatabase` is called with **neither** a driver nor a base DSN, it falls back to the `SEQUEL_TESTING_DSN` environment variable. This lets you run the same test suite against any supported server without touching test code — leave the variable unset to use in-memory SQLite (the default, no server required), or set it to a base DSN to run against that server instead, with the driver inferred from the DSN:
+
+```go
+func TestUserService(t *testing.T) {
+    // "" driver + "" DSN → SEQUEL_TESTING_DSN, or in-memory SQLite if it is unset.
+    dsn, err := sequel.CreateTestingDatabase("", "", t.Name())
+    if err != nil { t.Fatal(err) }
+    db, err := sequel.OpenSingleton("", dsn)
+    if err != nil { t.Fatal(err) }
+    defer db.Close()
+}
+```
+
+```sh
+# Same tests, different engine — no code change.
+go test ./...                                                          # SQLite (default)
+SEQUEL_TESTING_DSN='postgres://user:pw@127.0.0.1:5432/' go test ./...  # PostgreSQL
+SEQUEL_TESTING_DSN='root:pw@tcp(127.0.0.1:3306)/'       go test ./...  # MySQL
+```
+
+Passing an explicit driver — even with an empty DSN, which just selects that driver's localhost default — opts out of the fallback, so a test that deliberately targets a specific engine keeps using it regardless of the environment. Because the variable is read inside `CreateTestingDatabase`, any project that provisions its test databases through sequel inherits this behavior with no additional wiring.
+
 ## Observability
 
 Sequel emits OpenTelemetry traces and metrics and `slog` logs when you supply the corresponding providers. Everything is opt-in and off by default — a `*DB` with no providers configured does no extra work beyond a single atomic-pointer check on the hot path.
