@@ -26,6 +26,7 @@ import (
 	"math"
 	"math/rand/v2"
 	"net/url"
+	"os"
 	"regexp"
 	"slices"
 	"strconv"
@@ -810,7 +811,15 @@ If a driver name is not provided, it is inferred from the data source name on a
 best-effort basis. Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres),
 "cockroachdb" (CockroachDB), "mssql" (SQL Server) or "sqlite" (SQLite).
 
-If a base data source name is not provided, the following localhost defaults are used based on the driver name:
+If neither a driver name nor a base data source name is provided, it falls back to the SEQUEL_TESTING_DSN
+environment variable. This lets any consumer that builds ephemeral test databases through sequel redirect
+its entire suite at a real server without changing test code: leave SEQUEL_TESTING_DSN unset to keep the
+SQLite default, or set it to a base DSN to run against that server instead, with the driver inferred from
+it. Naming a driver — even with an empty DSN — opts out of the fallback, so a test that explicitly asks for
+SQLite keeps running on SQLite regardless of the environment.
+
+If neither the arguments nor SEQUEL_TESTING_DSN select a server, the following localhost defaults are used
+based on the driver name:
   - (empty): SQLite in-memory database
   - sqlite: SQLite in-memory database
   - mysql: root:root@tcp(127.0.0.1:3306)/
@@ -819,6 +828,11 @@ If a base data source name is not provided, the following localhost defaults are
   - mssql: sqlserver://sa:Password123@127.0.0.1:1433
 */
 func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueTestID string) (dsn string, err error) {
+	// Only fall back to SEQUEL_TESTING_DSN when the caller named neither a driver nor a DSN;
+	// naming a driver is intent that must be honored.
+	if driverName == "" && baseDataSourceName == "" {
+		baseDataSourceName = os.Getenv("SEQUEL_TESTING_DSN")
+	}
 	// Set default connection to localhost
 	if baseDataSourceName == "" {
 		switch driverName {

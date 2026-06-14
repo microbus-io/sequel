@@ -21,56 +21,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/microbus-io/sequel/testdata"
 	"github.com/microbus-io/testarossa"
 )
-
-func TestDB_AutoCreate(t *testing.T) {
-	t.Parallel()
-	dsns := map[string]string{
-		"mysql":  "root:root@tcp(127.0.0.1:3306)/",
-		"pgx":    "postgres://postgres:postgres@127.0.0.1:5432/",
-		"sqlite": "",
-		// "mssql": "sqlserver://sa:Password123@127.0.0.1:1433",
-	}
-	for drv, dsn := range dsns {
-		t.Run(drv, func(t *testing.T) {
-			assert := testarossa.For(t)
-
-			testingDSN, err := CreateTestingDatabase(drv, dsn, t.Name())
-			assert.NoError(err)
-			db, err := OpenSingleton(drv, testingDSN)
-			assert.NoError(err)
-			if !assert.NotNil(db) {
-				return
-			}
-			defer db.Close()
-
-			err = db.Migrate(t.Name(), testdata.FS)
-			assert.NoError(err)
-
-			var count int
-			stmt := "SELECT COUNT(id) FROM foo"
-			err = db.QueryRow(stmt).Scan(&count)
-			assert.NoError(err)
-			assert.Equal(4, count)
-
-			var id int
-			stmt = db.ConformArgPlaceholders("SELECT id FROM foo WHERE id=?")
-			err = db.QueryRow(stmt, 1).Scan(&id)
-			assert.NoError(err)
-			assert.Equal(1, id)
-
-			// 10.insert.sql sorts before 2.alter-table.sql by filename but must run after it
-			// (it uses the column 2 adds). Its row proves migrations ran in numeric order.
-			var updated int
-			stmt = db.ConformArgPlaceholders("SELECT updated FROM foo WHERE id=?")
-			err = db.QueryRow(stmt, 10).Scan(&updated)
-			assert.NoError(err)
-			assert.Equal(1, updated)
-		})
-	}
-}
 
 func TestDB_ConformArgPlaceholders(t *testing.T) {
 	t.Parallel()

@@ -1,17 +1,41 @@
 # https://docs.github.com/en/actions/use-cases-and-examples/building-and-testing/building-and-testing-go
 
 name: Test
+
 on:
-  pull_request:
-    types: [opened, reopened, edited]
   push:
-    branches:
-      - "main"
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+# The suite picks its database from the SEQUEL_TESTING_DSN environment variable. An unset/empty value runs
+# against in-memory SQLite; otherwise sequel.CreateTestingDatabase connects to the server and provisions an
+# isolated, auto-dropped testing database per test off this base DSN (which therefore needs CREATE/DROP
+# DATABASE privilege). Each job below points SEQUEL_TESTING_DSN at one provider so the same tests run against
+# every supported server. Credentials are throwaway CI service-container values, not secrets.
 
 jobs:
-  test:
+  sqlite:
+    name: SQLite
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Test (SQLite in-memory)
+        run: go test ./... -count=1 -timeout 20m
 
+  mysql:
+    name: MySQL
+    runs-on: ubuntu-latest
     services:
       mysql:
         image: mysql:9.6
@@ -20,44 +44,74 @@ jobs:
         ports:
           - 3306:3306
         options: >-
-          --health-cmd="mysqladmin ping --silent"
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
           --health-interval=10s
           --health-timeout=5s
-          --health-retries=3
+          --health-retries=10
+    env:
+      SEQUEL_TESTING_DSN: root:root@tcp(127.0.0.1:3306)/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Test (MySQL)
+        run: go test ./... -count=1 -timeout 20m
+
+  postgres:
+    name: PostgreSQL
+    runs-on: ubuntu-latest
+    services:
       postgres:
         image: postgres:18
         env:
           POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: postgres
         ports:
           - 5432:5432
         options: >-
-          --health-cmd pg_isready
+          --health-cmd "pg_isready -U postgres"
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-      # sqlserver:
-      #   image: mcr.microsoft.com/mssql/server:2025-latest
-      #   env:
-      #     ACCEPT_EULA: "Y"
-      #     MSSQL_SA_PASSWORD: Password123
-      #   ports:
-      #     - 1433:1433
-      #   options: >-
-      #     --health-cmd "/opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P Password123 -Q 'SELECT 1'"
-      #     --health-interval 10s
-      #     --health-timeout 5s
-      #     --health-retries 10
-
-    name: Run tests
+    env:
+      SEQUEL_TESTING_DSN: postgres://postgres:postgres@127.0.0.1:5432/?sslmode=disable
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version-file: 'go.mod'
+          go-version-file: go.mod
           cache: true
           cache-dependency-path: go.sum
-      - name: Go version
-        run: go version
-      - name: Go test
-        run: go test -count 1 -timeout 30s -cover ./...
+      - name: Test (PostgreSQL)
+        run: go test ./... -count=1 -timeout 20m
+
+  sqlserver:
+    name: SQL Server
+    runs-on: ubuntu-latest
+    services:
+      mssql:
+        image: mcr.microsoft.com/mssql/server:2025-latest
+        env:
+          ACCEPT_EULA: "Y"
+          MSSQL_SA_PASSWORD: Sequel_CI_Pass_2026
+        ports:
+          - 1433:1433
+        options: >-
+          --health-cmd "/opt/mssql-tools18/bin/sqlcmd -C -S localhost -U sa -P Sequel_CI_Pass_2026 -Q 'SELECT 1' -b"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 20
+          --health-start-period 30s
+    env:
+      SEQUEL_TESTING_DSN: sqlserver://sa:Sequel_CI_Pass_2026@127.0.0.1:1433
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Test (SQL Server)
+        run: go test ./... -count=1 -timeout 20m

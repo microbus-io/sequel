@@ -182,3 +182,34 @@ per-query Debug lines. The Debug lines are gated on `logger.Enabled(ctx, slog.Le
 own logger level — not a separate sequel switch — decides whether to pay for per-query logging, and the gate
 keeps the string-building cost off the hot path when Debug is disabled. `Migrate` logs at *attempt* time
 regardless of outcome, so the log shows what was tried even when the migration then fails.
+
+## `CreateTestingDatabase` and the `SEQUEL_TESTING_DSN` fallback
+
+`CreateTestingDatabase` provisions an isolated, auto-dropped database per test. When the caller names
+**neither** a driver nor a base DSN, it falls back to the `SEQUEL_TESTING_DSN` environment variable (unset →
+SQLite in-memory) and infers the driver from it. This is what lets the same test suite run against every
+supported server without touching test code — CI sets the variable per provider, one job each — and it is
+inherited by any *upstream* consumer that builds its ephemeral test databases through sequel (e.g. dwarf):
+they get the env-var redirect for free, no plumbing of their own.
+
+The non-obvious part is *why the fallback is gated on an empty driver too*, not just an empty DSN. A caller
+that passes a driver name — even with an empty DSN, which only asks for that driver's localhost default — has
+expressed intent, and the env var must not override it. Sequel's own unit tests rely on this: they call
+`CreateTestingDatabase("sqlite", "", …)` and assert SQLite-specific behavior (the `db.system.name` attribute,
+`sqlite_master`, file-DSN pool coalescing). Gating on the DSN alone would redirect those onto whatever server
+`SEQUEL_TESTING_DSN` points at and break them. So the rule is: the fallback fills in only when the caller
+expressed *no* preference at all. The integration tests under `fixtures/` pass empty/empty precisely to opt
+in; the root package's white-box tests name `"sqlite"` precisely to opt out.
+
+### Unit tests in the root package, integration tests under `fixtures/`
+
+Tests that only exercise pure logic — DSN parsing, placeholder conforming, virtual-function string expansion,
+lock-contention classification, telemetry plumbing — live in the root `sequel` package and never touch a
+server (the telemetry tests are white-box: they read unexported `telemetry` internals, so they cannot move
+and stay on SQLite). Tests that provision a real database and run SQL against it live in the test-only
+`fixtures/` package, are black-box (exported API only), and are driven entirely by `SEQUEL_TESTING_DSN`. The
+virtual-function tests are split deliberately across the two: the root package asserts the SQL each function
+*expands to*; `fixtures/` *executes* that SQL on each engine, so a dialect expansion that is well-formed text
+but invalid SQL on some server is caught. `REGEXP_TEXT_SEARCH` expands to `REGEXP_LIKE`, which exists only on
+PostgreSQL 18+ and SQL Server 2025+; its fixture skips (not fails) when the engine lacks the function, so the
+suite stays green on older servers while CI's modern images still exercise it.
