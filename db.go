@@ -41,6 +41,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/microbus-io/errors"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
 	sqlite "modernc.org/sqlite"
@@ -103,12 +104,14 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	return &DB{
+	db = &DB{
 		DB:             sqlDB,
 		driverName:     driverName,
 		dataSourceName: dataSourceName,
 		refCount:       1,
-	}, nil
+	}
+	db.telemetry.Store(newDefaultTelemetry(db))
+	return db, nil
 }
 
 /*
@@ -156,6 +159,7 @@ func OpenSingleton(driverName string, dataSourceName string) (db *DB, err error)
 	}
 	singletonDB.DB = sqlDB
 	singletonDB.refCount = 1
+	singletonDB.telemetry.Store(newDefaultTelemetry(singletonDB))
 	singletonDB.adjustConnectionLimits()
 	return singletonDB, nil
 }
@@ -331,7 +335,8 @@ func (db *DB) maybeDropTestingDatabase() {
 
 /*
 SetTracerProvider attaches an OpenTelemetry TracerProvider so sequel emits a client span around each query,
-transaction, and migration. Pass nil to disable tracing.
+transaction, and migration. A freshly opened *DB already uses the process-wide otel.GetTracerProvider();
+call this to override it, or pass nil to revert to that global provider (whose default is a no-op).
 
 Observability is configured after Open/OpenSingleton (which keep the standard database/sql signature) rather
 than at construction. This loses nothing: sql.Open does no I/O — it only prepares a lazy pool — so there is
@@ -341,37 +346,40 @@ Configure before the *DB is used concurrently. For an OpenSingleton-shared *DB t
 wide for that pool; the last setter wins, so configure once from the owning caller.
 */
 func (db *DB) SetTracerProvider(tp trace.TracerProvider) {
+	if tp == nil {
+		tp = otel.GetTracerProvider()
+	}
 	db.updateTelemetry(func(t *telemetry) {
-		if tp == nil {
-			t.tracer = nil
-			return
-		}
 		t.tracer = tp.Tracer(instrumentationName)
 	})
 }
 
 // SetMeterProvider attaches an OpenTelemetry MeterProvider so sequel emits sequel_ metrics (query and
-// transaction duration, lock-contention count, migration count, and connection-pool gauges). Pass nil to
-// disable metrics. See [DB.SetTracerProvider] for when to call this.
+// transaction duration, lock-contention count, migration count, and connection-pool gauges). A freshly
+// opened *DB already uses the process-wide otel.GetMeterProvider(); call this to override it, or pass nil to
+// revert to that global provider (whose default is a no-op). See [DB.SetTracerProvider] for when to call.
 func (db *DB) SetMeterProvider(mp metric.MeterProvider) {
+	if mp == nil {
+		mp = otel.GetMeterProvider()
+	}
 	db.mutex.Lock()
 	defer db.mutex.Unlock()
 	nt := db.telemetry.Load().clone()
 	nt.clearInstruments() // unregisters any prior pool callback
-	if mp != nil {
-		nt.meter = mp.Meter(instrumentationName)
-		nt.initInstruments(db)
-	} else {
-		nt.meter = nil
-	}
+	nt.meter = mp.Meter(instrumentationName)
+	nt.initInstruments(db)
 	db.telemetry.Store(nt)
 }
 
 // SetLogger attaches an slog.Logger. The library does not log operation errors (they are returned to the
 // caller, who logs them); it logs one-off events such as schema migrations at Info, and — when the logger
 // is enabled at Debug level — each query at Debug. Per-query logging is therefore controlled by the
-// logger's own level, not a separate switch. Pass nil to disable logging.
+// logger's own level, not a separate switch. A freshly opened *DB uses a discard logger; pass nil here to
+// revert to that discard logger (disabling logging).
 func (db *DB) SetLogger(logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.New(slog.DiscardHandler)
+	}
 	db.updateTelemetry(func(t *telemetry) {
 		t.logger = logger
 	})

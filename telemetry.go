@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/microbus-io/errors"
+	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/metric"
@@ -61,6 +62,22 @@ type telemetry struct {
 	poolRegistration    metric.Registration
 }
 
+// newDefaultTelemetry builds the telemetry a freshly opened DB starts with: the process-wide OpenTelemetry
+// tracer and meter providers (otel.GetTracerProvider / otel.GetMeterProvider) and a discard logger. Those
+// global providers are delegating no-ops until the application installs real ones, so an app that configures
+// OpenTelemetry globally gets sequel spans and metrics with no extra call, while an app that configures
+// nothing pays only OTEL's no-op cost. The per-DB setters override any of the three; passing them nil
+// reverts to these same defaults.
+func newDefaultTelemetry(db *DB) *telemetry {
+	t := &telemetry{
+		tracer: otel.GetTracerProvider().Tracer(instrumentationName),
+		meter:  otel.GetMeterProvider().Meter(instrumentationName),
+		logger: slog.New(slog.DiscardHandler),
+	}
+	t.initInstruments(db)
+	return t
+}
+
 // clone returns a shallow copy so a setter can mutate one field and swap the pointer without disturbing a
 // telemetry value that concurrent operations may still be reading.
 func (t *telemetry) clone() *telemetry {
@@ -71,10 +88,12 @@ func (t *telemetry) clone() *telemetry {
 	return nt
 }
 
-// enabled reports whether any observability sink is configured. Used to skip work that only matters when
-// something is listening.
+// enabled reports whether telemetry is present. Since Open seeds every *DB with the global OTEL providers
+// and a discard logger (and the setters never clear them to nil), this is a plain nil-pointer guard, not a
+// live fast path: an unconfigured *DB still funnels through the instrumentation, where OTEL's no-op tracer
+// and meter short-circuit the cost. The check remains only to stay safe on a zero-value *telemetry.
 func (t *telemetry) enabled() bool {
-	return t != nil && (t.tracer != nil || t.meter != nil || t.logger != nil)
+	return t != nil
 }
 
 // initInstruments creates the sequel_ metric instruments and registers the connection-pool gauge callback

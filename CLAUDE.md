@@ -109,12 +109,30 @@ only a possible argument error, which the caller already receives as a return va
 to a setter therefore loses nothing real, and keeps the two constructors drop-in compatible with
 `database/sql`.
 
-The telemetry is held in a single `atomic.Pointer[telemetry]` on `*DB`. The hot path is one atomic load
-plus a nil check (`enabled()`), so a `*DB` with no providers pays essentially nothing. Setters build a new
-`telemetry` value under `db.mutex` (copy-on-write via `clone`) and swap the pointer, so reads never lock and
-never see a torn value. A `*Tx` captures the pointer at begin time. For an `OpenSingleton`-shared `*DB` the
-pointer is process-wide for that pool — last writer wins — so callers are told to configure once from the
-owning caller rather than each opener racing to set its own.
+### Defaults are the global OTEL providers and a discard logger, not "off"
+
+A freshly opened `*DB` does not start uninstrumented. `newDefaultTelemetry` seeds it with
+`otel.GetTracerProvider()`, `otel.GetMeterProvider()`, and a `slog.DiscardHandler` logger. The reason is
+that the overwhelmingly common deployment installs OpenTelemetry *globally* (`otel.SetTracerProvider(...)`)
+and expects libraries to pick it up — requiring an explicit `db.SetTracerProvider` per pool would silently
+drop sequel out of otherwise-configured traces. Defaulting to the global providers means "configured OTEL
+globally" just works, and the setters remain available to override per-`DB` (or to pass `nil`, which reverts
+that one signal to its default — the global provider, or the discard logger).
+
+This is a deliberate trade against the old zero-overhead path. The global providers are **delegating
+no-ops** until the application installs real ones, so an unconfigured process pays only OTEL's no-op cost
+(a non-recording span from a noop tracer, `Record` calls into noop instruments) — not zero, but bounded and
+constant. Because the delegating provider forwards to whatever is installed *later*, instruments and the
+pool-stats callback created at `Open` time start working the moment the app calls `otel.SetMeterProvider`,
+with no re-open. The practical consequence: `enabled()` is now effectively always true (every field is
+non-nil), so the early-return guards exist for nil-pointer safety rather than as a live fast path. To truly
+disable a signal, install an explicit no-op provider — sequel no longer treats "unset" as "off".
+
+The telemetry is held in a single `atomic.Pointer[telemetry]` on `*DB`, seeded at `Open`/`OpenSingleton`.
+Setters build a new `telemetry` value under `db.mutex` (copy-on-write via `clone`) and swap the pointer, so
+reads never lock and never see a torn value. A `*Tx` captures the pointer at begin time. For an
+`OpenSingleton`-shared `*DB` the pointer is process-wide for that pool — last writer wins — so callers are
+told to configure once from the owning caller rather than each opener racing to set its own.
 
 ### Spans carry operation + table, never the statement text
 

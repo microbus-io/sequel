@@ -222,21 +222,26 @@ func TestTelemetry_RowScanErrorCaptured(t *testing.T) {
 	assert.True(found, "expected span for failed QueryRow")
 }
 
-func TestTelemetry_NoProvidersIsNoOp(t *testing.T) {
+func TestTelemetry_DefaultsToGlobalProviders(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)
 
+	// A freshly opened DB starts with the global OTEL providers and a discard logger — non-nil, but a no-op
+	// until the application installs real providers, so queries run normally without any explicit setup.
 	db := newSQLiteDB(t)
-	assert.Nil(db.telemetry.Load()) // nothing configured
+	tl := db.telemetry.Load()
+	assert.NotNil(tl)
+	assert.NotNil(tl.tracer)
+	assert.NotNil(tl.meter)
+	assert.NotNil(tl.logger)
 	assert.NoError(db.Migrate(t.Name(), testdata.FS))
 
 	var count int
 	assert.NoError(db.QueryRow("SELECT COUNT(id) FROM foo").Scan(&count))
 	assert.Equal(4, count)
-	assert.Nil(db.telemetry.Load())
 }
 
-func TestTelemetry_DisableClearsInstruments(t *testing.T) {
+func TestTelemetry_SetMeterProviderNilRevertsToGlobal(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)
 
@@ -245,18 +250,14 @@ func TestTelemetry_DisableClearsInstruments(t *testing.T) {
 
 	db := newSQLiteDB(t)
 	db.SetMeterProvider(mp)
-	db.SetMeterProvider(nil) // disable
-
-	t2 := db.telemetry.Load()
-	assert.Nil(t2.queryDuration)
-	assert.Nil(t2.poolRegistration)
+	db.SetMeterProvider(nil) // revert to the global (no-op) provider
 
 	var rm metricdata.ResourceMetrics
 	assert.NoError(reader.Collect(context.Background(), &rm))
-	// After disabling, the pool callback is unregistered, so no sequel_ metrics remain.
+	// Reverting unregisters the pool callback from the real reader, so it no longer sees sequel_ metrics.
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
-			assert.False(strings.HasPrefix(m.Name, "sequel_"), "unexpected metric %s after disable", m.Name)
+			assert.False(strings.HasPrefix(m.Name, "sequel_"), "unexpected metric %s after revert", m.Name)
 		}
 	}
 }
