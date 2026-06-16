@@ -388,7 +388,7 @@ func TestDB_UnpackQuery_DateAddMillis(t *testing.T) {
 	db = newTestDB("sqlite")
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, 5000)")
 	assert.NoError(err)
-	assert.Equal("SELECT (STRFTIME('%Y-%m-%d %H:%M:%f', created_at, '+' || ((5000) / 1000.0) || ' seconds'))", q)
+	assert.Equal("SELECT (STRFTIME('%Y-%m-%d %H:%M:%f', created_at, ((5000) / 1000.0) || ' seconds'))", q)
 
 	// Missing comma
 	db = newTestDB("mysql")

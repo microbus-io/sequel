@@ -51,6 +51,9 @@ func TestVF_DateAddAndDiffMillis(t *testing.T) {
 	db := newTestDB(t)
 	diff := queryFloat(t, db, "SELECT DATE_DIFF_MILLIS(DATE_ADD_MILLIS(NOW_UTC(), 5000), NOW_UTC())")
 	assert.True(math.Abs(diff-5000) < 1000, "expected ~5000ms, got %v ms", diff)
+
+	diff = queryFloat(t, db, "SELECT DATE_DIFF_MILLIS(DATE_ADD_MILLIS(NOW_UTC(), -5000), NOW_UTC())")
+	assert.True(math.Abs(diff-(-5000)) < 1000, "expected ~-5000ms, got %v ms", diff)
 }
 
 // TestVF_LimitOffset verifies the paging expansion returns the right window of rows. SQL Server expands to

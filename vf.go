@@ -202,14 +202,15 @@ func findBalancedClose(s string, start int) int {
 	depth := 1
 	for i := start; i < len(s); i++ {
 		ch := s[i]
-		if ch == '\'' || ch == '"' {
+		switch ch {
+		case '\'', '"':
 			i++
 			for i < len(s) && s[i] != ch {
 				i++
 			}
-		} else if ch == '(' {
+		case '(':
 			depth++
-		} else if ch == ')' {
+		case ')':
 			depth--
 			if depth == 0 {
 				return i
@@ -327,7 +328,7 @@ func vfDateAddMillis(driverName string, args string) (string, error) {
 	case "mssql":
 		return "DATEADD(MILLISECOND, " + millis + ", " + baseExpr + ")", nil
 	case "sqlite":
-		return "(STRFTIME('%Y-%m-%d %H:%M:%f', " + baseExpr + ", '+' || ((" + millis + ") / 1000.0) || ' seconds'))", nil
+		return "(STRFTIME('%Y-%m-%d %H:%M:%f', " + baseExpr + ", ((" + millis + ") / 1000.0) || ' seconds'))", nil
 	default:
 		return "", errors.New("unsupported driver name: %s", driverName)
 	}
