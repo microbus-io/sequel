@@ -814,7 +814,22 @@ func TestDB_InjectOutputInserted(t *testing.T) {
 	assert.NoError(err)
 	assert.Equal("INSERT INTO foo (a, b) OUTPUT INSERTED.id\tVALUES (?, ?)", result)
 
-	// No VALUES clause
-	_, err = injectOutputInserted("INSERT INTO foo (a, b) SELECT a, b FROM bar", "id")
+	// INSERT ... SELECT: OUTPUT is injected before the source SELECT
+	result, err = injectOutputInserted("INSERT INTO foo (a, b) SELECT a, b FROM bar", "id")
+	assert.NoError(err)
+	assert.Equal("INSERT INTO foo (a, b) OUTPUT INSERTED.id SELECT a, b FROM bar", result)
+
+	// INSERT ... SELECT with a nested subquery: the outer source SELECT is targeted, not the nested one
+	result, err = injectOutputInserted("INSERT INTO foo (a) SELECT (SELECT MAX(x) FROM z) FROM bar", "id")
+	assert.NoError(err)
+	assert.Equal("INSERT INTO foo (a) OUTPUT INSERTED.id SELECT (SELECT MAX(x) FROM z) FROM bar", result)
+
+	// Lowercase select
+	result, err = injectOutputInserted("INSERT INTO foo (a, b) select a, b FROM bar", "id")
+	assert.NoError(err)
+	assert.Equal("INSERT INTO foo (a, b) OUTPUT INSERTED.id select a, b FROM bar", result)
+
+	// Neither VALUES nor SELECT: error
+	_, err = injectOutputInserted("INSERT INTO foo DEFAULT VALUES_BOGUS", "id")
 	assert.Error(err)
 }

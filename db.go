@@ -56,7 +56,10 @@ var (
 	testingMutexes     = map[string]*sync.Mutex{}
 	testingStartedAt   = time.Now().UTC()
 
-	valuesClausePattern        = regexp.MustCompile(`(?i)\s+VALUES\s*`)
+	// insertSourceClausePattern matches the start of an INSERT statement's source clause - either
+	// VALUES (INSERT ... VALUES (...)) or SELECT (INSERT ... SELECT ...). MSSQL's OUTPUT INSERTED
+	// clause is injected immediately before whichever appears, so InsertReturnID works for both forms.
+	insertSourceClausePattern  = regexp.MustCompile(`(?i)\s+(VALUES|SELECT)\b`)
 	testingDatabaseNamePattern = regexp.MustCompile(`^testing_\d{2}_`)
 )
 
@@ -619,11 +622,12 @@ func insertReturnID(ctx context.Context, qe Executor, driverName string, idColum
 }
 
 // injectOutputInserted rewrites an INSERT statement to include an OUTPUT INSERTED clause
-// before the VALUES keyword, for use with MSSQL.
+// before the source clause (VALUES or SELECT), for use with MSSQL. This makes InsertReturnID
+// work for both INSERT ... VALUES (...) and INSERT ... SELECT ... forms.
 func injectOutputInserted(stmt string, idColumn string) (string, error) {
-	loc := valuesClausePattern.FindStringIndex(stmt)
+	loc := insertSourceClausePattern.FindStringIndex(stmt)
 	if loc == nil {
-		return "", errors.New("VALUES clause not found in INSERT statement")
+		return "", errors.New("VALUES or SELECT clause not found in INSERT statement")
 	}
 	return stmt[:loc[0]] + " OUTPUT INSERTED." + idColumn + stmt[loc[0]:], nil
 }
