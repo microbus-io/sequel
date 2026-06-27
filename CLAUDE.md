@@ -98,6 +98,13 @@ nothing and short-circuits nothing, so existing direct-transaction callers see i
 Sequel emits OpenTelemetry traces/metrics and `slog` logs when the caller supplies providers. The design
 choices below are the non-obvious ones.
 
+**Counter instrument names carry no `_total` suffix** (`sequel_lock_contention`, `sequel_migration_runs`).
+`_total` is a Prometheus naming convention, not an OpenTelemetry one: a Prometheus exporter appends it to
+every counter at the scrape boundary (and de-duplicates, so a name already ending in `_total` is not
+doubled), while the OTLP push path uses the instrument name verbatim. So these query in PromQL as
+`sequel_lock_contention_total` / `sequel_migration_runs_total`. Do not bake `_total` into a counter's
+instrument name.
+
 ### Providers via setters, not constructor options — because `Open` has nothing to instrument
 
 `Open`/`OpenSingleton` deliberately keep the standard `database/sql` signature; telemetry is attached with
@@ -154,7 +161,7 @@ the text holds only `?`/`$1` placeholders, never argument values.)
 ### Lock contention is classified once, centrally
 
 Every query funnels through one `instrument(...)` wrapper, which is the *only* place an operation's error is
-classified for the `sequel_lock_contention_total` counter. Classifying opportunistically wherever
+classified for the `sequel_lock_contention` counter. Classifying opportunistically wherever
 `IsLockContentionError` happens to be called would be unreliable — that function may be called zero times or
 several times per error. `Transact` does **not** separately increment the counter; it only reads the error
 to decide whether to retry. Each failed attempt still counts exactly once (at the statement level), which is

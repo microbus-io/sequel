@@ -187,7 +187,7 @@ func TestTelemetry_Metrics(t *testing.T) {
 	for _, want := range []string{
 		"sequel_query_duration",
 		"sequel_transaction_duration",
-		"sequel_migration_runs_total",
+		"sequel_migration_runs",
 		"sequel_pool_open_connections",
 		"sequel_pool_idle_connections",
 	} {

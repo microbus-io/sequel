@@ -112,12 +112,13 @@ func (t *telemetry) initInstruments(db *DB) {
 		metric.WithUnit("s"),
 		metric.WithDescription("Duration of Transact calls in seconds, including retries"),
 	)
+	// Counter instrument names carry no _total suffix; the Prometheus exporter appends it (see CLAUDE.md).
 	t.lockContention, _ = m.Int64Counter(
-		"sequel_lock_contention_total",
+		"sequel_lock_contention",
 		metric.WithDescription("Count of operations that failed on lock contention or deadlock"),
 	)
 	t.migrationRuns, _ = m.Int64Counter(
-		"sequel_migration_runs_total",
+		"sequel_migration_runs",
 		metric.WithDescription("Count of schema migrations executed (excludes already-completed ones)"),
 	)
 
@@ -308,7 +309,7 @@ func (t *telemetry) logMigrationAttempt(ctx context.Context, driver, sequence, f
 		"driver", driver, "sequence", sequence, "file", file)
 }
 
-// recordMigration increments sequel_migration_runs_total for a migration that actually executed, tagged
+// recordMigration increments sequel_migration_runs for a migration that actually executed, tagged
 // with its ok/error status.
 func (t *telemetry) recordMigration(ctx context.Context, driver, sequence string, err error) {
 	if t == nil || t.migrationRuns == nil {

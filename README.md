@@ -321,14 +321,16 @@ The span name is `"{operation} {table}"` (e.g. `SELECT users`), or just the oper
 
 ### Metrics
 
-All metric names carry the `sequel_` prefix:
+All metric names carry the `sequel_` prefix. Counter instrument names carry **no** `_total` suffix; a
+Prometheus exporter appends it at the scrape boundary, so `sequel_lock_contention` is queried in PromQL as
+`sequel_lock_contention_total` (and `sequel_migration_runs` as `sequel_migration_runs_total`):
 
 | Metric | Type | Notes |
 |--------|------|-------|
 | `sequel_query_duration` | histogram (s) | attrs: `db.system.name`, `db.operation.name`, `status` (ok/error) |
 | `sequel_transaction_duration` | histogram (s) | attrs: `db.system.name`, `outcome` (committed/rolledback) |
-| `sequel_lock_contention_total` | counter | incremented once per surfaced lock-contention/deadlock error |
-| `sequel_migration_runs_total` | counter | counts migrations that actually ran (skipped ones excluded); attrs include `status` |
+| `sequel_lock_contention` | counter | incremented once per surfaced lock-contention/deadlock error (PromQL: `sequel_lock_contention_total`) |
+| `sequel_migration_runs` | counter | counts migrations that actually ran (skipped ones excluded); attrs include `status` (PromQL: `sequel_migration_runs_total`) |
 | `sequel_pool_open_connections` | gauge | from `sql.DBStats`, attr `database` (never the raw DSN) |
 | `sequel_pool_in_use_connections` | gauge | |
 | `sequel_pool_idle_connections` | gauge | |
