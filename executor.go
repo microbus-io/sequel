@@ -30,8 +30,8 @@ var (
 type Executor interface {
 	Exec(query string, args ...any) (sql.Result, error)
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-	Query(query string, args ...any) (*sql.Rows, error)
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+	Query(query string, args ...any) (*Rows, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*Rows, error)
 	QueryRow(query string, args ...any) *Row
 	QueryRowContext(ctx context.Context, query string, args ...any) *Row
 	Prepare(query string) (*sql.Stmt, error)

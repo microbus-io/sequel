@@ -93,6 +93,31 @@ Recording is opt-in via an internal `autoErr` flag set only by `Transact`; a `Tx
 nothing and short-circuits nothing, so existing direct-transaction callers see identical behavior.
 `Tx.Err()` exposes the recorded error for callers that want to inspect it.
 
+### The "no partial commit" guarantee extends to row reads (`Rows`)
+
+The statement-level recording above covers `Exec`/`Query`/`InsertReturnID` — the errors returned when a
+statement is *issued*. It did **not** originally cover the errors that surface *while iterating a result
+set*: a mid-stream `rows.Scan` failure or a streaming error reported by `rows.Err()` (a connection drop
+mid-fetch, a type-conversion failure on a row). Those are invisible to the issuing call, so a closure that
+looped over rows and forgot to check `rows.Err()` could build state from a **truncated read** and commit
+it — the one hole in the "a closure that ignores an error can never commit half its work" promise. This is
+the failure class an upstream consumer (dwarf) hit: a fan-in step committed with partially-merged state
+because a cohort-scan loop dropped a row error.
+
+`Query`/`QueryContext` therefore return a **`sequel.Rows`** (embeds `*sql.Rows`, so `for rows.Next() {
+rows.Scan(...) }` / `rows.Err()` / `rows.Close()` are unchanged — same source-compat shape as `Row`). In
+`Transact` (`autoErr`) mode it **latches** a `Scan` error, and the `rows.Err()` observed when `Next()`
+returns false, into the same recorded-error slot as a statement error — so the transaction refuses to
+commit and the subsequent statements short-circuit, exactly as for a failed `Exec`. The latch fires only
+on a real error: draining a healthy result set latches a nil `rows.Err()` (no-op), and an early `break`
+(where `Next()` is still returning `true`) latches nothing — a streaming error would itself have made
+`Next()` return `false`. Outside `Transact` — a `*DB` query or a `BeginTx` `Tx` — `recordErr` is nil and
+`Rows` is a pure passthrough, so direct callers are unaffected (same opt-in boundary as statement
+recording). `Row` (from `QueryRow`) still carries only the telemetry finish func, not a tx latch; a
+`QueryRow(...).Scan` error inside a Transact closure is conventionally checked by the caller (its error is
+returned directly, not deferred behind an iteration loop). `fixtures/rows_test.go` pins both halves: an
+ignored `Scan` error rolls the closure's write back; a healthy full drain commits.
+
 ## Observability (`telemetry.go`)
 
 Sequel emits OpenTelemetry traces/metrics and `slog` logs when the caller supplies providers. The design

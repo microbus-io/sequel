@@ -426,20 +426,31 @@ func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.R
 		})
 }
 
-// Query shadows sql.DB.Query and conforms arg placeholders for the driver.
-func (db *DB) Query(query string, args ...any) (*sql.Rows, error) {
-	return instrumentExec(db.telemetry.Load(), context.Background(), db.driverName, query,
+// Query shadows sql.DB.Query and conforms arg placeholders for the driver. It returns a [Rows], which
+// embeds *sql.Rows so existing rows.Next()/rows.Scan()/rows.Err() call sites are unchanged. A *DB query
+// is not transactional, so Rows here is a pure passthrough (no error latching).
+func (db *DB) Query(query string, args ...any) (*Rows, error) {
+	rows, err := instrumentExec(db.telemetry.Load(), context.Background(), db.driverName, query,
 		func(_ context.Context, q string) (*sql.Rows, error) {
 			return db.DB.Query(q, args...)
 		})
+	if err != nil {
+		return nil, err
+	}
+	return &Rows{Rows: rows}, nil
 }
 
-// QueryContext shadows sql.DB.QueryContext and conforms arg placeholders for the driver.
-func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
-	return instrumentExec(db.telemetry.Load(), ctx, db.driverName, query,
+// QueryContext shadows sql.DB.QueryContext and conforms arg placeholders for the driver. It returns a
+// [Rows] (see Query); a *DB query does not latch errors into any transaction.
+func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
+	rows, err := instrumentExec(db.telemetry.Load(), ctx, db.driverName, query,
 		func(ctx context.Context, q string) (*sql.Rows, error) {
 			return db.DB.QueryContext(ctx, q, args...)
 		})
+	if err != nil {
+		return nil, err
+	}
+	return &Rows{Rows: rows}, nil
 }
 
 // QueryRow shadows sql.DB.QueryRow and conforms arg placeholders for the driver. It returns a [Row], which

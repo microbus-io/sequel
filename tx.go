@@ -85,8 +85,11 @@ func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.R
 	return res, tx.recordErr(err)
 }
 
-// Query shadows sql.Tx.Query and conforms arg placeholders for the driver.
-func (tx *Tx) Query(query string, args ...any) (*sql.Rows, error) {
+// Query shadows sql.Tx.Query and conforms arg placeholders for the driver. It returns a [Rows], which
+// embeds *sql.Rows so existing rows.Next()/rows.Scan()/rows.Err() call sites are unchanged. In Transact
+// (autoErr) mode the returned Rows latches a mid-iteration Scan or streaming error into the transaction,
+// so a closure that forgets rows.Err() cannot commit state read from a truncated result set.
+func (tx *Tx) Query(query string, args ...any) (*Rows, error) {
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
@@ -94,11 +97,15 @@ func (tx *Tx) Query(query string, args ...any) (*sql.Rows, error) {
 		func(_ context.Context, q string) (*sql.Rows, error) {
 			return tx.Tx.Query(q, args...)
 		})
-	return rows, tx.recordErr(err)
+	if err != nil {
+		return nil, tx.recordErr(err)
+	}
+	return &Rows{Rows: rows, recordErr: tx.recordErr}, nil
 }
 
-// QueryContext shadows sql.Tx.QueryContext and conforms arg placeholders for the driver.
-func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error) {
+// QueryContext shadows sql.Tx.QueryContext and conforms arg placeholders for the driver. It returns a
+// [Rows] (see Query) that latches row-iteration errors into the transaction in Transact (autoErr) mode.
+func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
@@ -106,7 +113,10 @@ func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*sql
 		func(ctx context.Context, q string) (*sql.Rows, error) {
 			return tx.Tx.QueryContext(ctx, q, args...)
 		})
-	return rows, tx.recordErr(err)
+	if err != nil {
+		return nil, tx.recordErr(err)
+	}
+	return &Rows{Rows: rows, recordErr: tx.recordErr}, nil
 }
 
 // QueryRow shadows sql.Tx.QueryRow and conforms arg placeholders for the driver. It returns a [Row], which
