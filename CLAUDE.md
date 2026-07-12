@@ -27,6 +27,72 @@ a comparison preserves ordering and the phantom disappears. The general principl
 must never exceed the instant it represents at the precision the schema actually stores, and the only way
 to guarantee that across store-and-compare is to generate at the column's precision.
 
+## Cross-driver JSON extraction (`JSON_FIELD()`)
+
+`JSON_FIELD(col, '$.path')` pulls one field out of a JSON column. The interesting question was never the
+syntax — every engine has an extractor — but **which contract all four can actually keep**, because each one
+returns a different thing for the same document.
+
+The contract chosen is `->>` semantics: a JSON string comes back **unquoted**, an object or array comes back
+as its **JSON text**, a number or boolean comes back as its text form, and a JSON `null` *or* a missing path
+comes back as **SQL NULL**. That is the strongest contract every dialect can reach; the alternative (return
+raw JSON text for everything, so strings arrive quoted) is *not* reachable, because SQL Server's `JSON_VALUE`
+hands back unquoted scalars and has no mode that re-quotes them.
+
+Two dialects need work to keep it, and both are the kind of thing this library exists to absorb:
+
+- **MySQL is the only engine that breaks the null rule.** `JSON_UNQUOTE(JSON_EXTRACT(doc, '$.x'))` on a JSON
+  `null` returns the four-character *string* `'null'`, not SQL NULL — while PostgreSQL `#>>`, SQLite
+  `json_extract` and SQL Server `JSON_VALUE` all return NULL. The expansion therefore guards with
+  `CASE WHEN JSON_TYPE(...) = 'NULL' THEN NULL ELSE JSON_UNQUOTE(...) END`. This matters more than it looks:
+  a JSON `null` is a common tombstone encoding (dwarf uses it for deleted state fields), so an engine that
+  silently turns it into the string `"null"` corrupts a delete into a write.
+- **SQL Server has no single function that spans the types.** `JSON_VALUE` sees scalars and returns NULL for
+  an object/array; `JSON_QUERY` sees objects/arrays and returns NULL for a scalar. Neither alone is the
+  contract, so the expansion is `COALESCE(JSON_QUERY(...), JSON_VALUE(...))`.
+
+### The SQL Server 4000-character ceiling on scalars
+
+`JSON_VALUE` returns `NVARCHAR(4000)` and yields **NULL** (in lax mode) for a scalar longer than that. So on
+SQL Server — and only there — a JSON *string* over 4000 characters reads back as NULL. Objects and arrays are
+unaffected: they take the `JSON_QUERY` branch, which is `NVARCHAR(MAX)`. This is why `JSON_QUERY` is written
+*first* in the `COALESCE`: it confines the ceiling to scalars instead of letting a NULL from an oversized
+scalar shadow an object that would have extracted fine.
+
+The ceiling is not fixable inside a virtual function. Lifting it requires
+`OPENJSON(col, '$.parent') WITH (field NVARCHAR(MAX) '$.field')`, which is a **rowset**, not a scalar
+expression — a different *statement shape* than a macro that must expand in place inside a `SELECT` list or a
+`WHERE` clause. A correlated scalar subquery over `OPENJSON` would technically fit, but it parses the document
+per row and needs a `COLLATE Latin1_General_BIN2` on the key comparison (JSON keys are case-sensitive; SQL
+Server's default collation is not), which is a large tax to levy on every driver's use of the function for one
+engine's edge case. So the limit is **documented and pinned by a test** (`fixtures/vf_test.go`,
+`TestVF_JSONFieldLongScalar`, which asserts NULL on mssql and the full value everywhere else) rather than
+papered over. Callers who need large scalars on SQL Server should select the whole column and extract in Go.
+
+### Why the path must be a literal, and the column must not hold a placeholder
+
+The path cannot be a `?` placeholder: PostgreSQL needs it as a `text[]` of keys (`'{"a","b"}'`) and SQL Server
+needs it split across two functions, so it has to be **known at expansion time**, not at bind time. It is
+parsed into elements and then **re-rendered canonically** rather than passed through, so only the validated
+subset ever reaches the database — and the accepted charset for a member name is deliberately narrow
+(`[A-Za-z_][A-Za-z0-9_]*`, plus `[0]` array indexes). That narrowness is what makes it safe to splice the path
+into a SQL string literal on four dialects without per-dialect escaping rules: a quote or a bracket in a path
+is rejected at expansion, not escaped.
+
+### The `$` root is optional
+
+Because the path is parsed and re-rendered per dialect (PostgreSQL's `#>>` takes an array of keys, not a path
+string), the conventional JSONPath `$` **carries no information the function does not already supply itself**:
+it is validated, discarded, and then re-emitted by us. So `'$.name'` and `'name'` are the same path. The `$` is
+*accepted* because three of the four engines spell paths that way natively (MySQL `JSON_EXTRACT`, SQLite
+`json_extract`, SQL Server `JSON_VALUE`), and a path copied out of their documentation must not be rejected. It
+is *optional* because demanding a token we then throw away is ceremony. `TestVF_JSONFieldRootOptional` pins the
+equivalence on every driver.
+
+Separately, the MySQL and SQL Server expansions reference the **column expression twice**, so it must not
+itself contain a `?` — a bound argument there would be consumed twice and misalign every later placeholder.
+Columns don't normally carry binds, so this is a documented constraint rather than an enforced one.
+
 ## Transactions: `DB.Transact`
 
 `BeginTx` returns a `Tx` that is a thin shadow of `sql.Tx` (virtual-function expansion + placeholder

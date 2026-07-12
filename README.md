@@ -159,6 +159,32 @@ On SQL Server the value is rounded to millisecond precision so it matches the ot
 db.Query("SELECT * FROM users ORDER BY id LIMIT_OFFSET(?, ?)", limit, offset)
 ```
 
+**`JSON_FIELD(column, '$.path')`** extracts one field from a JSON column and returns it as text.
+
+| Driver     | `JSON_FIELD(doc, '$.name')` expands to                                                                    |
+|------------|----------------------------------------------------------------------------------------------------------|
+| MySQL      | `(CASE WHEN JSON_TYPE(JSON_EXTRACT(doc, '$.name')) = 'NULL' THEN NULL ELSE JSON_UNQUOTE(JSON_EXTRACT(doc, '$.name')) END)` |
+| PostgreSQL | `((doc)::jsonb #>> '{"name"}')`                                                                           |
+| SQL Server | `(COALESCE(JSON_QUERY(doc, '$.name'), JSON_VALUE(doc, '$.name')))`                                        |
+| SQLite     | `(JSON_EXTRACT(doc, '$.name'))`                                                                           |
+
+The return contract is the same on every driver:
+
+- a JSON string comes back **unquoted**,
+- an object or array comes back as its **JSON text**,
+- a number or boolean comes back as its **text form**,
+- a JSON `null`, or a path that does not exist, comes back as **SQL NULL**.
+
+```go
+db.Query("SELECT JSON_FIELD(doc, '$.name') FROM users WHERE JSON_FIELD(doc, '$.address.city') = ?", city)
+```
+
+The path supports member access and array indexes (`$.a.b`, `$.tags[0]`). The JSONPath `$` root is **optional** — `'$.name'` and `'name'` are the same path — so a path copied from the MySQL, SQLite or SQL Server documentation works as-is, and you can leave the `$` off when writing one yourself.
+
+The path must be a **literal**, not a `?` placeholder — PostgreSQL needs it as an array of keys and SQL Server needs it split across two functions, so it has to be known before the query is bound. Member names are restricted to `[A-Za-z_][A-Za-z0-9_]*`. The column expression is referenced twice on MySQL and SQL Server, so it must not itself contain a `?`.
+
+> **SQL Server caps scalars at 4000 characters.** `JSON_VALUE` returns `NVARCHAR(4000)` and yields `NULL` for anything longer, so on SQL Server a JSON *string* over 4000 characters reads back as `NULL`. Objects and arrays are unaffected (they go through `JSON_QUERY`, which is `NVARCHAR(MAX)`), as is every other driver. Lifting the cap requires an `OPENJSON ... WITH` rowset, which is a different statement shape than a virtual function can expand into; select the whole column and extract in Go if you need large scalars there.
+
 #### Nesting
 
 Virtual functions can be nested. Inner functions are expanded first across multiple passes:

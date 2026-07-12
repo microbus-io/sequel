@@ -18,6 +18,7 @@ package sequel
 
 import (
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -56,6 +57,7 @@ func init() {
 		"DATE_ADD_MILLIS":    {name: "DATE_ADD_MILLIS", handler: vfDateAddMillis},
 		"DATE_DIFF_MILLIS":   {name: "DATE_DIFF_MILLIS", handler: vfDateDiffMillis},
 		"LIMIT_OFFSET":       {name: "LIMIT_OFFSET", handler: vfLimitOffset},
+		"JSON_FIELD":         {name: "JSON_FIELD", handler: vfJSONField},
 	}
 	virtualFuncs.Store(&m)
 }
@@ -360,6 +362,158 @@ func vfDateDiffMillis(driverName string, args string) (string, error) {
 		return "DATEDIFF_BIG(MILLISECOND, " + b + ", " + a + ")", nil
 	case "sqlite":
 		return "((JULIANDAY(" + a + ") - JULIANDAY(" + b + ")) * 86400000.0)", nil
+	default:
+		return "", errors.New("unsupported driver name: %s", driverName)
+	}
+}
+
+// jsonPathElemPattern matches a member name accepted in a JSON_FIELD path. The charset is deliberately
+// narrow: every element is spliced into SQL string literals on four dialects, and refusing quotes, brackets
+// and dots up front is what makes that splicing safe without per-dialect escaping rules.
+var jsonPathElemPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// jsonPathElem is one step of a parsed JSON_FIELD path: a member name, or an array index when index >= 0.
+type jsonPathElem struct {
+	name  string
+	index int
+}
+
+// parseJSONPath parses the supported subset of JSONPath: any number of member accesses (.name) and array
+// indexes ([0]). Wildcards, recursive descent, filters and quoted member names are rejected — see
+// jsonPathElemPattern.
+//
+// The conventional JSONPath '$' root is accepted but optional, and 'name' is equivalent to '$.name'. The
+// path is never passed through to the database — PostgreSQL's #>> wants an array of keys, not a path string,
+// so parsing and re-rendering per dialect is mandatory anyway — which leaves the '$' carrying no information
+// that this function does not already supply itself. It is accepted because three of the four engines spell
+// paths that way natively, so a path copied from their documentation must not be rejected; it is optional
+// because demanding a token we then discard and re-emit is ceremony.
+func parseJSONPath(path string) ([]jsonPathElem, error) {
+	rest := strings.TrimPrefix(path, "$")
+	// A leading member name needs no '.' separator, so that 'name' parses as '$.name'.
+	if rest != "" && rest[0] != '.' && rest[0] != '[' {
+		rest = "." + rest
+	}
+	var elems []jsonPathElem
+	for rest != "" {
+		switch rest[0] {
+		case '.':
+			rest = rest[1:]
+			end := strings.IndexAny(rest, ".[")
+			if end < 0 {
+				end = len(rest)
+			}
+			name := rest[:end]
+			if !jsonPathElemPattern.MatchString(name) {
+				return nil, errors.New("JSON_FIELD path member must match [A-Za-z_][A-Za-z0-9_]*: %s", path)
+			}
+			elems = append(elems, jsonPathElem{name: name, index: -1})
+			rest = rest[end:]
+		case '[':
+			end := strings.IndexByte(rest, ']')
+			if end < 0 {
+				return nil, errors.New("JSON_FIELD path has an unclosed '[': %s", path)
+			}
+			n, err := strconv.Atoi(rest[1:end])
+			if err != nil || n < 0 {
+				return nil, errors.New("JSON_FIELD path index must be a non-negative integer: %s", path)
+			}
+			elems = append(elems, jsonPathElem{index: n})
+			rest = rest[end+1:]
+		default:
+			return nil, errors.New("JSON_FIELD path is malformed: %s", path)
+		}
+	}
+	if len(elems) == 0 {
+		return nil, errors.New("JSON_FIELD path must name at least one field, e.g. '$.name' or 'name': %s", path)
+	}
+	return elems, nil
+}
+
+// vfJSONField is the handler for the JSON_FIELD() virtual function.
+// The syntax is JSON_FIELD(column, '$.path') where column holds JSON text and the path is a literal.
+// It extracts one field and returns it as text, with a contract that holds on every driver:
+//
+//   - a JSON string comes back unquoted and unescaped,
+//   - an object or array comes back as its JSON text,
+//   - a number or boolean comes back as its text form,
+//   - a JSON null, or a path that does not exist, comes back as SQL NULL.
+//
+// This is the `->>` contract, which is the strongest one all four dialects can agree on. For example:
+//
+//	SELECT JSON_FIELD(state, '$.userName') FROM flows
+//	SELECT id FROM flows WHERE JSON_FIELD(state, '$.tags[0]') = ?
+//
+// Two constraints, both enforced or documented rather than silently worked around:
+//
+// The path must be a single-quoted literal, not a ? placeholder: PostgreSQL needs it as an array of keys and
+// SQL Server needs it split across two functions, so it has to be known at expansion time. It supports member
+// access and array indexes only. The conventional JSONPath '$' root is optional, so '$.name' and 'name' are
+// the same path.
+//
+// The column expression is referenced more than once on MySQL and SQL Server, so it must not itself contain a
+// ? placeholder — a bound argument there would be consumed twice and misalign every later placeholder.
+//
+// Note the SQL Server ceiling: JSON_VALUE returns NVARCHAR(4000) and yields NULL (in lax mode) for a longer
+// scalar, so a JSON *string* over 4000 characters reads back as NULL there. Objects and arrays are unaffected
+// (they go through JSON_QUERY, which is NVARCHAR(MAX)), as are all other drivers. Extracting large scalars on
+// SQL Server needs an OPENJSON ... WITH rowset, which is a different statement shape than a virtual function
+// can expand to.
+func vfJSONField(driverName string, args string) (string, error) {
+	comma := lastTopLevelComma(args)
+	if comma < 0 {
+		return "", errors.New("JSON_FIELD requires syntax: JSON_FIELD(column, '$.path')")
+	}
+	col := strings.TrimSpace(args[:comma])
+	pathLit := strings.TrimSpace(args[comma+1:])
+	if col == "" || len(pathLit) < 2 || pathLit[0] != '\'' || pathLit[len(pathLit)-1] != '\'' {
+		return "", errors.New("JSON_FIELD requires a literal path: JSON_FIELD(column, '$.path')")
+	}
+	elems, err := parseJSONPath(pathLit[1 : len(pathLit)-1])
+	if err != nil {
+		return "", errors.Trace(err)
+	}
+
+	// Canonical '$.a[0].b' form, re-rendered from the parsed elements rather than passed through, so what
+	// reaches the database is only ever the validated subset.
+	var path strings.Builder
+	path.WriteString("$")
+	for _, e := range elems {
+		if e.index >= 0 {
+			path.WriteString("[" + strconv.Itoa(e.index) + "]")
+		} else {
+			path.WriteString("." + e.name)
+		}
+	}
+	p := "'" + path.String() + "'"
+
+	switch driverName {
+	case "mysql":
+		// JSON_UNQUOTE maps a JSON null to the *string* 'null', not SQL NULL — the one place MySQL breaks the
+		// contract the other three keep. The JSON_TYPE guard restores it.
+		extract := "JSON_EXTRACT(" + col + ", " + p + ")"
+		return "(CASE WHEN JSON_TYPE(" + extract + ") = 'NULL' THEN NULL ELSE JSON_UNQUOTE(" + extract + ") END)", nil
+	case "pgx", "cockroachdb":
+		// #>> takes the path as a text[] of keys, and already returns text with scalars unquoted.
+		keys := make([]string, 0, len(elems))
+		for _, e := range elems {
+			if e.index >= 0 {
+				keys = append(keys, `"`+strconv.Itoa(e.index)+`"`)
+			} else {
+				keys = append(keys, `"`+e.name+`"`)
+			}
+		}
+		return "((" + col + ")::jsonb #>> '{" + strings.Join(keys, ",") + "}')", nil
+	case "mssql":
+		// JSON_VALUE returns scalars (NULL for an object/array); JSON_QUERY returns objects/arrays (NULL for a
+		// scalar). Neither alone covers the contract, so they are combined. JSON_QUERY comes first because a
+		// scalar over 4000 chars makes JSON_VALUE NULL, and preferring the JSON_QUERY branch keeps that failure
+		// confined to scalars rather than letting it swallow objects too.
+		return "(COALESCE(JSON_QUERY(" + col + ", " + p + "), JSON_VALUE(" + col + ", " + p + ")))", nil
+	case "sqlite":
+		// json_extract already returns unquoted scalars, JSON text for objects/arrays, and SQL NULL for a JSON
+		// null or a missing path — the contract, exactly.
+		return "(JSON_EXTRACT(" + col + ", " + p + "))", nil
 	default:
 		return "", errors.New("unsupported driver name: %s", driverName)
 	}
