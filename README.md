@@ -257,7 +257,7 @@ err := db.Transact(ctx, func(tx *sequel.Tx) error {
 ```
 
 - **Retry-safe by re-running.** A retried attempt re-executes the closure from the start in a new transaction (the previous attempt is rolled back), so the closure must be safe to run more than once — any non-transactional side effects it performs may repeat. Because retries re-run the Go code rather than replay recorded statements, a transaction whose control flow depends on data committed by another transaction between attempts stays correct.
-- **No partial commits.** The `Tx` passed to the closure records the first statement error and short-circuits the rest, so the transaction never commits half its work even if the closure forgets to check a statement's error.
+- **No partial commits.** The `Tx` passed to the closure records the first error and short-circuits every statement after it, so the transaction never commits half its work even if the closure forgets to check an error. This covers all three ways an error surfaces: a failed `Exec`/`Query`/`InsertReturnID` statement, an error while iterating a result set (a `rows.Scan` failure or a streaming error from `rows.Err()`), and a failed `QueryRow(...).Scan` — with `sql.ErrNoRows` exempt, since a missing row is normal control flow rather than a failure.
 - **SQL Server `XACT_ABORT ON`.** Applied automatically inside `Transact` so any statement error aborts the whole transaction server-side.
 
 A `Tx` from `BeginTx` does neither error-recording nor retry — it behaves exactly like `sql.Tx`.
@@ -367,11 +367,21 @@ Prometheus exporter appends it at the scrape boundary, so `sequel_lock_contentio
 The library **does not log operation errors** — every error is returned to the caller, who is best placed to log it. Logging is reserved for:
 
 - **Info** — one-off events: each schema migration as it is attempted (regardless of outcome).
-- **Debug** — every query, but only when `SetVerbose(true)` is set.
+- **Debug** — every query, including the full parameterized statement text. There is no separate sequel switch: the lines are gated on your own logger's level, so they cost nothing when Debug is disabled. (Statement text is never a privacy risk — sequel always parameterizes, so the text carries `?`/`$1` placeholders, never argument values.)
 
-### `QueryRow` returns `*sequel.Row`
+### `Query` and `QueryRow` return `*sequel.Rows` / `*sequel.Row`
 
-To instrument single-row queries, `QueryRow`/`QueryRowContext` return a `*sequel.Row` (which embeds `*sql.Row`) rather than `*sql.Row`. `database/sql` defers a `QueryRow` error to `Scan`, so the shadow captures it there. The common `db.QueryRow(q).Scan(&x)` call site is unchanged; only code that explicitly stores the result as `*sql.Row` needs adjustment.
+Query methods return sequel's own row types rather than `database/sql`'s: `Query`/`QueryContext` return a `*sequel.Rows` (embedding `*sql.Rows`), and `QueryRow`/`QueryRowContext` return a `*sequel.Row` (embedding `*sql.Row`). Both embed, so ordinary call sites are unchanged:
+
+```go
+rows, err := db.Query("SELECT id, name FROM users")   // type inference — no change needed
+for rows.Next() { rows.Scan(&id, &name) }
+err = db.QueryRow("SELECT name FROM users WHERE id=?", id).Scan(&name)
+```
+
+Only code that *explicitly* types a result as `*sql.Rows` / `*sql.Row`, or that implements the `Executor` interface itself, needs adjustment.
+
+These types exist for two reasons. **Instrumentation:** `database/sql` defers a `QueryRow` error to `Scan` and a streaming error to `rows.Err()`, so the shadows capture the error where it actually becomes available. **Transaction safety:** inside a `Transact` closure they latch that error into the transaction, so a closure that ignores a failed scan or a truncated read cannot commit state built on it — see [Transactions](#transactions). Outside `Transact` — a `*DB` query, or a `Tx` from `BeginTx` — both are pure passthroughs with no latching.
 
 ## Legal
 

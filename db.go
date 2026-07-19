@@ -456,7 +456,7 @@ func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*Row
 // QueryRow shadows sql.DB.QueryRow and conforms arg placeholders for the driver. It returns a [Row], which
 // embeds *sql.Row so existing QueryRow(...).Scan(...) call sites are unchanged.
 func (db *DB) QueryRow(query string, args ...any) *Row {
-	return instrumentQueryRow(db.telemetry.Load(), context.Background(), db.driverName, query,
+	return instrumentQueryRow(db.telemetry.Load(), context.Background(), db.driverName, query, nil,
 		func(_ context.Context, q string) *sql.Row {
 			return db.DB.QueryRow(q, args...)
 		})
@@ -465,7 +465,7 @@ func (db *DB) QueryRow(query string, args ...any) *Row {
 // QueryRowContext shadows sql.DB.QueryRowContext and conforms arg placeholders for the driver. It returns a
 // [Row], which embeds *sql.Row so existing QueryRowContext(...).Scan(...) call sites are unchanged.
 func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *Row {
-	return instrumentQueryRow(db.telemetry.Load(), ctx, db.driverName, query,
+	return instrumentQueryRow(db.telemetry.Load(), ctx, db.driverName, query, nil,
 		func(ctx context.Context, q string) *sql.Row {
 			return db.DB.QueryRowContext(ctx, q, args...)
 		})

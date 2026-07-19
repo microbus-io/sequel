@@ -422,17 +422,26 @@ func instrumentExec[T any](t *telemetry, ctx context.Context, driver, query stri
 // the returned *Row carries the finish func and reports the operation's error (and duration ending) when
 // the caller calls Scan or Err. An unpack error is swallowed here exactly as the original shadow methods do
 // (the empty query then surfaces a driver error at Scan time).
-func instrumentQueryRow(t *telemetry, ctx context.Context, driver, query string, run func(ctx context.Context, unpacked string) *sql.Row) *Row {
+func instrumentQueryRow(t *telemetry, ctx context.Context, driver, query string, recordErr func(error) error, run func(ctx context.Context, unpacked string) *sql.Row) *Row {
 	unpacked, _ := unpackQuery(driver, query)
 	ctx, finish := t.begin(ctx, driver, unpacked)
-	return &Row{Row: run(ctx, unpacked), finish: finish}
+	return &Row{Row: run(ctx, unpacked), finish: finish, recordErr: recordErr}
 }
 
 /*
-Row shadows *sql.Row so sequel can observe a single-row query. database/sql does not surface a QueryRow
-error until Scan, so Row records the operation's duration, classifies lock contention, and ends the span
-when the caller calls Scan (or Err). It embeds *sql.Row, so the common QueryRow(...).Scan(...) call site is
-unchanged; only code that explicitly stores the result as *sql.Row needs adjustment.
+Row shadows *sql.Row so sequel can observe a single-row query and latch its error into a [DB.Transact]-managed
+transaction. database/sql does not surface a QueryRow error until Scan, so Row records the operation's
+duration, classifies lock contention, and ends the span when the caller calls Scan (or Err). It embeds
+*sql.Row, so the common QueryRow(...).Scan(...) call site is unchanged; only code that explicitly stores the
+result as *sql.Row needs adjustment.
+
+In Transact (autoErr) mode Scan/Err also latch the error into the transaction, exactly as [Rows] does for a
+streamed read, so a closure that ignores a QueryRow error cannot commit work built on a row it never read.
+[sql.ErrNoRows] is deliberately exempt: unlike a Rows iteration, where an empty result set is simply Next
+returning false, "no row" reaches a QueryRow caller as an error and is routine control flow
+(`if err == sql.ErrNoRows { ...default... }`). Latching it would doom every transaction that legitimately
+handles a missing row. Every other error — deadlock, type-conversion failure, connection drop — is latched.
+Outside a Transact-managed Tx, recordErr is nil and no latching occurs.
 
 As with *sql.Row, a Row whose Scan/Err is never called holds resources open — and here, leaves its span
 unended. Call Scan (or Err) exactly as you would with *sql.Row.
@@ -440,21 +449,45 @@ unended. Call Scan (or Err) exactly as you would with *sql.Row.
 type Row struct {
 	*sql.Row
 	finish func(error)
-	done   bool
+	// recordErr latches an error into the owning autoErr Tx; nil for a *DB query or a non-Transact Tx.
+	recordErr func(error) error
+	// shortErr is the already-recorded transaction error for a Row returned by a short-circuited Tx
+	// query. When set, the embedded *sql.Row is nil and Scan/Err report shortErr without touching the
+	// database; no span was ever started, so finish is nil too.
+	shortErr error
+	done     bool
 }
 
-// Scan shadows sql.Row.Scan and finishes instrumentation with the scan error.
+// latch records a non-nil error into the owning transaction, when there is one. sql.ErrNoRows is exempt —
+// see the type doc.
+func (r *Row) latch(err error) {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) && r.recordErr != nil {
+		r.recordErr(err)
+	}
+}
+
+// Scan shadows sql.Row.Scan, finishes instrumentation with the scan error, and latches it into the
+// transaction (autoErr mode), so a closure that ignores the returned error cannot commit work built on a
+// row it never read.
 func (r *Row) Scan(dest ...any) error {
+	if r.shortErr != nil {
+		return r.shortErr
+	}
 	err := r.Row.Scan(dest...)
 	r.complete(err)
+	r.latch(err)
 	return err
 }
 
-// Err shadows sql.Row.Err and finishes instrumentation with the query error, so a caller that inspects Err
-// instead of scanning still closes the span.
+// Err shadows sql.Row.Err, finishes instrumentation with the query error, and latches it, so a caller that
+// inspects Err instead of scanning still closes the span and aborts the transaction.
 func (r *Row) Err() error {
+	if r.shortErr != nil {
+		return r.shortErr
+	}
 	err := r.Row.Err()
 	r.complete(err)
+	r.latch(err)
 	return err
 }
 

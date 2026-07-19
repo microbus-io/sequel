@@ -120,18 +120,25 @@ func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Row
 }
 
 // QueryRow shadows sql.Tx.QueryRow and conforms arg placeholders for the driver. It returns a [Row], which
-// embeds *sql.Row so existing QueryRow(...).Scan(...) call sites are unchanged.
+// embeds *sql.Row so existing QueryRow(...).Scan(...) call sites are unchanged. In Transact (autoErr) mode
+// the Row latches its Scan/Err error into the transaction (except sql.ErrNoRows — see [Row]).
 func (tx *Tx) QueryRow(query string, args ...any) *Row {
-	return instrumentQueryRow(tx.t, context.Background(), tx.driverName, query,
+	if err := tx.shortCircuit(); err != nil {
+		return &Row{shortErr: err}
+	}
+	return instrumentQueryRow(tx.t, context.Background(), tx.driverName, query, tx.recordErr,
 		func(_ context.Context, q string) *sql.Row {
 			return tx.Tx.QueryRow(q, args...)
 		})
 }
 
 // QueryRowContext shadows sql.Tx.QueryRowContext and conforms arg placeholders for the driver. It returns a
-// [Row], which embeds *sql.Row so existing QueryRowContext(...).Scan(...) call sites are unchanged.
+// [Row] (see QueryRow) that latches its error into the transaction in Transact (autoErr) mode.
 func (tx *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *Row {
-	return instrumentQueryRow(tx.t, ctx, tx.driverName, query,
+	if err := tx.shortCircuit(); err != nil {
+		return &Row{shortErr: err}
+	}
+	return instrumentQueryRow(tx.t, ctx, tx.driverName, query, tx.recordErr,
 		func(ctx context.Context, q string) *sql.Row {
 			return tx.Tx.QueryRowContext(ctx, q, args...)
 		})

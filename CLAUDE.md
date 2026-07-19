@@ -179,10 +179,37 @@ on a real error: draining a healthy result set latches a nil `rows.Err()` (no-op
 (where `Next()` is still returning `true`) latches nothing — a streaming error would itself have made
 `Next()` return `false`. Outside `Transact` — a `*DB` query or a `BeginTx` `Tx` — `recordErr` is nil and
 `Rows` is a pure passthrough, so direct callers are unaffected (same opt-in boundary as statement
-recording). `Row` (from `QueryRow`) still carries only the telemetry finish func, not a tx latch; a
-`QueryRow(...).Scan` error inside a Transact closure is conventionally checked by the caller (its error is
-returned directly, not deferred behind an iteration loop). `fixtures/rows_test.go` pins both halves: an
-ignored `Scan` error rolls the closure's write back; a healthy full drain commits.
+recording). `fixtures/rows_test.go` pins both halves: an ignored `Scan` error rolls the closure's write back; a healthy
+full drain commits.
+
+### `Row` latches too — but must exempt `sql.ErrNoRows`
+
+`Row` (from `QueryRow`) carries the same latch, for the same reason: a closure that drops a
+`QueryRow(...).Scan` error can otherwise commit work built on a row it never read. The argument that it
+need not — that a `QueryRow` error is checked at the call site rather than deferred behind an iteration
+loop — is weaker than it looks, since `if err != nil { /* skip */ }` reproduces the dwarf failure exactly.
+
+The asymmetry with `Rows` is not *whether* to latch but *what*. `Rows` can latch unconditionally because an
+empty result set is `Next()` returning false, never an error. For `Row`, "no row" arrives **as an error** —
+`sql.ErrNoRows` — and handling it is routine control flow (`if err == sql.ErrNoRows { …default… }`). A
+`Row` that latched it would doom every transaction that legitimately defaults a missing row, so the
+exemption is load-bearing, not a nicety, and `TestTransact_CommitsOnErrNoRows` pins it. Every other error —
+deadlock, type-conversion failure, connection drop — latches.
+
+Note that the latch is the *second* net for deadlock retry, not the first. `transactOnce` returns whichever
+of `fn`'s error or `tx.err` is non-nil, so a deadlock on a `QueryRow` the closure **returns** was always
+retried correctly; the latch only extends that to closures that drop the error.
+
+### `QueryRow` short-circuits like every other statement method
+
+`QueryRow`/`QueryRowContext` originally skipped the `shortCircuit()` guard that `Exec`/`Query`/`Prepare`/
+`InsertReturnID` all open with — an oversight, not a decision. Without it, a `QueryRow` issued after the
+transaction is already doomed still goes to the database and comes back with a driver cascade error
+(`current transaction is aborted…` on PostgreSQL), which is exactly the masking the recorded-error design
+exists to prevent. Because the guard must return a `*Row` rather than an `error`, a short-circuited `Row`
+carries the recorded error in a `shortErr` field with a **nil embedded `*sql.Row`**, and `Scan`/`Err`
+report it without touching the database or starting a span (consistent with short-circuited statements
+emitting no telemetry). `TestTransact_QueryRowShortCircuits` asserts the *first* error surfaces verbatim.
 
 ## Observability (`telemetry.go`)
 
