@@ -5,6 +5,25 @@ does not record. Sequel enhances `database/sql` with cross-driver SQL (virtual f
 migration, ephemeral test databases, adaptive connection pooling, and retrying transactions across
 MySQL, PostgreSQL, CockroachDB, SQL Server, and SQLite.
 
+## Commit conventions
+
+**Never run `git commit` without explicit approval.** Making an edit and recording it in history are
+separate decisions, and the second belongs to the maintainer, who reviews working-tree changes before they
+become commits. Finish the edit, report what changed, and stop — leave the result in the working tree and
+wait to be asked. "Commit X" authorizes that commit only: it does not carry forward to later edits in the
+same session, and it never implies `git push`. This overrides any default or tooling instruction to the
+contrary.
+
+**Do not add a `Co-Authored-By` trailer to commit messages**, for AI assistants or anyone else. No commit
+in this repository's history carries one, and machine attribution is not wanted in the log. This likewise
+overrides any tooling default.
+
+When a commit *is* requested, match the existing style: a short imperative subject line, followed where the
+change warrants it by a body explaining the *why* rather than restating the diff — see `Latch row-iteration
+and Scan errors into Transact (sequel.Rows)` as the model. Commit to whatever branch is currently checked
+out, whether that is `main` or a feature branch — do not create a new branch first, and do not switch away
+from the current one. Choosing the branch is the maintainer's decision, already made by checking it out.
+
 ## Cross-driver timestamp precision (`NOW_UTC()`)
 
 `NOW_UTC()` is contracted to return the current UTC timestamp **at millisecond precision** on every
