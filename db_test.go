@@ -785,6 +785,121 @@ func TestDB_CreateTestingDatabase_DistinctPools(t *testing.T) {
 	assert.Equal(7, x)
 }
 
+// testingRefsOf reads the live-handle count sequel keeps for a testing database.
+func testingRefsOf(databaseName string) int {
+	testingGlobalMutex.Lock()
+	defer testingGlobalMutex.Unlock()
+	return testingDBRefs[databaseName]
+}
+
+func testingDSNIsCached(databaseName string) bool {
+	testingGlobalMutex.Lock()
+	defer testingGlobalMutex.Unlock()
+	cacheKey, ok := testingDBKeys[databaseName]
+	if !ok {
+		return false
+	}
+	_, cached := testingDSNs[cacheKey]
+	return cached
+}
+
+// Several handles on one testing database drop it once, on the last close.
+func TestDB_TestingDatabaseDropsOnLastCloseOnly(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	name, ok := testingDatabaseNameOf("sqlite", dsn)
+	assert.True(ok, "the minted DSN must name a testing database")
+
+	db1, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	db2, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	assert.False(db1 == db2, "Open hands out a distinct *DB per call")
+	assert.Equal(2, testingRefsOf(name))
+
+	// First close must not drop: db2 is still using the database, so the DSN stays cached.
+	assert.NoError(db1.Close())
+	assert.Equal(1, testingRefsOf(name))
+	assert.True(testingDSNIsCached(name), "the DSN is still usable while a handle remains")
+
+	// Last close drops, and takes the cached DSN with it.
+	assert.NoError(db2.Close())
+	assert.Equal(0, testingRefsOf(name))
+	assert.False(testingDSNIsCached(name), "a dropped database must not stay cached under its DSN")
+}
+
+// OpenSingleton contributes one handle however many callers coalesce onto it.
+func TestDB_TestingDatabaseSingletonCountsOnce(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	name, ok := testingDatabaseNameOf("sqlite", dsn)
+	assert.True(ok)
+
+	db1, err := OpenSingleton("sqlite", dsn)
+	assert.NoError(err)
+	db2, err := OpenSingleton("sqlite", dsn)
+	assert.NoError(err)
+	assert.True(db1 == db2, "OpenSingleton coalesces by DSN")
+	assert.Equal(1, testingRefsOf(name), "coalesced callers are one handle, not two")
+
+	assert.NoError(db1.Close())
+	assert.Equal(1, testingRefsOf(name), "the shared handle is still open")
+	assert.NoError(db2.Close())
+	assert.Equal(0, testingRefsOf(name))
+}
+
+// Once every handle is gone the database is dropped, so asking for it again mints it afresh
+// rather than returning a DSN for a database that no longer exists.
+func TestDB_TestingDatabaseReprovisionsAfterFullClose(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	name, ok := testingDatabaseNameOf("sqlite", dsn)
+	assert.True(ok)
+
+	db, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	_, err = db.Exec("CREATE TABLE reprovision_t (x INT)")
+	assert.NoError(err)
+	assert.NoError(db.Close())
+	assert.False(testingDSNIsCached(name))
+
+	// The name is deterministic, so the DSN is the same string; what must differ is that the
+	// database behind it was provisioned afresh.
+	again, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	assert.Equal(dsn, again)
+	assert.True(testingDSNIsCached(name), "re-provisioning re-caches the DSN")
+
+	db2, err := Open("sqlite", again)
+	assert.NoError(err)
+	defer db2.Close()
+	_, err = db2.Exec("CREATE TABLE reprovision_t (x INT)")
+	assert.NoError(err, "the table must not already exist - a stale database would still hold it")
+}
+
+// An ordinary DSN is neither counted nor dropped.
+func TestDB_NonTestingDSNIsNotTracked(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	_, ok := testingDatabaseNameOf("sqlite", "file:production_db?mode=memory&cache=shared")
+	assert.False(ok, "a database without the testing prefix names no testing database")
+
+	db, err := Open("sqlite", "file:not_a_testing_db?mode=memory&cache=shared")
+	assert.NoError(err)
+	assert.Equal(0, testingRefsOf("not_a_testing_db"))
+	assert.NoError(db.Close())
+}
+
 func TestDB_InjectOutputInserted(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)

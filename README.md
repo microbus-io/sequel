@@ -291,7 +291,7 @@ func startup(cfg Config) (*sequel.DB, error) {
 }
 ```
 
-Repeated calls within the same process with the same `(driver, baseDSN, uniqueTestID)` reuse the same testing database — the `DROP+CREATE` runs only once. The returned DSN points at a database whose name has the `testing_NN_` prefix; sequel inspects this on `Close` and drops the database automatically when the last referencing `*DB` is closed. There is no separate cleanup call to remember. If a process exits before `Close` runs, the leftover-cleanup sweep on the next `CreateTestingDatabase` call removes stale databases older than 1–2 hours.
+Repeated calls within the same process with the same `(driver, baseDSN, uniqueTestID)` reuse the same testing database — the `DROP+CREATE` runs only once, for as long as a handle on it remains open. The returned DSN points at a database whose name has the `testing_NN_` prefix; sequel inspects this on `Close` and drops the database automatically when the last referencing `*DB` is closed — last across every handle, since `Open` returns a distinct `*DB` per call. There is no separate cleanup call to remember. A call after that point provisions the database again rather than returning a DSN for one that no longer exists. If a process exits before `Close` runs, the leftover-cleanup sweep on the next `CreateTestingDatabase` call removes stale databases older than 1–2 hours.
 
 ### Choosing the server with `SEQUEL_TESTING_DSN`
 

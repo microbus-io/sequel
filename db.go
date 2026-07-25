@@ -55,6 +55,12 @@ var (
 	testingGlobalMutex sync.Mutex
 	testingMutexes     = map[string]*sync.Mutex{}
 	testingStartedAt   = time.Now().UTC()
+	// testingDBRefs counts the live *DB handles on each testing database, so the auto-drop
+	// happens on the last close rather than on every one.
+	testingDBRefs = map[string]int{}
+	// testingDBKeys maps a testing database name to its testingDSNs cache key, so dropping
+	// the database can evict the DSN that named it.
+	testingDBKeys = map[string]string{}
 
 	// insertSourceClausePattern matches the start of an INSERT statement's source clause - either
 	// VALUES (INSERT ... VALUES (...)) or SELECT (INSERT ... SELECT ...). MSSQL's OUTPUT INSERTED
@@ -115,6 +121,7 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 		refCount:       1,
 	}
 	db.telemetry.Store(newDefaultTelemetry(db))
+	retainTestingDatabase(driverName, dataSourceName)
 	return db, nil
 }
 
@@ -165,6 +172,8 @@ func OpenSingleton(driverName string, dataSourceName string) (db *DB, err error)
 	singletonDB.refCount = 1
 	singletonDB.telemetry.Store(newDefaultTelemetry(singletonDB))
 	singletonDB.adjustConnectionLimits()
+	// Only on this branch, not the coalescing one above: the extra callers share this *DB.
+	retainTestingDatabase(driverName, dataSourceName)
 	return singletonDB, nil
 }
 
@@ -289,10 +298,11 @@ func isLockContentionMessage(msg string) bool {
 
 // Close closes the database connection.
 //
-// When the last reference closes and the underlying database name matches the
-// testing pattern (testing_NN_…), sequel drops the database from the server as
-// a best-effort cleanup. This makes [CreateTestingDatabase]-provisioned
-// databases self-cleaning on test teardown.
+// When the underlying database name matches the testing pattern (testing_NN_…),
+// the last handle to close drops the database from the server as a best-effort
+// cleanup, making [CreateTestingDatabase]-provisioned databases self-cleaning on
+// test teardown. Last across every handle on that database, not just this one:
+// [Open] hands out a *DB per call, so several may share one testing database.
 func (db *DB) Close() (err error) {
 	if db == nil {
 		return nil
@@ -313,16 +323,59 @@ func (db *DB) Close() (err error) {
 	return errors.Trace(err)
 }
 
-// maybeDropTestingDatabase drops the database backing this *DB if its database
-// name has the testing prefix produced by [CreateTestingDatabase]. Errors are
-// swallowed: the leftover-DB sweep on the next test run is the safety net.
-// No-op for SQLite (in-memory).
-func (db *DB) maybeDropTestingDatabase() {
-	if db.driverName == "sqlite" {
+// testingDatabaseNameOf reports the testing database a DSN names, if any. The testing_NN_
+// prefix minted by CreateTestingDatabase is the only signal.
+func testingDatabaseNameOf(driverName string, dsn string) (string, bool) {
+	// Cheap reject before parsing: this runs on every Open, production ones included.
+	if !strings.Contains(dsn, "testing_") {
+		return "", false
+	}
+	databaseName, err := databaseNameFromDataSourceName(driverName, dsn)
+	if err != nil || !testingDatabaseNamePattern.MatchString(databaseName) {
+		return "", false
+	}
+	return databaseName, true
+}
+
+// retainTestingDatabase records one more handle on the testing database the DSN names.
+// Call it once per *DB that will eventually run maybeDropTestingDatabase.
+func retainTestingDatabase(driverName string, dsn string) {
+	databaseName, ok := testingDatabaseNameOf(driverName, dsn)
+	if !ok {
 		return
 	}
-	dbName, err := databaseNameFromDataSourceName(db.driverName, db.dataSourceName)
-	if err != nil || !testingDatabaseNamePattern.MatchString(dbName) {
+	testingGlobalMutex.Lock()
+	testingDBRefs[databaseName]++
+	testingGlobalMutex.Unlock()
+}
+
+// maybeDropTestingDatabase releases this handle on the database backing this *DB if its
+// name has the testing prefix produced by [CreateTestingDatabase], and drops the database
+// once the last handle is gone. Errors are swallowed: the leftover-DB sweep on the next
+// test run is the safety net. No-op for SQLite (in-memory).
+func (db *DB) maybeDropTestingDatabase() {
+	dbName, ok := testingDatabaseNameOf(db.driverName, db.dataSourceName)
+	if !ok {
+		return
+	}
+	testingGlobalMutex.Lock()
+	testingDBRefs[dbName]--
+	last := testingDBRefs[dbName] <= 0
+	if last {
+		delete(testingDBRefs, dbName)
+		// The cached DSN names a database that is about to stop existing, so evict it and let
+		// the next CreateTestingDatabase caller mint it afresh.
+		if cacheKey, ok := testingDBKeys[dbName]; ok {
+			delete(testingDBKeys, dbName)
+			delete(testingDSNs, cacheKey)
+		}
+	}
+	testingGlobalMutex.Unlock()
+	if !last {
+		return
+	}
+	// SQLite testing databases are in-memory: closing the last connection is the drop.
+	if db.driverName == "sqlite" {
 		return
 	}
 	masterDSN, err := setDatabaseInDataSourceName(db.driverName, db.dataSourceName, "")
@@ -334,7 +387,10 @@ func (db *DB) maybeDropTestingDatabase() {
 		return
 	}
 	defer masterDB.Close()
-	masterDB.Exec("DROP DATABASE IF EXISTS " + dbName)
+	// Bounded: a leaked handle can leave the DROP blocked server-side on a database still in use.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	masterDB.ExecContext(ctx, "DROP DATABASE IF EXISTS "+dbName)
 }
 
 /*
@@ -820,7 +876,9 @@ that wants a per-run database:
 
 Within a single process, repeated calls with the same (driverName,
 baseDataSourceName, uniqueTestID) reuse the same testing database — the
-underlying DROP+CREATE only happens on the first call.
+underlying DROP+CREATE only happens on the first call. Once every handle on that
+database has been closed it is dropped, and a later call with the same triple
+provisions it again.
 
 If a driver name is not provided, it is inferred from the data source name on a
 best-effort basis. Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres),
@@ -982,6 +1040,7 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 	// Cache for other openers in the same test
 	testingGlobalMutex.Lock()
 	testingDSNs[cacheKey] = testingDSN
+	testingDBKeys[testingDatabaseName] = cacheKey
 	testingGlobalMutex.Unlock()
 
 	return testingDSN, nil

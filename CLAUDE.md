@@ -345,6 +345,32 @@ expressed intent, and the env var must not override it. Sequel's own unit tests 
 expressed *no* preference at all. The integration tests under `fixtures/` pass empty/empty precisely to opt
 in; the root package's white-box tests name `"sqlite"` precisely to opt out.
 
+### The auto-drop is refcounted, and drops on the last close
+
+`Close` drops a `testing_NN_…` database as a best-effort cleanup. The subtlety is *which* close does it.
+`Open` hands out a distinct `*DB` per call — that is how a consumer gets independent pools on one shared
+testing database — and every one of those handles reaches `maybeDropTestingDatabase` on its own `Close`.
+Dropping per handle meant each close but the last issued a `DROP` the server could not grant while its
+siblings still held connections, so it **blocked until the server gave up** — measured at 20s per attempt on
+SQL Server, 5s on PostgreSQL — and then swallowed the error, leaving nothing to explain why the suite was
+slow. So `testingDBRefs` counts live handles per database name and only the last one out drops.
+
+Only handles that will actually attempt the drop are counted. `OpenSingleton` coalesces by DSN, so its extra
+callers share one `*DB` and ride `DB.refCount`; their `Close` never reaches the drop path. Counting them
+would leave the count permanently above zero and the database never dropped — hence the `retainTestingDatabase`
+call sits on `OpenSingleton`'s pool-opening branch only, and on *every* `Open`.
+
+The drop also evicts the cached DSN (`testingDBKeys` maps a database name back to its `testingDSNs` cache
+key). Without that, the cache keeps handing out a DSN for a database that no longer exists — which is how a
+second engine in a shared-database test failed at startup after the first had shut down. Evicting makes the
+next `CreateTestingDatabase` with the same triple mint the database again, which is what asking for a testing
+database after releasing every handle on the previous one should mean.
+
+The `DROP` runs under a 5s context timeout. The refcount means it normally runs uncontended, but a handle
+that never closes — a test binary that panicked — leaves the database in use and puts the server back into
+that block-until-it-gives-up state. Since the drop is best-effort either way (errors are swallowed, and
+`CreateTestingDatabase` sweeps leftovers on the next run), waiting longer buys nothing.
+
 ### Unit tests in the root package, integration tests under `fixtures/`
 
 Tests that only exercise pure logic — DSN parsing, placeholder conforming, virtual-function string expansion,
