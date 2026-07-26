@@ -369,8 +369,7 @@ func BenchmarkExpandVirtualFuncs_Hot(b *testing.B) {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		if _, err := expandVirtualFuncsWithCache("pgx", q, cache); err != nil {
 			b.Fatal(err)
 		}
@@ -380,8 +379,7 @@ func BenchmarkExpandVirtualFuncs_Hot(b *testing.B) {
 // BenchmarkExpandVirtualFuncs_Cold measures the cache-miss path: a unique query every iteration.
 func BenchmarkExpandVirtualFuncs_Cold(b *testing.B) {
 	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		q := fmt.Sprintf(
 			"UPDATE microbus_steps SET lease_expires=DATE_ADD_MILLIS(NOW_UTC(), ?) WHERE step_id=? /* %d */",
 			i,

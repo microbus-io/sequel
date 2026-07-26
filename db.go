@@ -83,6 +83,10 @@ type DB struct {
 	refCount       int
 	mutex          sync.Mutex
 	telemetry      atomic.Pointer[telemetry]
+	// simulatedRTT is the artificial per-round-trip delay set by [DB.SimulateRTT], in nanoseconds. It is
+	// read on every operation and may be changed while the pool is in use, so it is atomic rather than
+	// guarded by mutex.
+	simulatedRTT atomic.Int64
 }
 
 /*
@@ -468,7 +472,7 @@ func (db *DB) snapshotStats() (sql.DBStats, bool) {
 
 // Exec shadows sql.DB.Exec and conforms arg placeholders for the driver.
 func (db *DB) Exec(query string, args ...any) (sql.Result, error) {
-	return instrumentExec(db.telemetry.Load(), context.Background(), db.driverName, query,
+	return instrumentExec(db.telemetry.Load(), db.rtt(), context.Background(), db.driverName, query,
 		func(_ context.Context, q string) (sql.Result, error) {
 			return db.DB.Exec(q, args...)
 		})
@@ -476,7 +480,7 @@ func (db *DB) Exec(query string, args ...any) (sql.Result, error) {
 
 // ExecContext shadows sql.DB.ExecContext and conforms arg placeholders for the driver.
 func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	return instrumentExec(db.telemetry.Load(), ctx, db.driverName, query,
+	return instrumentExec(db.telemetry.Load(), db.rtt(), ctx, db.driverName, query,
 		func(ctx context.Context, q string) (sql.Result, error) {
 			return db.DB.ExecContext(ctx, q, args...)
 		})
@@ -486,7 +490,7 @@ func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.R
 // embeds *sql.Rows so existing rows.Next()/rows.Scan()/rows.Err() call sites are unchanged. A *DB query
 // is not transactional, so Rows here is a pure passthrough (no error latching).
 func (db *DB) Query(query string, args ...any) (*Rows, error) {
-	rows, err := instrumentExec(db.telemetry.Load(), context.Background(), db.driverName, query,
+	rows, err := instrumentExec(db.telemetry.Load(), db.rtt(), context.Background(), db.driverName, query,
 		func(_ context.Context, q string) (*sql.Rows, error) {
 			return db.DB.Query(q, args...)
 		})
@@ -499,7 +503,7 @@ func (db *DB) Query(query string, args ...any) (*Rows, error) {
 // QueryContext shadows sql.DB.QueryContext and conforms arg placeholders for the driver. It returns a
 // [Rows] (see Query); a *DB query does not latch errors into any transaction.
 func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
-	rows, err := instrumentExec(db.telemetry.Load(), ctx, db.driverName, query,
+	rows, err := instrumentExec(db.telemetry.Load(), db.rtt(), ctx, db.driverName, query,
 		func(ctx context.Context, q string) (*sql.Rows, error) {
 			return db.DB.QueryContext(ctx, q, args...)
 		})
@@ -512,7 +516,7 @@ func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*Row
 // QueryRow shadows sql.DB.QueryRow and conforms arg placeholders for the driver. It returns a [Row], which
 // embeds *sql.Row so existing QueryRow(...).Scan(...) call sites are unchanged.
 func (db *DB) QueryRow(query string, args ...any) *Row {
-	return instrumentQueryRow(db.telemetry.Load(), context.Background(), db.driverName, query, nil,
+	return instrumentQueryRow(db.telemetry.Load(), db.rtt(), context.Background(), db.driverName, query, nil,
 		func(_ context.Context, q string) *sql.Row {
 			return db.DB.QueryRow(q, args...)
 		})
@@ -521,26 +525,50 @@ func (db *DB) QueryRow(query string, args ...any) *Row {
 // QueryRowContext shadows sql.DB.QueryRowContext and conforms arg placeholders for the driver. It returns a
 // [Row], which embeds *sql.Row so existing QueryRowContext(...).Scan(...) call sites are unchanged.
 func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *Row {
-	return instrumentQueryRow(db.telemetry.Load(), ctx, db.driverName, query, nil,
+	return instrumentQueryRow(db.telemetry.Load(), db.rtt(), ctx, db.driverName, query, nil,
 		func(ctx context.Context, q string) *sql.Row {
 			return db.DB.QueryRowContext(ctx, q, args...)
 		})
 }
 
-// Prepare shadows sql.DB.Prepare and conforms arg placeholders for the driver.
-func (db *DB) Prepare(query string) (*sql.Stmt, error) {
-	return instrumentExec(db.telemetry.Load(), context.Background(), db.driverName, query,
-		func(_ context.Context, q string) (*sql.Stmt, error) {
-			return db.DB.Prepare(q)
-		})
+// Prepare shadows sql.DB.Prepare and conforms arg placeholders for the driver. It returns a [Stmt], which
+// embeds *sql.Stmt so existing stmt.Exec(...)/stmt.Close() call sites are unchanged; executions of the
+// returned statement stay on sequel's instrumented path.
+func (db *DB) Prepare(query string) (*Stmt, error) {
+	// sql.DB.Prepare is defined as PrepareContext(context.Background(), ...), so this loses nothing and
+	// keeps one instrumented path.
+	return db.PrepareContext(context.Background(), query)
 }
 
-// PrepareContext shadows sql.DB.PrepareContext and conforms arg placeholders for the driver.
-func (db *DB) PrepareContext(ctx context.Context, query string) (*sql.Stmt, error) {
-	return instrumentExec(db.telemetry.Load(), ctx, db.driverName, query,
+// PrepareContext shadows sql.DB.PrepareContext and conforms arg placeholders for the driver. It returns a
+// [Stmt] (see Prepare).
+func (db *DB) PrepareContext(ctx context.Context, query string) (*Stmt, error) {
+	var unpacked string
+	sqlStmt, err := instrumentExec(db.telemetry.Load(), db.rtt(), ctx, db.driverName, query,
 		func(ctx context.Context, q string) (*sql.Stmt, error) {
+			unpacked = q
 			return db.DB.PrepareContext(ctx, q)
 		})
+	if err != nil {
+		return nil, err
+	}
+	return &Stmt{Stmt: sqlStmt, query: unpacked, driverName: db.driverName, db: db}, nil
+}
+
+// Ping shadows sql.DB.Ping so a simulated round-trip delay ([DB.SimulateRTT]) applies to it: a ping is a
+// wire operation like any statement. It is not otherwise instrumented — sequel has never traced a ping.
+func (db *DB) Ping() error {
+	_ = simulateRTT(context.Background(), db.rtt()) // an uncancellable context: the pause always elapses
+	return traceErr(db.DB.Ping())
+}
+
+// PingContext shadows sql.DB.PingContext for the same reason as [DB.Ping]. A context that expires during
+// the simulated latency fails the ping without reaching the database.
+func (db *DB) PingContext(ctx context.Context) error {
+	if err := simulateRTT(ctx, db.rtt()); err != nil {
+		return errors.Trace(err)
+	}
+	return traceErr(db.DB.PingContext(ctx))
 }
 
 // DriverName is the name of the driver: "mysql", "pgx", "cockroachdb", "mssql" or "sqlite".
@@ -565,24 +593,46 @@ func unpackQuery(driverName string, query string) (string, error) {
 	return query, nil
 }
 
+// traceErr attaches a stack trace to an operation error at the API boundary, passing the database/sql
+// sentinels through untouched: sql.ErrNoRows and sql.ErrTxDone are routine control flow, not failures, and
+// callers are entitled to compare them with == exactly as they would against database/sql. The identity
+// check (not errors.Is) is deliberate — only the bare sentinel is ==-comparable in the first place.
+// Everything else — driver errors, context errors — gains the stack of the failing call site; the wrapper
+// preserves Unwrap, so errors.Is/errors.As and IsLockContentionError see through it.
+func traceErr(err error) error {
+	if err == nil || err == sql.ErrNoRows || err == sql.ErrTxDone {
+		return err
+	}
+	return errors.Trace(err)
+}
+
 // Begin starts a transaction and returns a sequel.Tx that applies virtual function
 // expansion and placeholder conforming.
 func (db *DB) Begin() (*Tx, error) {
-	sqlTx, err := db.DB.Begin()
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	return &Tx{Tx: sqlTx, driverName: db.driverName, t: db.telemetry.Load()}, nil
+	// sql.DB.Begin is defined as BeginTx(context.Background(), nil), so this loses nothing and keeps one
+	// instrumented path. The transaction then has no caller context, so its lifecycle spans are roots.
+	return db.BeginTx(context.Background(), nil)
 }
 
 // BeginTx starts a transaction with the given options and returns a sequel.Tx that
 // applies virtual function expansion and placeholder conforming.
 func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
-	sqlTx, err := db.DB.BeginTx(ctx, opts)
+	sqlTx, rtt, err := db.beginTx(ctx, opts)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	return &Tx{Tx: sqlTx, driverName: db.driverName, t: db.telemetry.Load()}, nil
+	return &Tx{Tx: sqlTx, driverName: db.driverName, rtt: rtt, ctx: ctx, t: db.telemetry.Load()}, nil
+}
+
+// beginTx opens the underlying transaction under a BEGIN span, returning the simulated delay captured for
+// the transaction's lifetime alongside it so every statement and the eventual COMMIT run at one latency.
+func (db *DB) beginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, time.Duration, error) {
+	rtt := db.rtt()
+	sqlTx, err := instrumentTxOp(db.telemetry.Load(), rtt, ctx, db.driverName, "BEGIN",
+		func(ctx context.Context) (*sql.Tx, error) {
+			return db.DB.BeginTx(ctx, opts)
+		})
+	return sqlTx, rtt, err
 }
 
 // transactMaxAttempts bounds how many times Transact reruns a transaction that keeps losing to lock
@@ -617,20 +667,22 @@ func (db *DB) Transact(ctx context.Context, fn func(tx *Tx) error) (err error) {
 
 // transactOnce executes one attempt of a Transact: begin, run fn, commit, rolling back on any failure.
 func (db *DB) transactOnce(ctx context.Context, fn func(tx *Tx) error) error {
-	sqlTx, err := db.DB.BeginTx(ctx, nil)
+	sqlTx, rtt, err := db.beginTx(ctx, nil)
 	if err != nil {
 		return errors.Trace(err)
 	}
-	tx := &Tx{Tx: sqlTx, driverName: db.driverName, autoErr: true, t: db.telemetry.Load()}
+	// ctx carries the transact span, so the COMMIT/ROLLBACK spans nest under it like the statements do.
+	tx := &Tx{Tx: sqlTx, driverName: db.driverName, autoErr: true, rtt: rtt, ctx: ctx, t: db.telemetry.Load()}
 	committed := false
 	defer func() {
 		if !committed {
-			_ = sqlTx.Rollback()
+			_ = tx.Rollback()
 		}
 	}()
 	if db.driverName == "mssql" {
 		// XACT_ABORT ON makes any statement error abort the whole transaction server-side, so a deadlock
 		// or constraint failure cannot leave the transaction in a half-applied, committable state.
+		_ = simulateRTT(ctx, rtt) // a round trip like any other; an expired context is reported by the Exec
 		if _, err := sqlTx.ExecContext(ctx, "SET XACT_ABORT ON"); err != nil {
 			return errors.Trace(err)
 		}
@@ -641,7 +693,7 @@ func (db *DB) transactOnce(ctx context.Context, fn func(tx *Tx) error) error {
 	if tx.err != nil {
 		return errors.Trace(tx.err)
 	}
-	if err := sqlTx.Commit(); err != nil {
+	if err := tx.Commit(); err != nil {
 		return errors.Trace(err)
 	}
 	committed = true
@@ -649,12 +701,25 @@ func (db *DB) transactOnce(ctx context.Context, fn func(tx *Tx) error) error {
 }
 
 // InsertReturnID executes an INSERT statement and returns the auto-generated ID for the named ID column.
+// idColumn must be a plain identifier matching [A-Za-z_][A-Za-z0-9_]* — it is spliced into the statement
+// on some drivers, so quoted or exotic column names are rejected rather than escaped.
 func (db *DB) InsertReturnID(ctx context.Context, idColumn string, stmt string, args ...any) (int64, error) {
 	return insertReturnID(ctx, db, db.driverName, idColumn, stmt, args...)
 }
 
+// identifierPattern is the charset accepted for an identifier that is spliced into SQL text, such as
+// InsertReturnID's idColumn (RETURNING <col> on PostgreSQL/CockroachDB, OUTPUT INSERTED.<col> on SQL
+// Server). Same principle as JSON_FIELD paths: the narrow charset is what makes the splice safe on every
+// dialect — a quote or bracket is rejected up front, not escaped.
+var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
 // insertReturnID executes an INSERT statement and returns the auto-generated ID for the named ID column.
+// The column name is validated on every driver, not only the ones that splice it, so a bad name fails the
+// same way everywhere.
 func insertReturnID(ctx context.Context, qe Executor, driverName string, idColumn string, stmt string, args ...any) (int64, error) {
+	if !identifierPattern.MatchString(idColumn) {
+		return 0, errors.New("ID column must match [A-Za-z_][A-Za-z0-9_]*: %s", idColumn)
+	}
 	switch driverName {
 	case "mysql", "sqlite":
 		res, err := qe.ExecContext(ctx, stmt, args...)
@@ -699,6 +764,38 @@ func injectOutputInserted(stmt string, idColumn string) (string, error) {
 	return stmt[:loc[0]] + " OUTPUT INSERTED." + idColumn + stmt[loc[0]:], nil
 }
 
+// leftoverTestingDatabasePattern matches a database name that the leftover-cleanup sweep is allowed to
+// DROP. Candidates come from the server's own catalog — input sequel does not control, since any principal
+// with CREATE DATABASE rights can plant a name there — and the name is spliced into an unquoted DROP
+// DATABASE statement executed with the testing credentials. The full-match anchor and the narrow charset
+// (exactly what CreateTestingDatabase can mint, which sanitizes to [a-z0-9_]) are what make that splice
+// safe: a name carrying a quote, space or semicolon — a batch injection on SQL Server, which executes
+// multi-statement batches — fails the match and is left alone rather than escaped.
+var leftoverTestingDatabasePattern = regexp.MustCompile(`^testing_[0-2][0-9]_[a-z0-9_]*$`)
+
+// dsnURLCredentialsPattern matches the userinfo of a URL-form DSN (postgres://user:pass@host).
+// The password segment is [^@]* because a literal '@' must be percent-encoded in a valid URL.
+var dsnURLCredentialsPattern = regexp.MustCompile(`://([^:/@?]+):([^@]*)@`)
+
+// dsnMySQLCredentialsPattern matches the credentials of a mysql-form DSN (user:pass@tcp(host)/db).
+// The password match is greedy to the last '@', mirroring how the mysql driver itself splits the DSN,
+// so a password containing '@' is fully redacted rather than partially leaked.
+var dsnMySQLCredentialsPattern = regexp.MustCompile(`^([^:@/]+):(.*)@`)
+
+// dsnPasswordParamPattern matches a password passed as a key=value parameter (ADO-style SQL Server DSNs).
+var dsnPasswordParamPattern = regexp.MustCompile(`(?i)(password|pwd)=[^;& ]*`)
+
+// redactDataSourceName masks the credentials in a DSN so it can be quoted in an error message. DSNs carry
+// passwords, and errors end up in the caller's logs — a raw DSN in an error is a credential leak.
+func redactDataSourceName(dsn string) string {
+	if strings.Contains(dsn, "://") {
+		dsn = dsnURLCredentialsPattern.ReplaceAllString(dsn, "://$1:***@")
+	} else {
+		dsn = dsnMySQLCredentialsPattern.ReplaceAllString(dsn, "$1:***@")
+	}
+	return dsnPasswordParamPattern.ReplaceAllString(dsn, "$1=***")
+}
+
 // databaseNameFromDataSourceName extracts the database name part of the data source name.
 func databaseNameFromDataSourceName(driverName string, dsn string) (databaseName string, err error) {
 	if dsn == "" {
@@ -708,28 +805,28 @@ func databaseNameFromDataSourceName(driverName string, dsn string) (databaseName
 	case "mysql":
 		cfg, err := mysql.ParseDSN(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", dsn, err)
+			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
 		}
 		return cfg.DBName, nil
 	case "pgx", "cockroachdb":
 		_, err = pgx.ParseConfig(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", dsn, err)
+			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
 		}
 		u, err := url.Parse(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", dsn, err)
+			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
 		}
 		return strings.TrimPrefix(u.Path, "/"), nil
 	case "mssql":
 		// https://github.com/microsoft/go-mssqldb?tab=readme-ov-file#common-parameters
 		_, _, err = msdsn.Parse(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", dsn, err)
+			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
 		}
 		u, err := url.Parse(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", dsn, err)
+			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
 		}
 		return u.Query().Get("database"), nil
 	case "sqlite":
@@ -754,7 +851,7 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 	case "mysql":
 		cfg, err := mysql.ParseDSN(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", dsn, err)
+			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
 		}
 		cfg.DBName = databaseName
 		alteredDSN = cfg.FormatDSN()
@@ -762,11 +859,11 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 	case "pgx", "cockroachdb":
 		_, err = pgx.ParseConfig(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", dsn, err)
+			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
 		}
 		u, err := url.Parse(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", dsn, err)
+			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
 		}
 		u.Path = "/" + databaseName
 		alteredDSN = u.String()
@@ -775,11 +872,11 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 		// https://github.com/microsoft/go-mssqldb?tab=readme-ov-file#common-parameters
 		_, _, err = msdsn.Parse(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", dsn, err)
+			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
 		}
 		u, err := url.Parse(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", dsn, err)
+			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
 		}
 		q := u.Query()
 		if databaseName == "" {
@@ -1011,7 +1108,6 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 		rows, err := masterDB.Query(stmt)
 		if err == nil {
 			defer rows.Close()
-			re := regexp.MustCompile(`^testing_[0-2][0-9]_`)
 			var leftoverDatabaseNames []string
 			h14 := now.Add(-time.Hour).Format("15")
 			h15 := now.Format("15")
@@ -1019,7 +1115,7 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 			for rows.Next() {
 				var databaseName string
 				rows.Scan(&databaseName)
-				if re.MatchString(databaseName) &&
+				if leftoverTestingDatabasePattern.MatchString(databaseName) &&
 					!strings.HasPrefix(databaseName, "testing_"+h14+"_") &&
 					!strings.HasPrefix(databaseName, "testing_"+h15+"_") &&
 					!strings.HasPrefix(databaseName, "testing_"+h16+"_") {

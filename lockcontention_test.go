@@ -31,28 +31,28 @@ func TestDB_IsLockContentionError(t *testing.T) {
 	assert := testarossa.For(t)
 
 	// Driver-native typed errors classified by code (the primary path).
-	assert.True(IsLockContentionError(&pgconn.PgError{Code: "40P01"}))                  // PG deadlock
-	assert.True(IsLockContentionError(&pgconn.PgError{Code: "40001"}))                  // PG/CRDB serialization
-	assert.False(IsLockContentionError(&pgconn.PgError{Code: "23505"}))                 // PG unique violation
-	assert.True(IsLockContentionError(&mysql.MySQLError{Number: 1213}))                 // MySQL deadlock
-	assert.True(IsLockContentionError(&mysql.MySQLError{Number: 1205}))                 // MySQL lock wait timeout
-	assert.False(IsLockContentionError(&mysql.MySQLError{Number: 1062}))                // MySQL duplicate entry
-	assert.True(IsLockContentionError(mssql.Error{Number: 1205}))                       // SQL Server deadlock
-	assert.True(IsLockContentionError(mssql.Error{Number: 1222}))                       // SQL Server lock timeout
-	assert.False(IsLockContentionError(mssql.Error{Number: 2627}))                      // SQL Server PK violation
+	assert.True(IsLockContentionError(&pgconn.PgError{Code: "40P01"}))   // PG deadlock
+	assert.True(IsLockContentionError(&pgconn.PgError{Code: "40001"}))   // PG/CRDB serialization
+	assert.False(IsLockContentionError(&pgconn.PgError{Code: "23505"}))  // PG unique violation
+	assert.True(IsLockContentionError(&mysql.MySQLError{Number: 1213}))  // MySQL deadlock
+	assert.True(IsLockContentionError(&mysql.MySQLError{Number: 1205}))  // MySQL lock wait timeout
+	assert.False(IsLockContentionError(&mysql.MySQLError{Number: 1062})) // MySQL duplicate entry
+	assert.True(IsLockContentionError(mssql.Error{Number: 1205}))        // SQL Server deadlock
+	assert.True(IsLockContentionError(mssql.Error{Number: 1222}))        // SQL Server lock timeout
+	assert.False(IsLockContentionError(mssql.Error{Number: 2627}))       // SQL Server PK violation
 	// Typed errors are also found through a wrapped chain.
 	assert.True(IsLockContentionError(errors.Join(errors.New("op failed"), &pgconn.PgError{Code: "40P01"})))
 
 	// Substring fallback (drivers whose typed error isn't in the chain, e.g. text-only messages).
 	retryable := []string{
-		"SQLITE_BUSY: database is locked",                          // SQLite busy
-		"database table is locked: database is deadlocked (6)",     // SQLite shared-cache (SQLITE_LOCKED)
-		"SQLITE_LOCKED: database table is locked",                  // SQLite locked
-		"Error 1213: Deadlock found when trying to get lock",       // MySQL
-		"Error 1205: Lock wait timeout exceeded",                   // MySQL
-		"ERROR: deadlock detected (SQLSTATE 40P01)",                // PostgreSQL
-		"mssql: Transaction was chosen as the deadlock victim",     // SQL Server 1205
-		"mssql: Lock request time out period exceeded",             // SQL Server 1222
+		"SQLITE_BUSY: database is locked",                            // SQLite busy
+		"database table is locked: database is deadlocked (6)",       // SQLite shared-cache (SQLITE_LOCKED)
+		"SQLITE_LOCKED: database table is locked",                    // SQLite locked
+		"Error 1213: Deadlock found when trying to get lock",         // MySQL
+		"Error 1205: Lock wait timeout exceeded",                     // MySQL
+		"ERROR: deadlock detected (SQLSTATE 40P01)",                  // PostgreSQL
+		"mssql: Transaction was chosen as the deadlock victim",       // SQL Server 1205
+		"mssql: Lock request time out period exceeded",               // SQL Server 1222
 		"restart transaction: TransactionRetryWithProtoRefreshError", // CockroachDB
 	}
 	for _, msg := range retryable {

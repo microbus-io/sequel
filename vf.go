@@ -480,9 +480,12 @@ func vfJSONField(driverName string, args string) (string, error) {
 	path.WriteString("$")
 	for _, e := range elems {
 		if e.index >= 0 {
-			path.WriteString("[" + strconv.Itoa(e.index) + "]")
+			path.WriteString("[")
+			path.WriteString(strconv.Itoa(e.index))
+			path.WriteString("]")
 		} else {
-			path.WriteString("." + e.name)
+			path.WriteString(".")
+			path.WriteString(e.name)
 		}
 	}
 	p := "'" + path.String() + "'"

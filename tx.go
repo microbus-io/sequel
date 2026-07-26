@@ -19,6 +19,8 @@ package sequel
 import (
 	"context"
 	"database/sql"
+	"sync/atomic"
+	"time"
 )
 
 // Tx is an in-progress database transaction that shadows sql.Tx methods
@@ -33,9 +35,16 @@ import (
 type Tx struct {
 	*sql.Tx
 	driverName string
-	autoErr    bool       // set by Transact: record first statement error and short-circuit thereafter
-	err        error      // first recorded statement error (autoErr mode only)
-	t          *telemetry // observability snapshot taken when the transaction began (may be nil)
+	autoErr    bool          // set by Transact: record first statement error and short-circuit thereafter
+	err        error         // first recorded statement error (autoErr mode only)
+	rtt        time.Duration // simulated round-trip delay, captured when the transaction began
+	// done is set only by a Commit/Rollback that returned nil; see finalize. Atomic to match sql.Tx, whose
+	// own finalization is a CAS on an atomic.Bool so that concurrent Commit/Rollback is race-free.
+	done atomic.Bool
+	// ctx is the context the transaction began with, kept so Commit/Rollback — which take none of their own
+	// — can parent their spans to the transaction. sql.Tx stores its context for the same reason.
+	ctx context.Context
+	t   *telemetry // observability snapshot taken when the transaction began (may be nil)
 }
 
 // recordErr remembers the first statement error in Transact (autoErr) mode and returns err unchanged,
@@ -66,7 +75,7 @@ func (tx *Tx) Exec(query string, args ...any) (sql.Result, error) {
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	res, err := instrumentExec(tx.t, context.Background(), tx.driverName, query,
+	res, err := instrumentExec(tx.t, tx.rtt, context.Background(), tx.driverName, query,
 		func(_ context.Context, q string) (sql.Result, error) {
 			return tx.Tx.Exec(q, args...)
 		})
@@ -78,7 +87,7 @@ func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.R
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	res, err := instrumentExec(tx.t, ctx, tx.driverName, query,
+	res, err := instrumentExec(tx.t, tx.rtt, ctx, tx.driverName, query,
 		func(ctx context.Context, q string) (sql.Result, error) {
 			return tx.Tx.ExecContext(ctx, q, args...)
 		})
@@ -93,7 +102,7 @@ func (tx *Tx) Query(query string, args ...any) (*Rows, error) {
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	rows, err := instrumentExec(tx.t, context.Background(), tx.driverName, query,
+	rows, err := instrumentExec(tx.t, tx.rtt, context.Background(), tx.driverName, query,
 		func(_ context.Context, q string) (*sql.Rows, error) {
 			return tx.Tx.Query(q, args...)
 		})
@@ -109,7 +118,7 @@ func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Row
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	rows, err := instrumentExec(tx.t, ctx, tx.driverName, query,
+	rows, err := instrumentExec(tx.t, tx.rtt, ctx, tx.driverName, query,
 		func(ctx context.Context, q string) (*sql.Rows, error) {
 			return tx.Tx.QueryContext(ctx, q, args...)
 		})
@@ -126,7 +135,7 @@ func (tx *Tx) QueryRow(query string, args ...any) *Row {
 	if err := tx.shortCircuit(); err != nil {
 		return &Row{shortErr: err}
 	}
-	return instrumentQueryRow(tx.t, context.Background(), tx.driverName, query, tx.recordErr,
+	return instrumentQueryRow(tx.t, tx.rtt, context.Background(), tx.driverName, query, tx.recordErr,
 		func(_ context.Context, q string) *sql.Row {
 			return tx.Tx.QueryRow(q, args...)
 		})
@@ -138,37 +147,98 @@ func (tx *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *R
 	if err := tx.shortCircuit(); err != nil {
 		return &Row{shortErr: err}
 	}
-	return instrumentQueryRow(tx.t, ctx, tx.driverName, query, tx.recordErr,
+	return instrumentQueryRow(tx.t, tx.rtt, ctx, tx.driverName, query, tx.recordErr,
 		func(ctx context.Context, q string) *sql.Row {
 			return tx.Tx.QueryRowContext(ctx, q, args...)
 		})
 }
 
-// Prepare shadows sql.Tx.Prepare and conforms arg placeholders for the driver.
-func (tx *Tx) Prepare(query string) (*sql.Stmt, error) {
-	if err := tx.shortCircuit(); err != nil {
-		return nil, err
-	}
-	stmt, err := instrumentExec(tx.t, context.Background(), tx.driverName, query,
-		func(_ context.Context, q string) (*sql.Stmt, error) {
-			return tx.Tx.Prepare(q)
-		})
-	return stmt, tx.recordErr(err)
+// Prepare shadows sql.Tx.Prepare and conforms arg placeholders for the driver. It returns a [Stmt] bound
+// to this transaction: in Transact mode an execution error is recorded and short-circuits later
+// statements, exactly as for a statement issued through the Tx directly.
+func (tx *Tx) Prepare(query string) (*Stmt, error) {
+	// sql.Tx.Prepare is defined as PrepareContext(context.Background(), ...), so this loses nothing and
+	// keeps one instrumented path.
+	return tx.PrepareContext(context.Background(), query)
 }
 
-// PrepareContext shadows sql.Tx.PrepareContext and conforms arg placeholders for the driver.
-func (tx *Tx) PrepareContext(ctx context.Context, query string) (*sql.Stmt, error) {
+// PrepareContext shadows sql.Tx.PrepareContext and conforms arg placeholders for the driver. It returns a
+// [Stmt] bound to this transaction (see Prepare).
+func (tx *Tx) PrepareContext(ctx context.Context, query string) (*Stmt, error) {
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	stmt, err := instrumentExec(tx.t, ctx, tx.driverName, query,
+	var unpacked string
+	sqlStmt, err := instrumentExec(tx.t, tx.rtt, ctx, tx.driverName, query,
 		func(ctx context.Context, q string) (*sql.Stmt, error) {
+			unpacked = q
 			return tx.Tx.PrepareContext(ctx, q)
 		})
-	return stmt, tx.recordErr(err)
+	if err != nil {
+		return nil, tx.recordErr(err)
+	}
+	return &Stmt{Stmt: sqlStmt, query: unpacked, driverName: tx.driverName, tx: tx}, nil
+}
+
+// Stmt shadows sql.Tx.Stmt: it binds a statement prepared on the [DB] to this transaction. The returned
+// [Stmt] is transaction-bound, so in Transact mode its execution errors are recorded and short-circuit
+// later statements — a prepared statement is not an escape hatch from the no-partial-commit guarantee.
+func (tx *Tx) Stmt(stmt *Stmt) *Stmt {
+	return tx.StmtContext(context.Background(), stmt)
+}
+
+// StmtContext shadows sql.Tx.StmtContext (see Stmt).
+func (tx *Tx) StmtContext(ctx context.Context, stmt *Stmt) *Stmt {
+	// The statement text was unpacked for the same pool, so it carries over; only the binding changes.
+	return &Stmt{Stmt: tx.Tx.StmtContext(ctx, stmt.Stmt), query: stmt.query, driverName: tx.driverName, tx: tx}
+}
+
+/*
+Commit shadows sql.Tx.Commit so the COMMIT round trip is instrumented like any statement: it emits its own
+span (nested under the transaction), records into sequel_query_duration as operation COMMIT, is classified
+for sequel_lock_contention, and pays any simulated round-trip delay ([DB.SimulateRTT]). Classification
+matters here because a serialization failure most often surfaces at commit on CockroachDB and on PostgreSQL
+under SERIALIZABLE.
+
+A call that answers [sql.ErrTxDone] never reaches the database, so it emits no span, records no duration,
+and pays no delay. Return values are identical to sql.Tx throughout.
+
+Behavior is otherwise unchanged, including in Transact mode: Transact decides whether to commit before
+calling this, and a commit error is not recorded into [Tx.Err].
+*/
+func (tx *Tx) Commit() error {
+	return tx.finalize("COMMIT", tx.Tx.Commit)
+}
+
+// Rollback shadows sql.Tx.Rollback for the same reasons as [Tx.Commit], and handles an already-finalized
+// transaction the same way. A rollback is a round trip whether or not anything went right, so it is
+// instrumented while the transaction unwinds after a failure too.
+func (tx *Tx) Rollback() error {
+	return tx.finalize("ROLLBACK", tx.Tx.Rollback)
+}
+
+// finalize runs Commit or Rollback, skipping the round trip, span and delay once the transaction is known
+// to be over.
+//
+// Only a nil error may set done: sql.Tx.Commit reports a cancelled context from an early return that does
+// *not* finalize, so marking done on any completed call would answer a later Rollback with ErrTxDone where
+// database/sql would really have rolled back. Being conservative costs at most one extra ErrTxDone call,
+// which is free.
+func (tx *Tx) finalize(op string, run func() error) error {
+	if tx.done.Load() {
+		return sql.ErrTxDone
+	}
+	err := instrumentTxEnd(tx.t, tx.rtt, tx.ctx, tx.driverName, op, run)
+	if err == nil {
+		tx.done.Store(true)
+	}
+	// traceErr keeps ErrTxDone bare — whichever path answered it — so == comparisons keep working.
+	return traceErr(err)
 }
 
 // InsertReturnID executes an INSERT statement and returns the auto-generated ID for the named ID column.
+// idColumn must be a plain identifier matching [A-Za-z_][A-Za-z0-9_]* — it is spliced into the statement
+// on some drivers, so quoted or exotic column names are rejected rather than escaped.
 func (tx *Tx) InsertReturnID(ctx context.Context, idColumn string, stmt string, args ...any) (int64, error) {
 	if err := tx.shortCircuit(); err != nil {
 		return 0, err

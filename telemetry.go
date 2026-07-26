@@ -20,7 +20,11 @@ import (
 	"context"
 	"database/sql"
 	"log/slog"
+	"maps"
+	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/microbus-io/errors"
@@ -112,7 +116,7 @@ func (t *telemetry) initInstruments(db *DB) {
 		metric.WithUnit("s"),
 		metric.WithDescription("Duration of Transact calls in seconds, including retries"),
 	)
-	// Counter instrument names carry no _total suffix; the Prometheus exporter appends it (see CLAUDE.md).
+	// Counter instrument names carry no _total suffix; the Prometheus exporter appends it at scrape time.
 	t.lockContention, _ = m.Int64Counter(
 		"sequel_lock_contention",
 		metric.WithDescription("Count of operations that failed on lock contention or deadlock"),
@@ -177,11 +181,17 @@ status, and — when the logger is enabled at Debug level — emits a Debug log.
 *telemetry (no-op).
 */
 func (t *telemetry) begin(ctx context.Context, driver, query string) (context.Context, func(err error)) {
+	return t.beginAt(ctx, driver, query, time.Now())
+}
+
+// beginAt is begin with an explicit start instant, for an operation whose instrumentation can only be
+// decided after it has run (see instrumentTxEnd). Back-dating keeps the span covering the whole operation.
+func (t *telemetry) beginAt(ctx context.Context, driver, query string, start time.Time) (context.Context, func(err error)) {
 	if !t.enabled() {
 		return ctx, func(error) {}
 	}
 	op, table := parseOperation(query)
-	start := time.Now()
+	t.logOperationCapOnce(ctx)
 
 	var span trace.Span
 	if t.tracer != nil {
@@ -196,7 +206,8 @@ func (t *telemetry) begin(ctx context.Context, driver, query string) (context.Co
 		if table != "" {
 			attrs = append(attrs, attribute.String("db.collection.name", table))
 		}
-		ctx, span = t.tracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindClient), trace.WithAttributes(attrs...))
+		ctx, span = t.tracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindClient),
+			trace.WithTimestamp(start), trace.WithAttributes(attrs...))
 	}
 
 	return ctx, func(err error) {
@@ -330,6 +341,111 @@ func (t *telemetry) recordMigration(ctx context.Context, driver, sequence string
 // table from a statement. The operation is always the leading keyword. The table is returned only for a
 // single-target statement: it is omitted for joins, multi-table FROM lists, and subqueries, so a non-empty
 // table is trustworthy (and keeps span-name cardinality bounded) rather than a guess.
+// operationOther is the bucket for a statement verb that is not reported verbatim, either because it is
+// not shaped like a verb or because the label cap has been reached.
+const operationOther = "OTHER"
+
+// operationLabelCap bounds how many distinct verbs may ever be reported. A curated codebase uses on the
+// order of a dozen, so the cap is unreachable in normal operation; it exists so that an application which
+// interpolates uncontrolled input into its SQL cannot mint unbounded metric attribute values or span names.
+const operationLabelCap = 128
+
+// seedOperations are the verbs reported verbatim from the very first statement, without being learned.
+// Seeding matters for more than convenience: a seeded verb is deterministic (its label never depends on
+// what the process happened to see first) and cannot be crowded out of the learned set, so the labels an
+// ordinary application depends on survive even while something else is filling the cap with junk. The verbs
+// participating in table extraction below are seeded for the same reason — db.collection.name and the span
+// name should not vary with history either. Rarer verbs are deliberately absent: the learner picks them up
+// on first use, which is what keeps this list from needing to enumerate five dialects.
+var seedOperations = []string{
+	"SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE", "UPSERT", "WITH",
+	"CREATE", "DROP", "ALTER", "TRUNCATE",
+	"BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT",
+	"SET", "PRAGMA", "USE",
+	"SHOW", "EXPLAIN", "ANALYZE",
+	"CALL", "EXEC",
+}
+
+// verbPattern is the shape a token must have to be learned as a verb. It is what stops a hostile leading
+// token from consuming the cap: only plausible-verb-shaped tokens are ever added, so arbitrary bytes,
+// injected SQL fragments and comment prefixes are bucketed as OTHER without occupying a slot. It also
+// bounds the length of any label sequel can emit, since the token is spliced into metric attributes and
+// span names.
+var verbPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,31}$`)
+
+// operationLabels is the bounded set of verbs reported as db.operation.name. Reads are a single atomic load
+// of an immutable snapshot, so the hot path never locks; a first sighting clones-then-swaps under the mutex.
+// This is the same copy-on-write discipline as the virtual function registry, for the same reason.
+//
+// It is package-level rather than per-DB because the quantity being bounded — how many distinct label
+// values this process exports — is a property of the process, not of one pool. That does mean a pool
+// issuing unusual statements consumes slots shared with every other pool; acceptable, since the seed
+// protects the labels that matter and the cap is far above any curated workload.
+type operationLabels struct {
+	mutex       sync.Mutex // serializes writers so concurrent first sightings don't lose updates
+	known       atomic.Pointer[map[string]bool]
+	capExceeded atomic.Bool
+}
+
+// newOperationLabels returns a set pre-seeded with the given verbs.
+func newOperationLabels(seed []string) *operationLabels {
+	o := &operationLabels{}
+	m := make(map[string]bool, len(seed))
+	for _, v := range seed {
+		m[v] = true
+	}
+	o.known.Store(&m)
+	return o
+}
+
+var defaultOperationLabels = newOperationLabels(seedOperations)
+
+// label maps a statement's leading token to the value reported as db.operation.name: the token itself if it
+// is already known or can still be learned, otherwise OTHER.
+func (o *operationLabels) label(token string) string {
+	if (*o.known.Load())[token] {
+		return token
+	}
+	if !verbPattern.MatchString(token) {
+		// Not verb-shaped, so not learnable — and deliberately not a cap event: filtering junk is normal,
+		// whereas exhausting the cap is worth telling an operator about.
+		return operationOther
+	}
+	o.mutex.Lock()
+	defer o.mutex.Unlock()
+	// Re-read under the lock: another goroutine may have learned this token, or filled the last slot.
+	known := *o.known.Load()
+	if known[token] {
+		return token
+	}
+	if len(known) >= operationLabelCap {
+		o.capExceeded.Store(true)
+		return operationOther
+	}
+	clone := maps.Clone(known)
+	clone[token] = true
+	o.known.Store(&clone)
+	return token
+}
+
+// operationCapLogOnce keeps the cap warning to a single line per process.
+var operationCapLogOnce sync.Once
+
+// logOperationCapOnce tells the operator, once, that the verb label cap has been reached and further
+// unrecognized verbs are being bucketed. This is the one thing about the cap that is not self-evident from
+// the metrics: seeing OTHER does not by itself distinguish "an odd statement" from "labels are now being
+// dropped". Logged at Info as a one-off lifecycle event, not per occurrence.
+func (t *telemetry) logOperationCapOnce(ctx context.Context) {
+	if t.logger == nil || !defaultOperationLabels.capExceeded.Load() {
+		return
+	}
+	operationCapLogOnce.Do(func() {
+		t.logger.InfoContext(ctx,
+			"sequel reached its limit of distinct statement verbs; further unrecognized verbs report as "+operationOther,
+			"cap", operationLabelCap)
+	})
+}
+
 func parseOperation(query string) (op string, table string) {
 	s := strings.TrimLeft(query, " \t\r\n")
 	if s == "" {
@@ -339,12 +455,16 @@ func parseOperation(query string) (op string, table string) {
 	for end < len(s) && !isSQLSpace(s[end]) {
 		end++
 	}
-	op = strings.ToUpper(s[:end])
+	// A single-word statement may arrive with its terminator attached ("COMMIT;").
+	op = defaultOperationLabels.label(strings.ToUpper(strings.TrimRight(s[:end], ";")))
+	if op == operationOther {
+		return op, ""
+	}
 	upper := strings.ToUpper(s)
 	switch op {
 	case "SELECT", "DELETE":
 		table = tableAfter(s, upper, " FROM ")
-	case "INSERT", "REPLACE":
+	case "INSERT", "REPLACE", "UPSERT":
 		table = tableAfter(s, upper, " INTO ")
 	case "UPDATE", "MERGE":
 		table = identAt(s, end)
@@ -401,10 +521,11 @@ func isIdentDelim(c byte) bool {
 }
 
 // instrumentExec wraps an Exec/Query/Prepare-shaped operation: it unpacks the query once, opens a span,
-// runs the operation, and finishes instrumentation with the result error. It preserves the existing error
-// behavior — the unpack error is traced (matching the shadow methods), the operation error is returned
-// verbatim so driver error types stay intact for IsLockContentionError.
-func instrumentExec[T any](t *telemetry, ctx context.Context, driver, query string, run func(ctx context.Context, unpacked string) (T, error)) (T, error) {
+// pauses for the simulated round-trip time (see [DB.SimulateRTT]; normally zero), runs the operation, and
+// finishes instrumentation with the result error. The operation error is wrapped by traceErr — the stack
+// is attached around the raw error, so driver error types stay intact for IsLockContentionError and the
+// database/sql sentinels pass through untouched.
+func instrumentExec[T any](t *telemetry, rtt time.Duration, ctx context.Context, driver, query string, run func(ctx context.Context, unpacked string) (T, error)) (T, error) {
 	var zero T
 	unpacked, err := unpackQuery(driver, query)
 	if err != nil {
@@ -412,20 +533,76 @@ func instrumentExec[T any](t *telemetry, ctx context.Context, driver, query stri
 		finish(err)
 		return zero, errors.Trace(err)
 	}
+	return instrumentUnpacked(t, rtt, ctx, driver, unpacked, run)
+}
+
+// instrumentUnpacked is instrumentExec for a statement that is already unpacked — an execution of a
+// prepared [Stmt], whose text was expanded and conformed once at Prepare time.
+//
+// The pause sits inside the span rather than before it, so an operation's recorded duration includes the
+// latency being simulated. That is the point of simulating it: the numbers a test reads should be the ones
+// a caller would experience. Unpacking is local string work, not a round trip, so it stays outside.
+func instrumentUnpacked[T any](t *telemetry, rtt time.Duration, ctx context.Context, driver, unpacked string, run func(ctx context.Context, unpacked string) (T, error)) (T, error) {
 	ctx, finish := t.begin(ctx, driver, unpacked)
+	if err := simulateRTT(ctx, rtt); err != nil {
+		finish(err)
+		var zero T
+		return zero, errors.Trace(err)
+	}
 	res, err := run(ctx, unpacked)
+	// finish sees the raw error: spans, metrics and the Debug log record what the driver reported, without
+	// the wrapper.
 	finish(err)
-	return res, err
+	return res, traceErr(err)
 }
 
 // instrumentQueryRow wraps QueryRow/QueryRowContext. Because database/sql defers the query error to Scan,
 // the returned *Row carries the finish func and reports the operation's error (and duration ending) when
 // the caller calls Scan or Err. An unpack error is swallowed here exactly as the original shadow methods do
 // (the empty query then surfaces a driver error at Scan time).
-func instrumentQueryRow(t *telemetry, ctx context.Context, driver, query string, recordErr func(error) error, run func(ctx context.Context, unpacked string) *sql.Row) *Row {
+func instrumentQueryRow(t *telemetry, rtt time.Duration, ctx context.Context, driver, query string, recordErr func(error) error, run func(ctx context.Context, unpacked string) *sql.Row) *Row {
 	unpacked, _ := unpackQuery(driver, query)
+	return instrumentQueryRowUnpacked(t, rtt, ctx, driver, unpacked, recordErr, run)
+}
+
+// instrumentQueryRowUnpacked is instrumentQueryRow for a statement that is already unpacked — an
+// execution of a prepared [Stmt].
+func instrumentQueryRowUnpacked(t *telemetry, rtt time.Duration, ctx context.Context, driver, unpacked string, recordErr func(error) error, run func(ctx context.Context, unpacked string) *sql.Row) *Row {
 	ctx, finish := t.begin(ctx, driver, unpacked)
+	// A context that expires during the simulated round trip needs no handling of its own here: the query
+	// below is issued with that same context, so the driver surfaces the cancellation at Scan — which is
+	// where a QueryRow error surfaces in any case.
+	_ = simulateRTT(ctx, rtt)
 	return &Row{Row: run(ctx, unpacked), finish: finish, recordErr: recordErr}
+}
+
+// instrumentTxOp wraps a transaction lifecycle operation — BEGIN, COMMIT, ROLLBACK. database/sql exposes
+// these as methods rather than SQL, so there is no statement text to unpack and the operation keyword goes
+// to beginAt as the "query".
+func instrumentTxOp[T any](t *telemetry, rtt time.Duration, ctx context.Context, driver, op string, run func(ctx context.Context) (T, error)) (T, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	start := time.Now()
+	// No handling for a context cancelled during the pause: database/sql checks the context itself in all
+	// three calls, so running the call is what produces the authoritative error.
+	_ = simulateRTT(ctx, rtt)
+	res, err := run(ctx)
+	if errors.Is(err, sql.ErrTxDone) {
+		// Answered without touching the database, so there is no operation to report. Instrumenting it would
+		// stamp an error span on every cancelled Transact, whose deferred rollback lands here.
+		return res, err
+	}
+	_, finish := t.beginAt(ctx, driver, op, start)
+	finish(err)
+	return res, err
+}
+
+// instrumentTxEnd is instrumentTxOp for COMMIT and ROLLBACK, which return no value.
+func instrumentTxEnd(t *telemetry, rtt time.Duration, ctx context.Context, driver, op string, run func() error) error {
+	_, err := instrumentTxOp(t, rtt, ctx, driver, op,
+		func(context.Context) (any, error) { return nil, run() })
+	return err
 }
 
 /*
@@ -476,7 +653,7 @@ func (r *Row) Scan(dest ...any) error {
 	err := r.Row.Scan(dest...)
 	r.complete(err)
 	r.latch(err)
-	return err
+	return traceErr(err)
 }
 
 // Err shadows sql.Row.Err, finishes instrumentation with the query error, and latches it, so a caller that
@@ -488,7 +665,7 @@ func (r *Row) Err() error {
 	err := r.Row.Err()
 	r.complete(err)
 	r.latch(err)
-	return err
+	return traceErr(err)
 }
 
 // complete fires the finish func once. A Row is not meant for concurrent use, so no synchronization.

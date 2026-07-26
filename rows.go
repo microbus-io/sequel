@@ -54,7 +54,7 @@ func (r *Rows) latch(err error) {
 func (r *Rows) Scan(dest ...any) error {
 	err := r.Rows.Scan(dest...)
 	r.latch(err)
-	return err
+	return traceErr(err)
 }
 
 // Next shadows sql.Rows.Next. When iteration ends (Next returns false) it latches any streaming error
@@ -69,10 +69,21 @@ func (r *Rows) Next() bool {
 	return ok
 }
 
+// NextResultSet shadows sql.Rows.NextResultSet. Like Next, a false return latches the streaming error, so
+// a multi-result-set loop that never checks rows.Err() still aborts the transaction when advancing to the
+// next result set failed rather than ran out.
+func (r *Rows) NextResultSet() bool {
+	ok := r.Rows.NextResultSet()
+	if !ok {
+		r.latch(r.Rows.Err())
+	}
+	return ok
+}
+
 // Err shadows sql.Rows.Err and latches the streaming error, so an explicit rows.Err() check aborts the
 // transaction as well as surfacing the error to the caller.
 func (r *Rows) Err() error {
 	err := r.Rows.Err()
 	r.latch(err)
-	return err
+	return traceErr(err)
 }

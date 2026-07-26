@@ -24,6 +24,30 @@ and Scan errors into Transact (sequel.Rows)` as the model. Commit to whatever br
 out, whether that is `main` or a feature branch — do not create a new branch first, and do not switch away
 from the current one. Choosing the branch is the maintainer's decision, already made by checking it out.
 
+## Documentation
+
+Four audiences, four homes. Put each piece of writing where its reader is, and never say the same thing
+twice in two of them.
+
+- **`CLAUDE.md`** — for an agent *working on* sequel. Cross-cutting design rationale lives here: why a
+  decision was made, which alternatives were rejected and why, and invariants that span more than one file.
+  Prefer this over a long comment whenever the reasoning is not tied to one specific line.
+- **Godoc on exported packages, types, methods and functions** — for agents and users *using* sequel. State
+  the contract, the guarantees, and the caveats a caller must know; not the internal reasoning behind them.
+- **Other in-code comments** — for an agent working on sequel, at a spot where the location itself carries
+  the information: a non-obvious invariant a future edit would break, an ordering that must be preserved, a
+  subtlety of the lines immediately below. Keep them concise. If the point stands on its own away from the
+  code, it belongs in `CLAUDE.md` instead; if the code already makes it obvious, it belongs nowhere.
+- **`README.md`** — for agents and users using sequel. Task-oriented: what a feature does, how to call it,
+  what to expect. No internals.
+
+The usual failure mode is an essay in the source. Move the reasoning to `CLAUDE.md` and leave behind only
+what a reader of that line actually needs.
+
+**Never write "see CLAUDE.md" in code.** An agent working on sequel has already read this file; a pointer
+back to it carries no information and dates the moment a heading is renamed. Either the comment says the
+thing, or it says nothing and this file says the thing.
+
 ## Cross-driver timestamp precision (`NOW_UTC()`)
 
 `NOW_UTC()` is contracted to return the current UTC timestamp **at millisecond precision** on every
@@ -196,7 +220,9 @@ returns false, into the same recorded-error slot as a statement error — so the
 commit and the subsequent statements short-circuit, exactly as for a failed `Exec`. The latch fires only
 on a real error: draining a healthy result set latches a nil `rows.Err()` (no-op), and an early `break`
 (where `Next()` is still returning `true`) latches nothing — a streaming error would itself have made
-`Next()` return `false`. Outside `Transact` — a `*DB` query or a `BeginTx` `Tx` — `recordErr` is nil and
+`Next()` return `false`. `NextResultSet` latches on the same rule as `Next` — running out of result sets is
+a nil `rows.Err()` (no-op), a failed advance is not — so a multi-result-set consumer is not a side door
+around the latch. Outside `Transact` — a `*DB` query or a `BeginTx` `Tx` — `recordErr` is nil and
 `Rows` is a pure passthrough, so direct callers are unaffected (same opt-in boundary as statement
 recording). `fixtures/rows_test.go` pins both halves: an ignored `Scan` error rolls the closure's write back; a healthy
 full drain commits.
@@ -229,6 +255,81 @@ exists to prevent. Because the guard must return a `*Row` rather than an `error`
 carries the recorded error in a `shortErr` field with a **nil embedded `*sql.Row`**, and `Scan`/`Err`
 report it without touching the database or starting a span (consistent with short-circuited statements
 emitting no telemetry). `TestTransact_QueryRowShortCircuits` asserts the *first* error surfaces verbatim.
+
+### Prepared statements are inside the net (`Stmt`)
+
+A raw `*sql.Stmt` from `Tx.Prepare` was the last way out of the guarantee: the *prepare* error was
+recorded, but the statement's *executions* talked to the driver directly, so a closure that executed a
+prepared statement and ignored the error could still commit its other work on the engines that do not
+auto-abort (MySQL, SQLite). The promoted `sql.Tx.Stmt`/`StmtContext` were the same hole by another door.
+`Prepare` therefore returns a **`sequel.Stmt`** (embeds `*sql.Stmt` — same source-compat shape as `Rows`
+and `Row`), whose executions short-circuit, record errors, pay the simulated round trip, and emit
+spans/metrics exactly like a statement issued through the `Tx` — and whose `Query`/`QueryRow` hand out the
+same latching `Rows`/`Row`.
+
+`DB.Prepare` returns the same type even though there is no latch outside a transaction, because the
+`Executor` interface requires `DB` and `Tx` to agree on the signature — and because a DB-prepared statement
+is the natural argument to `Tx.Stmt`, which re-binds it (`stmt.query` carries the unpacked text; only the
+tx binding changes). This is also why `Tx.Stmt` takes a `*sequel.Stmt` rather than `*sql.Stmt`: the common
+flow `db.Prepare` → `tx.Stmt(stmt)` must keep compiling. A DB-bound `Stmt` reads telemetry and the
+simulated delay *live* per execution (matching `DB` methods); a Tx-bound one uses the transaction's
+snapshots (matching `Tx` methods, one consistent latency per transaction). `Stmt.Close` stays a
+passthrough — releasing the handle is lifecycle, not caller-facing work. Statements executed on a
+`*sql.Conn` remain outside sequel's path; that is documented, not enforced.
+
+## Error wrapping (`traceErr`)
+
+Every error sequel returns from an operation is wrapped with `errors.Trace` at the API boundary, attaching
+the stack of the failing call site. The wrapper preserves `Unwrap` and the message verbatim, so
+`errors.Is`/`errors.As`, `IsLockContentionError` (typed via `errors.As`, plus the message-substring
+fallback) and retry classification all see through it.
+
+Two exemptions, and one ordering rule, are load-bearing:
+
+- **The `database/sql` sentinels pass through bare.** `sql.ErrNoRows` and `sql.ErrTxDone` are routine
+  control flow, not failures — a stack trace on "no rows" locates nothing worth locating, and callers are
+  entitled to `err == sql.ErrNoRows`, which plain `database/sql` taught them. Wrapping would silently break
+  every such comparison downstream. The check in `traceErr` is *identity*, not `errors.Is`: only the bare
+  sentinel is ==-comparable in the first place, so a sentinel a driver has already wrapped gains a trace
+  without loss. No other error is exempt — driver errors are distinct values per occurrence, so nobody can
+  compare them with `==` even against plain `database/sql`. `TestErrors_SentinelsPassThroughUnwrapped` pins
+  the exemption; the fast path in `Tx.finalize` returns the sentinel directly for the same reason (and to
+  stay allocation-free on the `defer tx.Rollback()` idiom).
+- **Telemetry sees the raw error.** `finish(err)` runs before the wrap, so spans, metrics and the Debug log
+  record what the driver reported, not the wrapper.
+- Latches (`recordErr`, `Rows`/`Row` `latch`) may receive either form; they classify with `errors.Is`/
+  `errors.As`, so it does not matter which.
+
+## Hardening against uncontrolled input
+
+Sequel splices text into SQL, error messages, and telemetry attributes in a handful of places. The rule in
+all of them is the same one `JSON_FIELD` set: **validate against a narrow charset and reject, never
+escape** — per-dialect escaping rules are exactly the complexity a cross-driver library must not take on.
+Four places carry input sequel does not control:
+
+- **The leftover-database sweep** (`CreateTestingDatabase`) DROPs names read from the server's own
+  catalog — anyone with CREATE DATABASE rights on a shared test server can plant a name there, and the
+  name is spliced unquoted into `DROP DATABASE`. On SQL Server that splice is a batch: go-mssqldb executes
+  multi-statement text, so a database named `testing_00_x; <T-SQL>` would run arbitrary SQL under the
+  suite's credentials. `leftoverTestingDatabasePattern` therefore full-matches `^testing_[0-2][0-9]_[a-z0-9_]*$` —
+  exactly the set of names `CreateTestingDatabase` can mint (it sanitizes to `[a-z0-9_]`) — and anything
+  else is left alone. A name that fails the match is by definition not sequel's leftover, so refusing to
+  drop it costs nothing.
+- **DSNs quoted in error messages** are redacted first (`redactDataSourceName`): a DSN carries a password,
+  and parse errors end up in the caller's logs. Both credential spellings are masked — URL userinfo
+  (`://user:pass@`) and the mysql form (`user:pass@tcp(...)`), plus ADO-style `password=`/`pwd=` params.
+  The mysql pattern is greedy to the *last* `@`, mirroring how the mysql driver itself splits the DSN, so
+  a password containing `@` over-redacts rather than leaks a suffix.
+- **`db.operation.name` is bounded, not curated** — see the section below.
+- **`InsertReturnID`'s idColumn** is spliced into the statement (`RETURNING <col>` on PostgreSQL/
+  CockroachDB, `OUTPUT INSERTED.<col>` on SQL Server), so it must match `identifierPattern`
+  (`[A-Za-z_][A-Za-z0-9_]*`). It is validated on *every* driver, including MySQL/SQLite which never splice
+  it, so a bad column name fails identically everywhere instead of only on the engines that happen to use
+  it — the same portability principle as the rest of the library.
+
+Related, and already the case: pool metrics identify a pool by parsed database name, never the raw DSN;
+spans never carry statement text; the Debug log carries parameterized text only (placeholders, no argument
+values); and the virtual-function expansion cache is a bounded LRU.
 
 ## Observability (`telemetry.go`)
 
@@ -278,9 +379,54 @@ reads never lock and never see a torn value. A `*Tx` captures the pointer at beg
 `OpenSingleton`-shared `*DB` the pointer is process-wide for that pool — last writer wins — so callers are
 told to configure once from the owning caller rather than each opener racing to set its own.
 
+### `db.operation.name` is learned at runtime and capped, not enumerated
+
+The verb reported as `db.operation.name` (and used in span names) flows straight from the query's leading
+token, which is attacker-influenced in any application that interpolates input into its SQL — so it cannot
+be emitted verbatim without bounding it. Three designs were considered, and the shipped one is a hybrid,
+because each pure form fails in a way the other fixes:
+
+- A **static allowlist** is deterministic and attack-proof, but it must enumerate the real statement verbs of
+  five dialects. An 86-entry list still missed things, and every miss reports as `OTHER` until someone
+  notices. The cardinality goal never required curating a vocabulary, so the curation was pure cost.
+- **Pure runtime learning** (report the first N distinct verbs seen) needs no curation, but makes the label a
+  function of process *history* rather than of the query. Two consequences, both bad: an attacker who fills
+  the slots first pushes the application's *own* verbs into `OTHER` — inverting the failure so that
+  legitimate traffic loses its labels precisely during an incident — and the same statement can label
+  differently in two processes, which is poor ground for an alert.
+
+So: a **small seed** (`seedOperations`, ~24 verbs) reports verbatim from the first statement and can never be
+crowded out, which keeps the common labels deterministic and attack-proof; everything else is **learned on
+first sighting** up to `operationLabelCap` (128), which removes the curation burden for the long tail; past
+the cap, `OTHER`. The learner only ever affects verbs that the static design bucketed unconditionally, so
+its history-dependence is confined to cases that were strictly worse before. Verbs participating in table
+extraction are seeded deliberately — `db.collection.name` and the span name should not vary with history
+either.
+
+Two details carry most of the safety:
+
+- **Only verb-shaped tokens are learnable** (`verbPattern`, `^[A-Z][A-Z0-9_]{0,31}$`). This is what stops
+  hostile input from consuming the cap at all: injected fragments, comment prefixes and arbitrary bytes are
+  bucketed without occupying a slot, so filling the cap requires 128 distinct tokens that already look like
+  verbs. It also bounds the length of any label sequel can emit — without it, a single 10KB token would
+  become a metric attribute value and a span name.
+- **The set is package-level, and copy-on-write.** Package-level because the quantity being bounded is how
+  many distinct label values *this process* exports, which is not a per-pool property; the cost is that one
+  pool's unusual statements consume slots shared with others, which the seed makes tolerable. Copy-on-write
+  via `atomic.Pointer[map[string]bool]` plus a writer mutex — the same discipline as the virtual-function
+  registry — so the hot path stays one atomic load and one map lookup, with a clone only on a genuine first
+  sighting (at most 128 times per process).
+
+Reaching the cap is reported to the operator **once**, at Info, via `logOperationCapOnce`. That is the one
+fact the metrics cannot convey on their own: an `OTHER` data point does not distinguish "an odd statement"
+from "labels are being dropped from here on". A malformed token is deliberately *not* a cap event — filtering
+junk is normal operation, whereas exhausting the cap means the process is losing label fidelity.
+
+Statement text is unaffected by all of this: the Debug log still carries the real query verbatim.
+
 ### Spans carry operation + table, never the statement text
 
-`db.operation.name` (the leading SQL keyword) is always accurate. `db.collection.name` (the table) is
+`db.operation.name` is bounded as described above. `db.collection.name` (the table) is
 emitted **only when `parseOperation` can determine it unambiguously** — a single target after
 `FROM`/`INTO`/`UPDATE`, with no join, multi-table list, or subquery. The alternative (best-effort table
 extraction from arbitrary SQL) would produce confident-looking but wrong attributes and would inflate
@@ -301,9 +447,68 @@ Every query funnels through one `instrument(...)` wrapper, which is the *only* p
 classified for the `sequel_lock_contention` counter. Classifying opportunistically wherever
 `IsLockContentionError` happens to be called would be unreliable — that function may be called zero times or
 several times per error. `Transact` does **not** separately increment the counter; it only reads the error
-to decide whether to retry. Each failed attempt still counts exactly once (at the statement level), which is
-the correct semantics: N contended attempts → N increments. Statements short-circuited in `Transact` mode
-return before the wrapper, so they emit no span, metric, or log.
+to decide whether to retry. Each failed attempt still counts exactly once — at whichever operation failed,
+statement *or* commit — which is the correct semantics: N contended attempts → N increments. Statements
+short-circuited in `Transact` mode return before the wrapper, so they emit no span, metric, or log.
+
+### `BEGIN`, `COMMIT` and `ROLLBACK` are instrumented operations, not free
+
+All three originally went straight to the underlying `sql.DB`/`sql.Tx`, so they emitted no span and no
+`sequel_query_duration` sample. Their latency was inside the parent `transact` span's wall time but not
+broken out, so a slow commit showed up only as time in `transact` that no child span accounted for. They
+share one wrapper (`instrumentTxOp`) because `database/sql` exposes all three as methods rather than SQL —
+there is no statement text to unpack, and the operation keyword goes to `beginAt` as the "query".
+
+The sharper problem was the **contention counter**. A serialization failure very often surfaces at `COMMIT`
+rather than at a statement — that is the normal shape on CockroachDB and on PostgreSQL under `SERIALIZABLE`,
+where conflicts are detected at commit time. `Transact` retried those correctly (it reads the commit error),
+but nothing incremented `sequel_lock_contention`, because no *instrumented* operation had failed. The
+counter therefore under-reported exactly the engines whose contention it was most needed for. Routing commit
+through the same `instrument` wrapper as every statement closes that hole, and is why the wrapper — not a
+bespoke span — is the right home for it.
+
+Two details make the instrumentation honest:
+
+- **The span needs a parent, and `sql.Tx.Commit` takes no context.** `BEGIN` has the caller's context
+  passed to `BeginTx`, but a commit span hung off `context.Background()` would orphan at the root of a
+  trace, which is worse than no span. So `Tx` stores the context the transaction began with (`tx.ctx`)
+  purely to scope the end spans; `sql.Tx` stores its own context for the same reason. In `Transact` that
+  context carries the `transact` span, so all three nest alongside the statements between them. The
+  exception is a transaction from `DB.Begin()`, which has no context to offer and therefore does orphan —
+  consistent with `Tx.Exec`/`Tx.Query`, whose non-context variants already do, and unavoidable without
+  changing an API that deliberately mirrors `database/sql`. `Begin` is defined as
+  `BeginTx(context.Background(), nil)` — exactly as `sql.DB.Begin` is — so there is one instrumented path
+  rather than two.
+- **`ErrTxDone` is not an operation, and must be reported as nothing.** `sql.Tx` answers a call on an
+  already-finalized transaction with `ErrTxDone` *without a round trip*. Reporting that would stamp an error
+  span and a `status=error` duration sample for a database error that never happened. That is not a corner
+  case: a `Transact` whose context is cancelled reaches its deferred rollback *after* `database/sql`'s own
+  `awaitDone` goroutine has finalized the transaction, so every cancelled request — an ordinary client
+  disconnect — would manufacture a failed `ROLLBACK`. `instrumentTxEnd` therefore decides instrumentation
+  **after** running the call and emits nothing when the answer is `ErrTxDone`. This is why `telemetry.begin`
+  was split to expose `beginAt`: the span still has to be back-dated to the true start, so its duration
+  covers the whole operation rather than only the part after the decision.
+
+### `Tx.done` is an optimization, and only `nil` may set it
+
+`Tx.done` exists to skip the round trip, the span, and the simulated delay for `defer tx.Rollback()` next to
+a successful `Commit` — the most common transaction idiom in Go. Two properties are load-bearing, and both
+were gotten wrong in a first cut:
+
+- **Only a `nil` error sets it.** The tempting rule — mark the transaction finalized whenever a call
+  completes — is wrong, because `sql.Tx.Commit` opens with a context precheck that returns `ctx.Err()`
+  **without** finalizing (`// Check context first to avoid transaction leak`). A `Tx` that recorded itself as
+  done there would answer a subsequent `Rollback` with `ErrTxDone` where `database/sql` would have issued a
+  real `ROLLBACK` — the caller believes it released locks it still holds, which is far worse than a redundant
+  round trip. A `nil` return is the one outcome that *proves* finalization, and being conservative costs at
+  most one extra call that returns `ErrTxDone`, which is free (no round trip, and no telemetry).
+- **It is `atomic.Bool`, not `bool`.** `sql.Tx` finalizes with a compare-and-swap on an `atomic.Bool`
+  precisely so that concurrent `Commit`/`Rollback` — a watchdog goroutine rolling back on timeout while the
+  main path commits — is safe. A plain `bool` in the shadow reintroduces a data race in front of a type that
+  does not have one, turning a downstream consumer's `-race` suite red.
+
+The flag is not the correctness boundary; `sql.Tx`'s own CAS is. Two goroutines may both find `done` false
+and both call through — exactly one wins, and the loser's `ErrTxDone` is reported as nothing.
 
 ### `QueryRow` returns `*sequel.Row` to capture the deferred error
 
@@ -326,6 +531,82 @@ per-query Debug lines. The Debug lines are gated on `logger.Enabled(ctx, slog.Le
 own logger level — not a separate sequel switch — decides whether to pay for per-query logging, and the gate
 keeps the string-building cost off the hot path when Debug is disabled. `Migrate` logs at *attempt* time
 regardless of outcome, so the log shows what was tried even when the migration then fails.
+
+## Simulated network latency (`DB.SimulateRTT`, `rtt.go`)
+
+The contract is on the `SimulateRTT` godoc; this is why it has the shape it does. It exists because the
+test suite is the one place where the network is *free*: against in-memory SQLite or a server on localhost
+a round trip costs microseconds, so a loop that issues one query per element performs indistinguishably
+from one that batches, and the timeout and cancellation paths never fire.
+
+### Charged per round trip, not per call
+
+The delay is charged per *round trip*, which is what makes the number a test reads meaningful: a
+`Transact` over three statements pays it five times, because `BEGIN` and `COMMIT` are round trips too, and
+that is exactly the cost a chatty transaction imposes on a real deployment. This is why `Begin`/`BeginTx`,
+`Commit` and `Rollback` are charged at all — `Commit`/`Rollback` had no shadow before this and gained one
+(which then became the seam for instrumenting the whole transaction lifecycle — see "`BEGIN`, `COMMIT` and
+`ROLLBACK` are instrumented operations"), and `transactOnce` was switched from
+`sqlTx.Commit()`/`sqlTx.Rollback()` to the `Tx` wrappers so its own commit and rollback are charged like a
+caller's. `InsertReturnID` is one statement on
+every driver and correctly pays once, since it delegates to `ExecContext`/`QueryRowContext` rather than
+issuing anything itself. On SQL Server the count is one higher, because the `SET XACT_ABORT ON` preamble
+`transactOnce` issues is a round trip like any other; it is charged explicitly there, since it goes out on
+the raw `sql.Tx` and so bypasses the instrumented path.
+
+Executions of a prepared `Stmt` are charged like any statement — each execution is a round trip, and since
+the `Stmt` shadow exists for the no-partial-commit net, sequel is in the path anyway (a Tx-bound `Stmt`
+uses the transaction's captured delay; a DB-bound one reads the pool's current value, like `DB` methods).
+
+Three things are deliberately *not* charged. The boundary is not simply "what sequel shadows" — `Close` is
+shadowed and exempt — but "caller-facing work sequel is in the path of":
+
+- **Raw handles obtained through sequel.** A `*sql.Conn` talks to the driver directly; sequel is not in
+  the path and cannot delay it without shadowing that type too.
+- **Fetching successive rows from an open `Rows`.** Drivers batch that transfer, so charging a full round
+  trip per `Next()` would model the wire *worse* than charging nothing — it would make a 1000-row scan look
+  like 1000 round trips when the driver made a handful.
+- **Lifecycle**: `Close` on a pool or a `Stmt`, and the `DROP` that retires a testing database. Neither is
+  work a caller waits on in the code under test, and the drop already runs under a 5s budget that injected
+  latency would eat into.
+
+`Ping`/`PingContext` are the odd pair: they gained a shadow for the delay even though — unlike every other
+shadowed method — they are *not* instrumented. A ping is unambiguously a round trip, so leaving it free
+would make the contract false; but sequel has never traced a ping, and injecting latency is not a reason to
+start emitting spans for it.
+
+### The pause sits inside the span, and honors the context
+
+`instrumentExec` pauses *after* `t.begin`, so an operation's recorded duration includes the simulated
+latency. That is the point of simulating it — the numbers a test reads, in traces as well as at the call
+site, should be the ones a caller would experience. Unpacking the query is local string work, not a round
+trip, so it stays outside the pause.
+
+The pause is a `select` on a timer and `ctx.Done()`, not a `time.Sleep`. A context whose deadline is shorter
+than the simulated latency therefore fails the operation with the context's error and never reaches the
+database, which is what a real round trip that outlives its deadline does — and is what makes the feature
+useful for exercising timeout handling that a localhost server never triggers. The methods without a
+context (`Exec`, `Query`, `Begin`, `Commit`, `Rollback`, `Ping`) pause on `context.Background()`, so their
+pause always elapses.
+
+`instrumentQueryRow` is the one place that ignores the pause's error, and can: `database/sql` defers a
+`QueryRow` error to `Scan`, and the query below the pause is issued with the same expired context, so the
+driver reports the cancellation at `Scan` — where a `QueryRow` error surfaces in any case. Manufacturing a
+second path to report it would only duplicate what the driver already does correctly.
+
+### Why a setter on `*DB`, not a DSN parameter or a wrapped driver
+
+A wrapping `driver.Driver` would catch a strictly larger set of operations (including `*sql.Stmt`), but it
+has to be registered under a driver name before `sql.Open`, which pushes the decision into the DSN and out
+of the caller's reach at the moment they actually want it — inside a test, on an already-open pool. The
+setter matches the shape sequel already uses for telemetry: an atomic field on `*DB`, settable while the
+pool is in use, snapshotted into a `Tx` at begin time so a transaction runs at one consistent latency. It
+carries the same `OpenSingleton` caveat as the telemetry setters — process-wide for that pool, last writer
+wins — for the same reason.
+
+The zero value is off, and a negative duration is clamped to zero rather than wrapping into an enormous
+pause. `simulateRTT` returns immediately on a zero delay, so a production pool pays one comparison per
+operation.
 
 ## `CreateTestingDatabase` and the `SEQUEL_TESTING_DSN` fallback
 

@@ -17,6 +17,7 @@ limitations under the License.
 package sequel
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -947,4 +948,73 @@ func TestDB_InjectOutputInserted(t *testing.T) {
 	// Neither VALUES nor SELECT: error
 	_, err = injectOutputInserted("INSERT INTO foo DEFAULT VALUES_BOGUS", "id")
 	assert.Error(err)
+}
+
+// The leftover-cleanup sweep DROPs database names read from the server's own catalog — input any
+// principal with CREATE DATABASE rights can plant — spliced unquoted into the statement. The full-match
+// pattern is the injection guard: only names CreateTestingDatabase could have minted qualify.
+func TestDB_LeftoverSweepRejectsHostileNames(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	assert.True(leftoverTestingDatabasePattern.MatchString("testing_14_foo_bar_1"))
+	assert.True(leftoverTestingDatabasePattern.MatchString("testing_09_"))
+	// Anything CreateTestingDatabase could not have minted is left alone, not escaped.
+	assert.False(leftoverTestingDatabasePattern.MatchString("testing_14_x; DROP DATABASE prod"))
+	assert.False(leftoverTestingDatabasePattern.MatchString("testing_14_x--"))
+	assert.False(leftoverTestingDatabasePattern.MatchString(`testing_14_"quoted"`))
+	assert.False(leftoverTestingDatabasePattern.MatchString("testing_14_UPPER"))
+	assert.False(leftoverTestingDatabasePattern.MatchString("prod_testing_14_x"))
+	assert.False(leftoverTestingDatabasePattern.MatchString("testing_99_x"))
+}
+
+// DSNs carry passwords and error messages end up in logs, so a DSN quoted in an error must have its
+// credentials masked in every DSN dialect sequel accepts.
+func TestDB_RedactDataSourceName(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	cases := []struct{ dsn, redacted string }{
+		{"postgres://user:s3cret@127.0.0.1:5432/db", "postgres://user:***@127.0.0.1:5432/db"},
+		{"sqlserver://sa:Password123@localhost:1433?database=x", "sqlserver://sa:***@localhost:1433?database=x"},
+		{"root:s3cret@tcp(127.0.0.1:3306)/db", "root:***@tcp(127.0.0.1:3306)/db"},
+		{"root:p@ss@w0rd@tcp(127.0.0.1:3306)/db", "root:***@tcp(127.0.0.1:3306)/db"}, // greedy: '@' in the password cannot leak a suffix
+		{"server=localhost;user id=sa;password=s3cret;port=1433", "server=localhost;user id=sa;password=***;port=1433"},
+		{"Server=localhost;PWD=s3cret", "Server=localhost;PWD=***"},
+		// No credentials: unchanged.
+		{"postgres://127.0.0.1:5432/db", "postgres://127.0.0.1:5432/db"},
+		{"tcp(127.0.0.1:3306)/db", "tcp(127.0.0.1:3306)/db"},
+		{"file:test.db?mode=memory", "file:test.db?mode=memory"},
+	}
+	for _, c := range cases {
+		assert.Equal(c.redacted, redactDataSourceName(c.dsn), "for %q", c.dsn)
+	}
+}
+
+// The ID column is spliced into SQL on some drivers (RETURNING / OUTPUT INSERTED), so it is validated
+// against a narrow identifier charset on every driver — rejected up front, never escaped.
+func TestDB_InsertReturnIDRejectsInvalidColumn(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	db, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	defer db.Close()
+	_, err = db.Exec("CREATE TABLE ins_ident (id INTEGER PRIMARY KEY AUTOINCREMENT, v INT)")
+	assert.NoError(err)
+
+	ctx := context.Background()
+	for _, col := range []string{"id; DROP TABLE ins_ident", "id--", `"id"`, "[id]", "id id", ""} {
+		_, err = db.InsertReturnID(ctx, col, "INSERT INTO ins_ident (v) VALUES (?)", 1)
+		assert.Error(err, "column %q must be rejected", col)
+	}
+	id, err := db.InsertReturnID(ctx, "id", "INSERT INTO ins_ident (v) VALUES (?)", 1)
+	assert.NoError(err)
+	assert.True(id > 0)
+
+	var n int
+	assert.NoError(db.QueryRow("SELECT COUNT(*) FROM ins_ident").Scan(&n))
+	assert.Equal(1, n, "rejected calls must not have executed the statement")
 }

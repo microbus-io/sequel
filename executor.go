@@ -34,8 +34,8 @@ type Executor interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*Rows, error)
 	QueryRow(query string, args ...any) *Row
 	QueryRowContext(ctx context.Context, query string, args ...any) *Row
-	Prepare(query string) (*sql.Stmt, error)
-	PrepareContext(ctx context.Context, query string) (*sql.Stmt, error)
+	Prepare(query string) (*Stmt, error)
+	PrepareContext(ctx context.Context, query string) (*Stmt, error)
 	InsertReturnID(ctx context.Context, idColumn string, stmt string, args ...any) (int64, error)
 	DriverName() string
 	UnpackQuery(query string) (string, error)
