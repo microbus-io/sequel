@@ -392,8 +392,11 @@ Prometheus exporter appends it at the scrape boundary, so `sequel_lock_contentio
 | `sequel_pool_open_connections` | gauge | from `sql.DBStats`, attr `database` (never the raw DSN) |
 | `sequel_pool_in_use_connections` | gauge | |
 | `sequel_pool_idle_connections` | gauge | |
-| `sequel_pool_wait_count` | gauge | |
-| `sequel_pool_wait_duration_seconds` | gauge | |
+| `sequel_pool_wait_count` | gauge | cumulative total |
+| `sequel_pool_wait_duration_seconds` | gauge | cumulative total |
+
+The two `wait` gauges come straight from `sql.DBStats` and only ever increase, so query them with `rate()`
+or `increase()` rather than reading the raw value.
 
 ### Logs
 
