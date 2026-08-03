@@ -132,9 +132,9 @@ func (t *telemetry) initInstruments(db *DB) {
 		metric.WithDescription("Connections currently in use"))
 	idleConns, _ := m.Int64ObservableGauge("sequel_pool_idle_connections",
 		metric.WithDescription("Idle connections in the pool"))
-	waitCount, _ := m.Int64ObservableGauge("sequel_pool_wait_count",
+	waitCount, _ := m.Int64ObservableCounter("sequel_pool_waits",
 		metric.WithDescription("Total number of connections waited for"))
-	waitDuration, _ := m.Float64ObservableGauge("sequel_pool_wait_duration_seconds",
+	waitDuration, _ := m.Float64ObservableCounter("sequel_pool_wait_duration_seconds",
 		metric.WithUnit("s"),
 		metric.WithDescription("Total time blocked waiting for a connection, in seconds"))
 
