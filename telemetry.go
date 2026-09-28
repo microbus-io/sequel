@@ -620,8 +620,9 @@ returning false, "no row" reaches a QueryRow caller as an error and is routine c
 handles a missing row. Every other error — deadlock, type-conversion failure, connection drop — is latched.
 Outside a Transact-managed Tx, recordErr is nil and no latching occurs.
 
-As with *sql.Row, a Row whose Scan/Err is never called holds resources open — and here, leaves its span
-unended. Call Scan (or Err) exactly as you would with *sql.Row.
+Always call Scan. As with *sql.Row, only Scan releases the connection: Err ends the span and reports the
+query's error, but after a successful query the connection stays held until Scan is called. A Row that is
+never scanned therefore holds its connection, and if Err is not called either, leaves its span unended.
 */
 type Row struct {
 	*sql.Row
