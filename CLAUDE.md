@@ -176,6 +176,195 @@ TRANSACTION" — masking the original error (e.g. a deadlock) and defeating retr
 `XACT_ABORT ON`, any statement error aborts the whole transaction server-side, so the real error is the
 one that surfaces.
 
+## Statement batches (`Tx.Batch`, `batch.go`, `batchresults.go`)
+
+The contract is on the `Batch`, `BatchResults` and `Tx.Batch` godoc; this is why it has the shape it does.
+
+### A batch, not a pipelined transaction
+
+A pipeline sends statements before reading any result, so no statement in it can take an earlier one's result
+as an argument, and no Go branch can sit between them. A "begin a pipelined transaction" API would therefore
+have to forbid most of what a `Tx` closure does, or silently stop pipelining when the closure reads a result.
+A `Batch` makes the boundary explicit: the caller groups the statements that are independent, and every point
+where Go needs a result is a new batch. What pipelining saves is set by that dependency chain, not by the
+statement count.
+
+### Results are pulled in queue order, which is what makes one API work on every driver
+
+`database/sql` has no pipelining, and only the pgx drivers offer it underneath, so `Send` must also work by
+issuing statements one at a time — with the same results, so a caller has one code path and the SQLite suite
+exercises it. The reading side decides whether that is possible. A design that delivers every result at `Send`
+(handles filled in, or a per-row callback) needs each statement's rows *during* `Send` on the sequential path, so
+every row-reading caller must hand over its destinations or a callback up front; reading after `Send` instead
+would mean buffering `database/sql` rows, which needs its unexported `convertAssign`. A **pull reader** —
+`BatchResults`, read in queue order and closed, which is pgx's own `BatchResults` shape — avoids both: on the
+sequential path each statement simply runs when its result is read (`run`), from a live `*Rows` scanned by
+`database/sql`; in one round trip everything was sent already and the reads walk the buffered results. The
+sequential path is not a simulation of the pipelined one: each statement is a real statement there, instrumented,
+charged a simulated round trip, and recorded into the transaction, because each really is one. A statement never
+read still belongs to the batch, so `Close` runs it.
+
+The price is that **the transaction belongs to the batch from `Send` to `Close`**: on the sequential path a result
+set may be open, which some drivers cannot run another statement alongside (MySQL errors, others interleave), and
+on either path a statement issued between reads would land at a different point relative to the batch's own
+statements depending on the driver. `Tx.openBatch` is set for that window and `shortCircuit` — which every
+statement method and `Send` call — refuses anything but the batch's own statements (`Tx.batchExecuting`).
+`Tx.StmtContext` binds without a statement method, and binding can prepare on the connection, so it checks too and
+hands back a `Stmt` whose every execution returns the refusal. `Tx.Commit` refuses while a batch is unsent or its
+results are open, since committing would drop the statements not yet run. Refusing everywhere is what keeps the
+same code behaving the same on every driver.
+
+A row is only readable until the next read of the batch, which closes it. Rows the caller had not finished with —
+not read to the end, not closed — are marked superseded, and a later read of them reports that and dooms the
+transaction, rather than coming back empty: an empty read is what a caller takes for "nothing there", and an empty
+`QueryRow` is `sql.ErrNoRows`. Rows read to the end are not superseded, so a `rows.Err()` checked after the next
+read stays nil.
+
+### There is no `DB.Batch`
+
+PostgreSQL runs everything in a pipeline up to its sync point as **one implicit transaction**, so a batch sent
+outside any explicit transaction is atomic by itself — one round trip for a whole transaction, against three for
+`Transact` + `Tx.Batch` (`BEGIN`, the batch, `COMMIT`). A `DB.Batch` built on that is deliberately not offered,
+because only its outcome — commits iff every statement succeeds — can be kept the same on every driver:
+
+- In one round trip it commits at `Send`, before anything is read; on the sequential path it can only commit at
+  `Close`, after the reads, holding its locks across the caller's read loop.
+- In one round trip every failure is known before the first read, so it can retry on lock contention; on the
+  sequential path a statement fails after earlier results were read, which a retry cannot take back.
+- Results read before a later statement failed come from statements that rolled back on the sequential path, and
+  fail their reads in one round trip.
+- A forgotten `Close` commits in one round trip and never commits otherwise; a pipelined one holds a pool
+  connection until `Close`.
+
+It would also need a retry loop, connection handling and a transaction of its own, which is where a batch's failure
+modes concentrate. `Transact` + `Tx.Batch` has the same semantics everywhere. If the round trips matter, the way to win
+most of them back without a second set of semantics is for `Transact` to send its `BEGIN` together with the
+transaction's first statement on pgx, which would make `Transact` + `Tx.Batch` two round trips. If the implicit
+transaction is ever used again, its preconditions apply: pgx keeps it in every batch mode (the cache and describe
+modes' executes share one Sync, after any cold prepare's own round trip; `exec` mode sends one `ExecBatch`;
+simple-protocol mode one multi-statement query), CockroachDB only while
+`enable_implicit_transaction_for_batch_statements` is on, and on PostgreSQL a statement that cannot run in a
+transaction block, or an explicit `BEGIN`/`COMMIT`/`SAVEPOINT`, breaks it.
+
+### A transaction-shaped batch would be consistent only if it were write-only
+
+Merging the transaction into the batch — begin, queue, commit as one unit — is `DB.Batch` again, and the question
+that decides it is whether the caller needs to run code between sending and committing. A caller that reads results
+to decide what to do next (inserted ids, affected counts, whether to roll back, follow-up statements that depend on
+them) does, and that is what `Transact` + `Tx.Batch` exists for: control has to come back to Go before the commit.
+
+A caller that does not need it could be served consistently, but only by a **write-only** batch: statements queued,
+then one `Commit` that sends them all, commits iff every statement succeeds, and returns each statement's affected
+count or the first error. Every inconsistency listed above comes from reading rows while the commit point differs by
+driver, and a write-only batch reads none: in one round trip it is the implicit transaction; elsewhere it is `BEGIN`,
+each statement and `COMMIT`, all inside `Commit`. It commits when `Commit` returns on every driver, holds no locks
+across caller code because there is none, can retry on lock contention on every driver because nothing was read
+before a failure, and returns plain integers, so the scan-conversion difference does not arise. The limit is the
+point: no `RETURNING`, no `SELECT` — the moment results are needed, it is `Tx.Batch`.
+
+It is not offered because no caller has needed it yet; it is easy to add later and would leave `Tx.Batch` unchanged.
+If one is added, keep it write-only — accepting a row-returning statement would bring back every difference above.
+
+### Reaching the pgx connection, and what may run while it is borrowed
+
+`sql.Tx` does not expose its driver connection. `Transact` therefore begins its transaction on a held `sql.Conn` on
+the pgx drivers (`beginTx` with `hold` set), and a batch reaches the `*pgx.Conn` through `Conn.Raw` while the
+transaction is open. `Conn.BeginTx` and `Conn.Raw` both take the `Conn`'s read lock, and the per-call driver mutex
+serializes `Raw` against the transaction's own statements. pgx's `database/sql` driver runs a transaction as a
+plain server-side `BEGIN` on that same connection, so a batch sent there runs inside it. Checking out the `Conn` is
+the same pool operation `BeginTx` performs, and sits inside the `BEGIN` span as `BeginTx`'s own pool wait does;
+neither `DB.BeginTx` nor `Conn.BeginTx` retries a dead connection at `BEGIN`, since pgx reports it as a plain
+network error rather than `driver.ErrBadConn`. **The `Conn` must be closed after the transaction ends**:
+`Conn.Close` waits for an open transaction, so `transactOnce` defers the close before the rollback (defers run
+last-in first-out).
+
+Three standing constraints come from the borrow, each with the failure it prevents:
+
+- **No caller code is invited inside `Raw`.** `Raw` holds the driver mutex every statement on the connection
+  takes, so a statement issued from inside it waits forever — and so does the context-cancellation rollback, which
+  needs the same mutex. So `pipeline` only *reads*: every statement's rows are copied as raw values
+  (`bufferResult`, copied because pgx reuses its buffers) along with its affected count, and the caller scans them
+  with `pgx.ScanRow` after `Raw` returns, using the connection's type map. Argument `driver.Valuer`s are the one
+  piece of caller code that does run inside — pgx encodes arguments there — which is parity with `database/sql`,
+  whose argument conversion runs under the same mutex.
+- **A panic must not escape `Raw`.** `Raw`'s cleanup closes the `Conn` on a panic, and closing a `Conn` waits for
+  its open transaction, which only the panicking goroutine could end — so the panic would hang instead of
+  propagating. `pipeline` recovers, closes the pgx connection (it may be mid-pipeline, and a closed one is discarded
+  by the pool), returns an error from `Raw`, and re-panics after. A panicking argument Valuer is what reaches it;
+  `TestBatch_PanicInArgument` hangs without the recover.
+- **The server's transaction state is checked before sending.** A closure that ended its transaction
+  (`tx.Rollback()`) and then sent a batch would find the borrowed connection idle, and the batch would autocommit
+  outside any transaction. `pipeline` returns `sql.ErrTxDone` when the connection reports `TxStatus` idle, and maps
+  the `sql.ErrConnDone` of a connection `database/sql` discarded on cancellation to the same, as the sequential path
+  reports both. `TestBatch_SendAfterRollback` fails without the check.
+
+The type map is the connection's, so nothing may scan with it once the connection could be back in the pool. Rows
+are scanned only while the batch is open, which is only while the transaction is; ending the transaction with the
+results still open (`Tx.Rollback`, and so `transactOnce`'s deferred rollback) calls `BatchResults.abandon`, which
+closes them and drops the buffered rows.
+
+A `BeginTx` transaction does not hold a `Conn`, so its batches run statement by statement. Holding one there would
+make the caller's `Commit`/`Rollback` responsible for releasing it, including on the paths where `database/sql`
+finalizes the transaction itself after a cancelled context — the bookkeeping is not worth it when `Transact` is the
+path that wants speed.
+
+### A batch is inside the no-partial-commit net
+
+Every way a batch can fail reaches `Tx.recordErr` (`BatchResults.fail` records into the transaction): a statement
+error, a scan error (including a superseded read), a panic out of a statement (an argument Valuer — `run` notes that
+its statement never returned), and misuse. A pipelined statement's failure is recorded when a read or `Close`
+reaches it in queue order, as on the sequential path: recording it at `Send` would fail the reads of the statements
+before it, which succeeded. Once a `Transact` transaction is doomed — by a scan error, say — every later read and
+`Close` report it, on either path (`doomed`, checked by `advance` and `Close`). Misuse is the easy one to leave out,
+and each case is work that would otherwise silently not happen in a transaction that commits: a second `Send`, a
+statement queued after `Send`, a batch never sent (`Tx.unsentBatches`), and results never closed (`Tx.openBatch`
+still set) — `transactOnce`, and `Tx.Commit` itself, refuse to commit while either is outstanding. A batch on an
+already-doomed transaction short-circuits like any statement: `Send` touches nothing, and its reads and `Close`
+return the recorded error verbatim, which is why `fail` keeps an error the transaction already recorded as recorded
+and traces any other once, when it is stored. `sql.ErrNoRows` from a `QueryRow` is the one outcome that is not a
+failure, for the same reason `Row` exempts it. Reading past the last statement, or after `Close`, is an error of the
+read, not of a statement, and is not recorded.
+
+`Close` releases the transaction however it ends — its unread statements run inside it, and one whose argument
+panics would otherwise leave the transaction refusing every statement — so `abandon` is deferred.
+
+Arguments are positional. `database/sql` unwraps a `sql.NamedArg` for the driver and pgx's `Batch.Queue` does not,
+so a named argument would work on one path and fail on the other; `Send` rejects it up front instead.
+`sql.RawBytes` is rejected as a `QueryRow` destination for the reason `sql.Row` rejects it: the row is closed before
+the caller could read the bytes.
+
+### What differs when pipelined, and why it is documented rather than hidden
+
+- **Pre-execution failures fail the whole batch.** In pgx's default statement-cache mode every statement not yet
+  cached is prepared before any executes, and every argument is encoded before anything is sent, so a missing
+  table, a syntax error or an argument it cannot encode is reported before the statements queued ahead of it have
+  run, and their reads report it too; a virtual function that fails to expand is likewise caught before anything is
+  sent. In `exec` and simple-protocol modes nothing is prepared first, and such a failure arrives in order. A
+  failure while executing (a duplicate key) leaves the earlier statements run within the transaction, as on the
+  sequential path. Either way the transaction is doomed. `TestBatch_ParseFailure` (asserting the earlier
+  statement's outcome per driver) and `TestBatch_RuntimeFailure` pin the two shapes; do not "fix" the parse case
+  into agreement, since that would mean giving up the pipeline.
+- **Rows are scanned with pgx's conversions, not `database/sql`'s.** pgx's `database/sql` driver keeps its value
+  conversion internal, so a destination is filled by pgx's scan plans. They cover the ordinary destinations but
+  refuse some conversions `database/sql`'s `convertAssign` performs, and a `*any` receives pgx's native types (a
+  UUID as `[16]byte`, a NUMERIC as `pgtype.Numeric`, JSON decoded). Vendoring `convertAssign` would not close the
+  gap on its own, since it needs `driver.Value`s that only pgx's internal conversion produces.
+- **Rows are held in memory until read**; every statement's rows are buffered, since `Send` cannot know which reads
+  will ask for them. Closing a result, and closing the batch, drops them.
+- **The first use of a statement text costs an extra round trip** on each connection, to prepare it; pgx's
+  statement cache makes later uses one round trip. And any batch error invalidates pgx's cached statements for that
+  batch, so the next use — the rollback that follows, or a retry — pays to deallocate and re-prepare them. Both
+  are uncharged by `SimulateRTT`, and both are failure- or first-use-only costs.
+
+### Telemetry
+
+A pipelined batch is one round trip, so it is one operation: a `BATCH` span and duration sample, with
+`db.operation.batch.size`, rather than a span per statement whose start and end would all be the same instant. The
+attribute is set only when sequel started the span (`telemetry.tracing`); otherwise the span in the context is the
+application's. Each batched statement still gets its Debug log line, since the span carries no text. `BATCH` is
+seeded so the label is deterministic. A sequential batch is ordinary statements and is instrumented as such.
+`TestBatch_Telemetry` pins both.
+
 ## `Tx` error recording and short-circuit
 
 In `Transact` mode (and only then — `BeginTx` callers are unaffected) a `Tx` records the **first**
@@ -553,6 +742,12 @@ every driver and correctly pays once, since it delegates to `ExecContext`/`Query
 issuing anything itself. On SQL Server the count is one higher, because the `SET XACT_ABORT ON` preamble
 `transactOnce` issues is a round trip like any other; it is charged explicitly there, since it goes out on
 the raw `sql.Tx` and so bypasses the instrumented path.
+
+A `Batch` is charged by what it really costs on the wire: a pipelined `Send` pays the delay once, and a
+sequential one pays it per statement, because it issues them through the `Tx` methods. That difference is the
+point of the feature, and `TestBatch_OneRoundTripOnPostgres` uses the simulation to assert it. (The prepare round
+trip pgx makes the first time a statement text is used on a connection is not charged; the test warms the
+statements first.)
 
 Executions of a prepared `Stmt` are charged like any statement — each execution is a round trip, and since
 the `Stmt` shadow exists for the no-partial-commit net, sequel is in the path anyway (a Tx-bound `Stmt`

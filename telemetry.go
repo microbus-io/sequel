@@ -100,6 +100,12 @@ func (t *telemetry) enabled() bool {
 	return t != nil
 }
 
+// tracing reports whether begin starts a span, so a caller adding attributes to it does not land them on a
+// span of the application's instead.
+func (t *telemetry) tracing() bool {
+	return t.enabled() && t.tracer != nil
+}
+
 // initInstruments creates the sequel_ metric instruments and registers the connection-pool gauge callback
 // against the current meter. It is called under db.mutex when a MeterProvider is set. Instrument
 // construction errors are ignored: the OTEL API returns a working no-op instrument alongside the error, so
@@ -360,7 +366,7 @@ const operationLabelCap = 128
 var seedOperations = []string{
 	"SELECT", "INSERT", "UPDATE", "DELETE", "REPLACE", "MERGE", "UPSERT", "WITH",
 	"CREATE", "DROP", "ALTER", "TRUNCATE",
-	"BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT",
+	"BEGIN", "COMMIT", "ROLLBACK", "SAVEPOINT", "BATCH",
 	"SET", "PRAGMA", "USE",
 	"SHOW", "EXPLAIN", "ANALYZE",
 	"CALL", "EXEC",

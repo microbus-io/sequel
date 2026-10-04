@@ -21,6 +21,8 @@ import (
 	"database/sql"
 	"sync/atomic"
 	"time"
+
+	"github.com/microbus-io/errors"
 )
 
 // Tx is an in-progress database transaction that shadows sql.Tx methods
@@ -45,6 +47,16 @@ type Tx struct {
 	// — can parent their spans to the transaction. sql.Tx stores its context for the same reason.
 	ctx context.Context
 	t   *telemetry // observability snapshot taken when the transaction began (may be nil)
+	// conn is the connection the transaction runs on, held by Transact on the pgx drivers so a [Batch] can
+	// reach the driver connection and pipeline; nil otherwise, and Batch then sends statement by statement.
+	conn *sql.Conn
+	// unsentBatches counts batches queued on this transaction and not yet sent; Transact refuses to commit
+	// while it is nonzero, since their statements would silently never run.
+	unsentBatches int
+	// openBatch is the batch whose results are being read, during which the transaction refuses every statement
+	// but the batch's own (batchExecuting).
+	openBatch      *BatchResults
+	batchExecuting bool
 }
 
 // recordErr remembers the first statement error in Transact (autoErr) mode and returns err unchanged,
@@ -56,8 +68,12 @@ func (tx *Tx) recordErr(err error) error {
 	return err
 }
 
-// shortCircuit reports the recorded error when the transaction has already failed in autoErr mode.
+// shortCircuit reports the recorded error when the transaction has already failed in autoErr mode, and refuses
+// any statement while a batch's results are open.
 func (tx *Tx) shortCircuit() error {
+	if tx.openBatch != nil && !tx.batchExecuting {
+		return tx.recordErr(errors.New("a statement cannot be issued while a batch's results are open"))
+	}
 	if tx.autoErr {
 		return tx.err
 	}
@@ -189,6 +205,13 @@ func (tx *Tx) Stmt(stmt *Stmt) *Stmt {
 
 // StmtContext shadows sql.Tx.StmtContext (see Stmt).
 func (tx *Tx) StmtContext(ctx context.Context, stmt *Stmt) *Stmt {
+	if stmt.err != nil {
+		return &Stmt{query: stmt.query, driverName: tx.driverName, tx: tx, err: stmt.err}
+	}
+	if tx.openBatch != nil && !tx.batchExecuting {
+		// Binding may prepare on the connection, which an open batch's result set may still be using.
+		return &Stmt{query: stmt.query, driverName: tx.driverName, tx: tx, err: tx.shortCircuit()}
+	}
 	// The statement text was unpacked for the same pool, so it carries over; only the binding changes.
 	return &Stmt{Stmt: tx.Tx.StmtContext(ctx, stmt.Stmt), query: stmt.query, driverName: tx.driverName, tx: tx}
 }
@@ -205,15 +228,38 @@ and pays no delay. Return values are identical to sql.Tx throughout.
 
 Behavior is otherwise unchanged, including in Transact mode: Transact decides whether to commit before
 calling this, and a commit error is not recorded into [Tx.Err].
+
+Commit refuses, without committing, while a [Batch] of the transaction is queued and not sent or its results are
+not closed: committing then would drop its statements not yet run.
 */
 func (tx *Tx) Commit() error {
+	if err := tx.batchPending(); err != nil {
+		return err
+	}
 	return tx.finalize("COMMIT", tx.Tx.Commit)
+}
+
+// batchPending reports a batch of this transaction that would be lost by committing now: one queued and never
+// sent, or one whose results were never closed, whose unread statements would never run.
+func (tx *Tx) batchPending() error {
+	if tx.unsentBatches > 0 {
+		return errors.New("a batch was queued but never sent")
+	}
+	if tx.openBatch != nil {
+		return errors.New("a batch's results were never closed")
+	}
+	return nil
 }
 
 // Rollback shadows sql.Tx.Rollback for the same reasons as [Tx.Commit], and handles an already-finalized
 // transaction the same way. A rollback is a round trip whether or not anything went right, so it is
 // instrumented while the transaction unwinds after a failure too.
 func (tx *Tx) Rollback() error {
+	if tx.openBatch != nil {
+		// The transaction is ending, so its batch's results can no longer be read: rows scanned later would use
+		// the type map of a connection back in the pool.
+		tx.openBatch.abandon()
+	}
 	return tx.finalize("ROLLBACK", tx.Tx.Rollback)
 }
 
@@ -234,6 +280,16 @@ func (tx *Tx) finalize(op string, run func() error) error {
 	}
 	// traceErr keeps ErrTxDone bare — whichever path answered it — so == comparisons keep working.
 	return traceErr(err)
+}
+
+// Batch returns an empty [Batch] of statements to send to the database together within this transaction.
+//
+// From Send until the results are closed the transaction belongs to the batch: any other statement on it fails,
+// and it does not commit. In a transaction run by [DB.Transact], a failed statement of the batch, or a failed scan,
+// is recorded like any failed statement, so the transaction rolls back even if the error is ignored; a batch
+// queued but never sent, or whose results are never closed, keeps the transaction from committing.
+func (tx *Tx) Batch() *Batch {
+	return &Batch{tx: tx}
 }
 
 // InsertReturnID executes an INSERT statement and returns the auto-generated ID for the named ID column.

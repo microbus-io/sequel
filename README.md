@@ -14,6 +14,7 @@ A Go library that enhances `database/sql` with cross-driver SQL, schema migratio
 - **Schema migration** - Concurrency-safe, incremental database migrations
 - **Cross-driver support** - MySQL, PostgreSQL, CockroachDB, SQL Server, and SQLite with unified API
 - **Retrying transactions** - `Transact` runs a closure in a transaction, retries on deadlock/lock contention, and never commits partial work
+- **Statement batches** - `tx.Batch` sends a transaction's independent statements together and reads their results in order: one round trip on PostgreSQL and CockroachDB, statement by statement elsewhere, same code either way
 - **Ephemeral test databases** - Isolated databases per test with automatic cleanup, with optional simulated network latency
 
 ## Quick Start
@@ -259,10 +260,75 @@ err := db.Transact(ctx, func(tx *sequel.Tx) error {
 ```
 
 - **Retry-safe by re-running.** A retried attempt re-executes the closure from the start in a new transaction (the previous attempt is rolled back), so the closure must be safe to run more than once — any non-transactional side effects it performs may repeat. Because retries re-run the Go code rather than replay recorded statements, a transaction whose control flow depends on data committed by another transaction between attempts stays correct.
-- **No partial commits.** The `Tx` passed to the closure records the first error and short-circuits every statement after it, so the transaction never commits half its work even if the closure forgets to check an error. This covers every way an error surfaces: a failed `Exec`/`Query`/`InsertReturnID` statement, an error while iterating a result set (a `rows.Scan` failure or a streaming error from `rows.Err()`), a failed `QueryRow(...).Scan` — with `sql.ErrNoRows` exempt, since a missing row is normal control flow rather than a failure — and executions of a prepared statement, whether prepared inside the transaction (`tx.Prepare`) or bound to it (`tx.Stmt`).
+- **No partial commits.** The `Tx` passed to the closure records the first error and short-circuits every statement after it, so the transaction never commits half its work even if the closure forgets to check an error. This covers every way an error surfaces: a failed `Exec`/`Query`/`InsertReturnID` statement, an error while iterating a result set (a `rows.Scan` failure or a streaming error from `rows.Err()`), a failed `QueryRow(...).Scan` — with `sql.ErrNoRows` exempt, since a missing row is normal control flow rather than a failure — executions of a prepared statement, whether prepared inside the transaction (`tx.Prepare`) or bound to it (`tx.Stmt`), and every failure or misuse of a batch: a failed statement or scan, and a batch never sent or never closed (`tx.Batch`, see [Statement Batches](#statement-batches)).
 - **SQL Server `XACT_ABORT ON`.** Applied automatically inside `Transact` so any statement error aborts the whole transaction server-side.
 
 A `Tx` from `BeginTx` does neither error-recording nor retry — it behaves exactly like `sql.Tx`.
+
+## Statement Batches
+
+A transaction is usually a chain of round trips, one per statement. When several statements in a transaction do
+not need each other's *results* — only each other's *effects*, or nothing at all — queue them in a `Batch`, send
+them together, then read their results in queue order, the way pgx reads a batch:
+
+```go
+err := db.Transact(ctx, func(tx *sequel.Tx) error {
+    b := tx.Batch()
+    b.Queue("UPDATE accounts SET balance = balance - ? WHERE id = ? AND balance >= ?", amt, from, amt)
+    b.Queue("INSERT INTO ledger (account_id, amount) VALUES (?, ?)", from, -amt)
+    b.Queue("SELECT balance FROM accounts WHERE id = ?", from)
+
+    res := b.Send(ctx)
+    defer res.Close()
+    debit, err := res.Exec() // a sql.Result
+    if err != nil {
+        return err
+    }
+    if n, _ := debit.RowsAffected(); n == 0 {
+        return errors.New("insufficient funds") // rolls back the ledger row too
+    }
+    if _, err := res.Exec(); err != nil {
+        return err
+    }
+    var balance int
+    if err := res.QueryRow().Scan(&balance); err != nil {
+        return err
+    }
+    return res.Close() // the first failure, if anything failed
+})
+```
+
+In a transaction run by `Transact` on PostgreSQL and CockroachDB, the batch goes out in one round trip; the
+transaction's `BEGIN` and `COMMIT` are round trips of their own. On the other drivers, and in a transaction from
+`BeginTx`, each statement runs as its result is read — so the same code runs everywhere and reads its results the
+same way. (The few differences are listed below.)
+
+- **Reading results.** `Exec` returns a `sql.Result`; `QueryRow` returns a row to `Scan`, as with `sql.Row`, with
+  `sql.ErrNoRows` when there is none; `Query` returns rows read like `sql.Rows` (`Next`, `Scan`, `Err`, `Columns`,
+  `Close`). Reading a statement closes the rows of the one before it: rows abandoned that way report an error when
+  read, rather than coming back empty.
+- **Always `Close`.** It runs any statement not read yet and returns the first failure. From `Send` until `Close`
+  the transaction belongs to the batch: any other statement on it fails, and the transaction does not commit.
+- **Failures.** A failed statement's read returns its error, and so does every read after it. Inside `Transact`,
+  any failure — a statement's, a `Scan`'s, or a misuse such as a batch never sent or never closed — rolls the
+  transaction back, even if the closure ignores the error.
+- **In order.** A later statement sees the effects of an earlier one. A batch cannot pass one statement's result
+  into another's arguments; that needs the result back first, which is what a second batch is for.
+- **Positional arguments only**; `sql.NamedArg` is rejected. Statements that control the transaction (`BEGIN`,
+  `COMMIT`, `SAVEPOINT`) do not belong in a batch.
+
+When the batch is one round trip:
+
+- **PostgreSQL prepares the whole batch first** (in pgx's default statement-cache mode), so a statement rejected
+  before anything runs — a syntax error, a missing table, an argument it cannot encode — fails every read,
+  including those of the statements queued before it. A failure while running, such as a duplicate key, fails
+  only its read and those after it.
+- **Rows are held in memory** until read, so a very large result set belongs in a plain query. They are scanned
+  with the PostgreSQL driver's own conversions, which are stricter than `database/sql`'s about cross-type
+  conversions (a `SMALLINT` into a `bool`, a number into a `string`), and a `*any` destination receives the
+  driver's own Go types. Scan into the Go type the column holds.
+- The first time a statement's text is used on a connection, PostgreSQL also prepares it, which is one more round
+  trip; after that it is cached.
 
 ## Ephemeral Test Databases
 
@@ -375,6 +441,8 @@ The span name is `"{operation} {table}"` (e.g. `SELECT users`), or just the oper
 
 `BEGIN`, `COMMIT` and `ROLLBACK` are round trips too, so each gets its own span, nested under the transaction it belongs to. This matters beyond bookkeeping: a serialization failure surfaces at commit time rather than at a statement on CockroachDB and on PostgreSQL under `SERIALIZABLE`, so a commit span is what puts that failure into `sequel_query_duration` and `sequel_lock_contention`.
 
+A batch sent in one round trip is one span, `BATCH`, with `db.operation.batch.size` for the number of statements. A batch whose statements run one by one gets a span per statement.
+
 A call on an already-finalized transaction reports `sql.ErrTxDone` without reaching the database, and correspondingly emits **nothing** — no span, no duration sample. That covers the ubiquitous `defer tx.Rollback()` next to a successful `Commit`, and equally the transaction that `database/sql` finalized itself when its context was cancelled, so a cancelled request does not show up as a failed rollback.
 
 ### Metrics
@@ -403,7 +471,7 @@ or `increase()` rather than reading the raw value.
 The library **does not log operation errors** — every error is returned to the caller, who is best placed to log it. Logging is reserved for:
 
 - **Info** — one-off events: each schema migration as it is attempted (regardless of outcome).
-- **Debug** — every query, including the full parameterized statement text. There is no separate sequel switch: the lines are gated on your own logger's level, so they cost nothing when Debug is disabled. (Statement text is never a privacy risk — sequel always parameterizes, so the text carries `?`/`$1` placeholders, never argument values.)
+- **Debug** — every query, including the full parameterized statement text, and each statement of a batch sent in one round trip. There is no separate sequel switch: the lines are gated on your own logger's level, so they cost nothing when Debug is disabled. (Statement text is never a privacy risk — sequel always parameterizes, so the text carries `?`/`$1` placeholders, never argument values.)
 
 ### `Query`, `QueryRow` and `Prepare` return `*sequel.Rows` / `*sequel.Row` / `*sequel.Stmt`
 

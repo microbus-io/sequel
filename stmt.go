@@ -44,6 +44,9 @@ type Stmt struct {
 	driverName string
 	db         *DB // for a DB-prepared Stmt: telemetry and simulated delay are read live per execution
 	tx         *Tx // for a Tx-bound Stmt: latch, short-circuit and snapshots come from the transaction
+	// err is set on a Stmt that could not be bound to its transaction, and is what every execution returns; the
+	// embedded *sql.Stmt is then nil.
+	err error
 }
 
 // telemetry is the observability to instrument an execution with: the transaction's snapshot when bound
@@ -66,10 +69,21 @@ func (s *Stmt) rttDelay() time.Duration {
 
 // shortCircuit mirrors Tx.shortCircuit for a transaction-bound statement, and is a no-op otherwise.
 func (s *Stmt) shortCircuit() error {
+	if s.err != nil {
+		return s.err
+	}
 	if s.tx != nil {
 		return s.tx.shortCircuit()
 	}
 	return nil
+}
+
+// Close shadows sql.Stmt.Close, so a Stmt that was never bound is safe to close.
+func (s *Stmt) Close() error {
+	if s.Stmt == nil {
+		return nil
+	}
+	return s.Stmt.Close()
 }
 
 // recordErr mirrors Tx.recordErr for a transaction-bound statement, and returns err unchanged otherwise.

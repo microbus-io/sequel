@@ -617,27 +617,50 @@ func (db *DB) Begin() (*Tx, error) {
 // BeginTx starts a transaction with the given options and returns a sequel.Tx that
 // applies virtual function expansion and placeholder conforming.
 func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
-	sqlTx, rtt, err := db.beginTx(ctx, opts)
+	sqlTx, _, rtt, err := db.beginTx(ctx, false, opts)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 	return &Tx{Tx: sqlTx, driverName: db.driverName, rtt: rtt, ctx: ctx, t: db.telemetry.Load()}, nil
 }
 
-// beginTx opens the underlying transaction under a BEGIN span, returning the simulated delay captured for
-// the transaction's lifetime alongside it so every statement and the eventual COMMIT run at one latency.
-func (db *DB) beginTx(ctx context.Context, opts *sql.TxOptions) (*sql.Tx, time.Duration, error) {
+// beginTx opens the underlying transaction under a BEGIN span, returning the simulated delay captured for the
+// transaction's lifetime alongside it, so every statement and the eventual COMMIT run at one latency. With hold
+// set it begins on a connection it checks out and returns, so the caller can reach the driver connection under
+// the transaction; the caller closes that Conn after the transaction ends. The checkout sits inside the BEGIN
+// span, where BeginTx's own pool wait sits.
+func (db *DB) beginTx(ctx context.Context, hold bool, opts *sql.TxOptions) (*sql.Tx, *sql.Conn, time.Duration, error) {
 	rtt := db.rtt()
+	var conn *sql.Conn
 	sqlTx, err := instrumentTxOp(db.telemetry.Load(), rtt, ctx, db.driverName, "BEGIN",
 		func(ctx context.Context) (*sql.Tx, error) {
-			return db.DB.BeginTx(ctx, opts)
+			if !hold {
+				return db.DB.BeginTx(ctx, opts)
+			}
+			c, err := db.DB.Conn(ctx)
+			if err != nil {
+				return nil, err
+			}
+			sqlTx, err := c.BeginTx(ctx, opts)
+			if err != nil {
+				_ = c.Close()
+				return nil, err
+			}
+			conn = c
+			return sqlTx, nil
 		})
-	return sqlTx, rtt, err
+	return sqlTx, conn, rtt, err
 }
 
 // transactMaxAttempts bounds how many times Transact reruns a transaction that keeps losing to lock
 // contention before giving up and returning the last error.
 const transactMaxAttempts = 8
+
+// transactBackoff sleeps before retry attempt n, jittered so callers that lost the same deadlock do not retry
+// in lockstep.
+func transactBackoff(n int) {
+	time.Sleep(time.Duration(n)*time.Millisecond + time.Duration(rand.IntN(3))*time.Millisecond)
+}
 
 // Transact runs fn inside a transaction, committing on success and rolling back on error. If the
 // transaction fails on lock contention or a deadlock, it is retried with a short jittered backoff.
@@ -653,7 +676,7 @@ func (db *DB) Transact(ctx context.Context, fn func(tx *Tx) error) (err error) {
 	defer func() { finish(attempts, err) }()
 	for attempt := range transactMaxAttempts {
 		if attempt > 0 {
-			time.Sleep(time.Duration(attempt)*time.Millisecond + time.Duration(rand.IntN(3))*time.Millisecond)
+			transactBackoff(attempt)
 		}
 		attempts++
 		err = db.transactOnce(ctx, fn)
@@ -667,12 +690,19 @@ func (db *DB) Transact(ctx context.Context, fn func(tx *Tx) error) (err error) {
 
 // transactOnce executes one attempt of a Transact: begin, run fn, commit, rolling back on any failure.
 func (db *DB) transactOnce(ctx context.Context, fn func(tx *Tx) error) error {
-	sqlTx, rtt, err := db.beginTx(ctx, nil)
+	// On the pgx drivers the transaction begins on a held connection, so a Batch can reach the driver
+	// connection under it and pipeline. Checking one out is the same pool operation BeginTx performs.
+	sqlTx, conn, rtt, err := db.beginTx(ctx, physicalDriverName(db.driverName) == "pgx", nil)
 	if err != nil {
 		return errors.Trace(err)
 	}
+	if conn != nil {
+		// Deferred before the rollback below, so it runs after it: closing a Conn waits for its transaction to
+		// end.
+		defer conn.Close()
+	}
 	// ctx carries the transact span, so the COMMIT/ROLLBACK spans nest under it like the statements do.
-	tx := &Tx{Tx: sqlTx, driverName: db.driverName, autoErr: true, rtt: rtt, ctx: ctx, t: db.telemetry.Load()}
+	tx := &Tx{Tx: sqlTx, driverName: db.driverName, autoErr: true, rtt: rtt, ctx: ctx, t: db.telemetry.Load(), conn: conn}
 	committed := false
 	defer func() {
 		if !committed {
@@ -680,10 +710,7 @@ func (db *DB) transactOnce(ctx context.Context, fn func(tx *Tx) error) error {
 		}
 	}()
 	if db.driverName == "mssql" {
-		// XACT_ABORT ON makes any statement error abort the whole transaction server-side, so a deadlock
-		// or constraint failure cannot leave the transaction in a half-applied, committable state.
-		_ = simulateRTT(ctx, rtt) // a round trip like any other; an expired context is reported by the Exec
-		if _, err := sqlTx.ExecContext(ctx, "SET XACT_ABORT ON"); err != nil {
+		if err := setXactAbort(ctx, sqlTx, rtt); err != nil {
 			return errors.Trace(err)
 		}
 	}
@@ -693,11 +720,22 @@ func (db *DB) transactOnce(ctx context.Context, fn func(tx *Tx) error) error {
 	if tx.err != nil {
 		return errors.Trace(tx.err)
 	}
+	if err := tx.batchPending(); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return errors.Trace(err)
 	}
 	committed = true
 	return nil
+}
+
+// setXactAbort turns on SQL Server's XACT_ABORT for a transaction, so any statement error aborts the whole
+// transaction server-side and a deadlock or constraint failure cannot leave it half-applied and committable.
+func setXactAbort(ctx context.Context, sqlTx *sql.Tx, rtt time.Duration) error {
+	_ = simulateRTT(ctx, rtt) // a round trip like any other; an expired context is reported by the Exec
+	_, err := sqlTx.ExecContext(ctx, "SET XACT_ABORT ON")
+	return err
 }
 
 // InsertReturnID executes an INSERT statement and returns the auto-generated ID for the named ID column.
