@@ -88,8 +88,8 @@ Two dialects need work to keep it, and both are the kind of thing this library e
   `null` returns the four-character *string* `'null'`, not SQL NULL — while PostgreSQL `#>>`, SQLite
   `json_extract` and SQL Server `JSON_VALUE` all return NULL. The expansion therefore guards with
   `CASE WHEN JSON_TYPE(...) = 'NULL' THEN NULL ELSE JSON_UNQUOTE(...) END`. This matters more than it looks:
-  a JSON `null` is a common tombstone encoding (dwarf uses it for deleted state fields), so an engine that
-  silently turns it into the string `"null"` corrupts a delete into a write.
+  a JSON `null` is a common tombstone encoding (marking a deleted field in a stored document), so an engine
+  that silently turns it into the string `"null"` corrupts a delete into a write.
 - **SQL Server has no single function that spans the types.** `JSON_VALUE` sees scalars and returns NULL for
   an object/array; `JSON_QUERY` sees objects/arrays and returns NULL for a scalar. Neither alone is the
   contract, so the expansion is `COALESCE(JSON_QUERY(...), JSON_VALUE(...))`.
@@ -398,9 +398,9 @@ statement is *issued*. It did **not** originally cover the errors that surface *
 set*: a mid-stream `rows.Scan` failure or a streaming error reported by `rows.Err()` (a connection drop
 mid-fetch, a type-conversion failure on a row). Those are invisible to the issuing call, so a closure that
 looped over rows and forgot to check `rows.Err()` could build state from a **truncated read** and commit
-it — the one hole in the "a closure that ignores an error can never commit half its work" promise. This is
-the failure class an upstream consumer (dwarf) hit: a fan-in step committed with partially-merged state
-because a cohort-scan loop dropped a row error.
+it — the one hole in the "a closure that ignores an error can never commit half its work" promise. It is not
+hypothetical: a consumer committed state merged from a partial read, because a loop over a result set dropped a
+row error.
 
 `Query`/`QueryContext` therefore return a **`sequel.Rows`** (embeds `*sql.Rows`, so `for rows.Next() {
 rows.Scan(...) }` / `rows.Err()` / `rows.Close()` are unchanged — same source-compat shape as `Row`). In
@@ -421,7 +421,8 @@ full drain commits.
 `Row` (from `QueryRow`) carries the same latch, for the same reason: a closure that drops a
 `QueryRow(...).Scan` error can otherwise commit work built on a row it never read. The argument that it
 need not — that a `QueryRow` error is checked at the call site rather than deferred behind an iteration
-loop — is weaker than it looks, since `if err != nil { /* skip */ }` reproduces the dwarf failure exactly.
+loop — is weaker than it looks, since `if err != nil { /* skip */ }` reproduces the truncated-read failure above
+exactly.
 
 The asymmetry with `Rows` is not *whether* to latch but *what*. `Rows` can latch unconditionally because an
 empty result set is `Next()` returning false, never an error. For `Row`, "no row" arrives **as an error** —
@@ -809,8 +810,8 @@ operation.
 **neither** a driver nor a base DSN, it falls back to the `SEQUEL_TESTING_DSN` environment variable (unset →
 SQLite in-memory) and infers the driver from it. This is what lets the same test suite run against every
 supported server without touching test code — CI sets the variable per provider, one job each — and it is
-inherited by any *upstream* consumer that builds its ephemeral test databases through sequel (e.g. dwarf):
-they get the env-var redirect for free, no plumbing of their own.
+inherited by any consumer that builds its ephemeral test databases through sequel: it gets the env-var
+redirect for free, with no plumbing of its own.
 
 The non-obvious part is *why the fallback is gated on an empty driver too*, not just an empty DSN. A caller
 that passes a driver name — even with an empty DSN, which only asks for that driver's localhost default — has
