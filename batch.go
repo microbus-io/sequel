@@ -288,6 +288,11 @@ type bufferedRows struct {
 }
 
 func (r *bufferedRows) Next() bool {
+	if r.next > 0 && r.next <= len(r.rows) {
+		// A row is scanned only while it is current, so the one being left is released: a large result is then
+		// held raw only until the caller has read past each row, not until the batch closes.
+		r.rows[r.next-1] = nil
+	}
 	if r.next >= len(r.rows) {
 		// Exhausted: a later Scan is an error, as it is on sql.Rows, not a re-read of the last row.
 		r.next = len(r.rows) + 1

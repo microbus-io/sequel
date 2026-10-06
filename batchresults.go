@@ -158,7 +158,9 @@ func (r *BatchResults) Query() (*BatchRows, error) {
 	}
 	var src rowSource
 	if r.pipelined {
+		// The reader takes the rows over, so that closing it, or reading past each row, releases them.
 		src = &bufferedRows{typeMap: r.typeMap, fields: it.fields, rows: it.rows}
+		it.rows = nil
 	} else {
 		var rows *Rows
 		err = r.run(func() (err error) {

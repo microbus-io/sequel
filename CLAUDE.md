@@ -350,7 +350,11 @@ the caller could read the bytes.
   UUID as `[16]byte`, a NUMERIC as `pgtype.Numeric`, JSON decoded). Vendoring `convertAssign` would not close the
   gap on its own, since it needs `driver.Value`s that only pgx's internal conversion produces.
 - **Rows are held in memory until read**; every statement's rows are buffered, since `Send` cannot know which reads
-  will ask for them. Closing a result, and closing the batch, drops them.
+  will ask for them. Each row is released as the reader moves past it - `Query` hands a statement's rows to its
+  reader (`batchItem.rows` is cleared) and `bufferedRows.Next` drops the row it leaves - so a caller that decodes
+  as it reads holds a large result raw and decoded only one row at a time. Closing a result, and closing the
+  batch, drops what is left. Keep that hand-off: a second reference from the batch would hold every row until
+  the batch closes, which is pinned by `TestBatch_QueryHandsRowsToReader`.
 - **The first use of a statement text costs an extra round trip** on each connection, to prepare it; pgx's
   statement cache makes later uses one round trip. And any batch error invalidates pgx's cached statements for that
   batch, so the next use — the rollback that follows, or a retry — pays to deallocate and re-prepare them. Both

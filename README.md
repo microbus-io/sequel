@@ -323,7 +323,8 @@ When the batch is one round trip:
   before anything runs — a syntax error, a missing table, an argument it cannot encode — fails every read,
   including those of the statements queued before it. A failure while running, such as a duplicate key, fails
   only its read and those after it.
-- **Rows are held in memory** until read, so a very large result set belongs in a plain query. They are scanned
+- **Rows are held in memory** until read - each row is released once read past - so a very large result set
+  belongs in a plain query. They are scanned
   with the PostgreSQL driver's own conversions, which are stricter than `database/sql`'s about cross-type
   conversions (a `SMALLINT` into a `bool`, a number into a `string`), and a `*any` destination receives the
   driver's own Go types. Scan into the Go type the column holds.
