@@ -852,6 +852,25 @@ that never closes — a test binary that panicked — leaves the database in use
 that block-until-it-gives-up state. Since the drop is best-effort either way (errors are swallowed, and
 `CreateTestingDatabase` sweeps leftovers on the next run), waiting longer buys nothing.
 
+### A SQLite testing database is pinned by an anchor connection
+
+An in-memory SQLite database exists only while a connection to it is open, so "closing the last connection is
+the drop" — and a pool can close every connection it holds while its handle stays open. `SetMaxIdleConns(0)`
+does it outright. A pool shrink does it under concurrency: `database/sql` refuses a returned connection while
+`numOpen > maxOpen` but decrements `numOpen` only later, in `finalClose`, outside the pool lock, so connections
+returned together all see the old count and all close. The next statement then opens a fresh, empty database.
+Measured downstream as `no such table` mid-test in ~half of a consumer's full `-race` runs, wherever a pool was
+cut to two connections while several were in use.
+
+So `retainTestingDatabase` opens one connection of its own — a separate `*sql.DB`, outside every handle's pool,
+capped at one — with a SQLite testing database's first handle, and `maybeDropTestingDatabase` closes it with the
+last. The database's life is then exactly the handle refcount's, which is the contract the server drivers
+already keep with their `DROP`. Do not pin through a handle's own pool (an idle-connection floor, a held
+`*sql.Conn`): the pool's limits are the consumer's to set, and a held connection counts against them. Pinned by
+`TestDB_TestingDatabaseOutlivesItsConnections`.
+
+A plain in-memory SQLite DSN that is not a testing database is not anchored: its lifetime is the caller's.
+
 ### Unit tests in the root package, integration tests under `fixtures/`
 
 Tests that only exercise pure logic — DSN parsing, placeholder conforming, virtual-function string expansion,

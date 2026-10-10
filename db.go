@@ -61,6 +61,10 @@ var (
 	// testingDBKeys maps a testing database name to its testingDSNs cache key, so dropping
 	// the database can evict the DSN that named it.
 	testingDBKeys = map[string]string{}
+	// testingAnchors holds one connection, outside every handle's pool, to each live SQLite testing
+	// database. An in-memory database is dropped with its last connection, and a pool may close all of
+	// its connections while its handle stays open.
+	testingAnchors = map[string]*sql.DB{}
 
 	// insertSourceClausePattern matches the start of an INSERT statement's source clause - either
 	// VALUES (INSERT ... VALUES (...)) or SELECT (INSERT ... SELECT ...). MSSQL's OUTPUT INSERTED
@@ -118,6 +122,11 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	err = retainTestingDatabase(driverName, dataSourceName)
+	if err != nil {
+		sqlDB.Close()
+		return nil, errors.Trace(err)
+	}
 	db = &DB{
 		DB:             sqlDB,
 		driverName:     driverName,
@@ -125,7 +134,6 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 		refCount:       1,
 	}
 	db.telemetry.Store(newDefaultTelemetry(db))
-	retainTestingDatabase(driverName, dataSourceName)
 	return db, nil
 }
 
@@ -172,12 +180,16 @@ func OpenSingleton(driverName string, dataSourceName string) (db *DB, err error)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
+	// Only on this branch, not the coalescing one above: the extra callers share this *DB.
+	err = retainTestingDatabase(driverName, dataSourceName)
+	if err != nil {
+		sqlDB.Close()
+		return nil, errors.Trace(err)
+	}
 	singletonDB.DB = sqlDB
 	singletonDB.refCount = 1
 	singletonDB.telemetry.Store(newDefaultTelemetry(singletonDB))
 	singletonDB.adjustConnectionLimits()
-	// Only on this branch, not the coalescing one above: the extra callers share this *DB.
-	retainTestingDatabase(driverName, dataSourceName)
 	return singletonDB, nil
 }
 
@@ -341,22 +353,38 @@ func testingDatabaseNameOf(driverName string, dsn string) (string, bool) {
 	return databaseName, true
 }
 
-// retainTestingDatabase records one more handle on the testing database the DSN names.
-// Call it once per *DB that will eventually run maybeDropTestingDatabase.
-func retainTestingDatabase(driverName string, dsn string) {
+// retainTestingDatabase records one more handle on the testing database the DSN names, and pins a SQLite
+// testing database with an anchor connection when this is its first handle. Call it once per *DB that will
+// eventually run maybeDropTestingDatabase.
+func retainTestingDatabase(driverName string, dsn string) error {
 	databaseName, ok := testingDatabaseNameOf(driverName, dsn)
 	if !ok {
-		return
+		return nil
 	}
 	testingGlobalMutex.Lock()
+	defer testingGlobalMutex.Unlock()
+	if testingDBRefs[databaseName] == 0 && driverName == "sqlite" {
+		anchor, err := sql.Open(physicalDriverName(driverName), dsn)
+		if err != nil {
+			return errors.Trace(err)
+		}
+		anchor.SetMaxOpenConns(1)
+		anchor.SetMaxIdleConns(1)
+		err = anchor.Ping()
+		if err != nil {
+			anchor.Close()
+			return errors.Trace(err)
+		}
+		testingAnchors[databaseName] = anchor
+	}
 	testingDBRefs[databaseName]++
-	testingGlobalMutex.Unlock()
+	return nil
 }
 
 // maybeDropTestingDatabase releases this handle on the database backing this *DB if its
 // name has the testing prefix produced by [CreateTestingDatabase], and drops the database
 // once the last handle is gone. Errors are swallowed: the leftover-DB sweep on the next
-// test run is the safety net. No-op for SQLite (in-memory).
+// test run is the safety net. For SQLite (in-memory), closing the anchor connection is the drop.
 func (db *DB) maybeDropTestingDatabase() {
 	dbName, ok := testingDatabaseNameOf(db.driverName, db.dataSourceName)
 	if !ok {
@@ -367,6 +395,12 @@ func (db *DB) maybeDropTestingDatabase() {
 	last := testingDBRefs[dbName] <= 0
 	if last {
 		delete(testingDBRefs, dbName)
+		// Close under the mutex: a retainTestingDatabase that ran before the close would anchor
+		// this database instead of minting a fresh one.
+		if anchor, ok := testingAnchors[dbName]; ok {
+			anchor.Close()
+			delete(testingAnchors, dbName)
+		}
 		// The cached DSN names a database that is about to stop existing, so evict it and let
 		// the next CreateTestingDatabase caller mint it afresh.
 		if cacheKey, ok := testingDBKeys[dbName]; ok {
@@ -378,7 +412,6 @@ func (db *DB) maybeDropTestingDatabase() {
 	if !last {
 		return
 	}
-	// SQLite testing databases are in-memory: closing the last connection is the drop.
 	if db.driverName == "sqlite" {
 		return
 	}

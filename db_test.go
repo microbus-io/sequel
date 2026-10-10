@@ -887,6 +887,33 @@ func TestDB_TestingDatabaseReprovisionsAfterFullClose(t *testing.T) {
 	assert.NoError(err, "the table must not already exist - a stale database would still hold it")
 }
 
+// An in-memory SQLite testing database lives as long as a handle is open, not as long as its pool happens to hold
+// a connection. A pool may close every connection it has while the handle stays open - shrinking its limits under
+// concurrent returns does, and so does dropping the idle cap - and SQLite drops an in-memory database with its last
+// connection.
+func TestDB_TestingDatabaseOutlivesItsConnections(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	db, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	defer db.Close()
+	_, err = db.Exec("CREATE TABLE outlives_t (x INT)")
+	assert.NoError(err)
+	_, err = db.Exec("INSERT INTO outlives_t (x) VALUES (1)")
+	assert.NoError(err)
+
+	// Close every connection the pool holds; the next statement opens a fresh one.
+	db.SetMaxIdleConns(0)
+	assert.Equal(0, db.Stats().OpenConnections)
+
+	var n int
+	assert.NoError(db.QueryRow("SELECT COUNT(*) FROM outlives_t").Scan(&n), "the database was dropped with the pool's last connection")
+	assert.Equal(1, n)
+}
+
 // An ordinary DSN is neither counted nor dropped.
 func TestDB_NonTestingDSNIsNotTracked(t *testing.T) {
 	t.Parallel()
