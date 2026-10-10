@@ -1294,7 +1294,13 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 	}
 	_, err = db.Exec(stmt)
 	if err != nil {
-		return errors.Trace(err)
+		// Concurrent first runs race this CREATE: the existence check precedes the catalog insert, so a loser
+		// fails on a duplicate although the table now exists. Proceed if it does.
+		var n int
+		if db.QueryRow(`SELECT COUNT(*) FROM sequel_migrations WHERE 1=0`).Scan(&n) != nil {
+			return errors.Trace(err)
+		}
+		err = nil
 	}
 
 	// Query for the high watermark
@@ -1360,8 +1366,9 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		case "pgx", "cockroachdb":
 			stmt = `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?) ON CONFLICT DO NOTHING`
 		case "mssql":
+			// HOLDLOCK: without it, concurrent MERGEs can all see no match and all insert
 			stmt = `
-			MERGE sequel_migrations AS tgt
+			MERGE sequel_migrations WITH (HOLDLOCK) AS tgt
 			USING (SELECT ? AS seq_name, ? AS seq_num) AS src
 				ON tgt.seq_name = src.seq_name AND tgt.seq_num = src.seq_num
 			WHEN NOT MATCHED BY TARGET THEN

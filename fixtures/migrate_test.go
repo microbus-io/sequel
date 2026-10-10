@@ -17,8 +17,10 @@ limitations under the License.
 package fixtures
 
 import (
+	"sync"
 	"testing"
 
+	"github.com/microbus-io/sequel"
 	"github.com/microbus-io/sequel/testdata"
 	"github.com/microbus-io/testarossa"
 )
@@ -68,4 +70,48 @@ func TestMigrate_Idempotent(t *testing.T) {
 	var second int
 	assert.NoError(db.QueryRow("SELECT COUNT(id) FROM foo").Scan(&second))
 	assert.Equal(4, second)
+}
+
+// TestMigrate_ConcurrentFirstRun starts several Migrates at once on an empty database, as a fleet rolled out
+// together onto a new database does. They race to create the sequel_migrations table before any migration lease
+// exists, and every one must succeed.
+func TestMigrate_ConcurrentFirstRun(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	testingDSN, err := sequel.CreateTestingDatabase("", "", t.Name())
+	if !assert.NoError(err) {
+		return
+	}
+	// A pool each, so each Migrate runs in its own session, as separate replicas do.
+	dbs := make([]*sequel.DB, 8)
+	for i := range dbs {
+		dbs[i], err = sequel.Open("", testingDSN)
+		if !assert.NoError(err) {
+			return
+		}
+		defer dbs[i].Close()
+		assert.NoError(dbs[i].Ping()) // Connect up front, so the Migrates start together
+	}
+
+	start := make(chan struct{})
+	errs := make([]error, len(dbs))
+	var wg sync.WaitGroup
+	for i, db := range dbs {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs[i] = db.Migrate(t.Name(), testdata.FS)
+		}()
+	}
+	close(start)
+	wg.Wait()
+	for _, err := range errs {
+		assert.NoError(err)
+	}
+
+	var count int
+	assert.NoError(dbs[0].QueryRow("SELECT COUNT(id) FROM foo").Scan(&count))
+	assert.Equal(4, count)
 }
