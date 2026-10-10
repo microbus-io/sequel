@@ -43,7 +43,7 @@ const instrumentationName = "github.com/microbus-io/sequel"
 telemetry holds the observability wiring derived from the caller-supplied providers and is referenced by
 a *DB (and handed to each *Tx). It is intentionally immutable once stored: the setters on *DB build a new
 telemetry value under lock and swap it in atomically, so the hot path reads a single atomic pointer and
-never takes a lock. A nil *telemetry is the zero-overhead path — every method below is nil-safe so that a
+never takes a lock. A nil *telemetry is the zero-overhead path - every method below is nil-safe so that a
 DB without any provider does no extra work beyond one nil check.
 
 Spans follow OpenTelemetry database semantic conventions (db.system.name, db.operation.name,
@@ -183,7 +183,7 @@ begin starts instrumentation for a single query-shaped operation and returns a (
 carrying the span plus a finish func to call with the operation's error. query is the executed (unpacked)
 SQL; its leading keyword and, when unambiguous, its table become the db.operation.name / db.collection.name
 attributes and the span name. The finish func records duration, classifies lock contention, sets the span
-status, and — when the logger is enabled at Debug level — emits a Debug log. Safe to call on a nil
+status, and - when the logger is enabled at Debug level - emits a Debug log. Safe to call on a nil
 *telemetry (no-op).
 */
 func (t *telemetry) begin(ctx context.Context, driver, query string) (context.Context, func(err error)) {
@@ -360,7 +360,7 @@ const operationLabelCap = 128
 // Seeding matters for more than convenience: a seeded verb is deterministic (its label never depends on
 // what the process happened to see first) and cannot be crowded out of the learned set, so the labels an
 // ordinary application depends on survive even while something else is filling the cap with junk. The verbs
-// participating in table extraction below are seeded for the same reason — db.collection.name and the span
+// participating in table extraction below are seeded for the same reason - db.collection.name and the span
 // name should not vary with history either. Rarer verbs are deliberately absent: the learner picks them up
 // on first use, which is what keeps this list from needing to enumerate five dialects.
 var seedOperations = []string{
@@ -383,8 +383,8 @@ var verbPattern = regexp.MustCompile(`^[A-Z][A-Z0-9_]{0,31}$`)
 // of an immutable snapshot, so the hot path never locks; a first sighting clones-then-swaps under the mutex.
 // This is the same copy-on-write discipline as the virtual function registry, for the same reason.
 //
-// It is package-level rather than per-DB because the quantity being bounded — how many distinct label
-// values this process exports — is a property of the process, not of one pool. That does mean a pool
+// It is package-level rather than per-DB because the quantity being bounded - how many distinct label
+// values this process exports - is a property of the process, not of one pool. That does mean a pool
 // issuing unusual statements consumes slots shared with every other pool; acceptable, since the seed
 // protects the labels that matter and the cap is far above any curated workload.
 type operationLabels struct {
@@ -413,7 +413,7 @@ func (o *operationLabels) label(token string) string {
 		return token
 	}
 	if !verbPattern.MatchString(token) {
-		// Not verb-shaped, so not learnable — and deliberately not a cap event: filtering junk is normal,
+		// Not verb-shaped, so not learnable - and deliberately not a cap event: filtering junk is normal,
 		// whereas exhausting the cap is worth telling an operator about.
 		return operationOther
 	}
@@ -528,7 +528,7 @@ func isIdentDelim(c byte) bool {
 
 // instrumentExec wraps an Exec/Query/Prepare-shaped operation: it unpacks the query once, opens a span,
 // pauses for the simulated round-trip time (see [DB.SimulateRTT]; normally zero), runs the operation, and
-// finishes instrumentation with the result error. The operation error is wrapped by traceErr — the stack
+// finishes instrumentation with the result error. The operation error is wrapped by traceErr - the stack
 // is attached around the raw error, so driver error types stay intact for IsLockContentionError and the
 // database/sql sentinels pass through untouched.
 func instrumentExec[T any](t *telemetry, rtt time.Duration, ctx context.Context, driver, query string, run func(ctx context.Context, unpacked string) (T, error)) (T, error) {
@@ -542,7 +542,7 @@ func instrumentExec[T any](t *telemetry, rtt time.Duration, ctx context.Context,
 	return instrumentUnpacked(t, rtt, ctx, driver, unpacked, run)
 }
 
-// instrumentUnpacked is instrumentExec for a statement that is already unpacked — an execution of a
+// instrumentUnpacked is instrumentExec for a statement that is already unpacked - an execution of a
 // prepared [Stmt], whose text was expanded and conformed once at Prepare time.
 //
 // The pause sits inside the span rather than before it, so an operation's recorded duration includes the
@@ -571,18 +571,18 @@ func instrumentQueryRow(t *telemetry, rtt time.Duration, ctx context.Context, dr
 	return instrumentQueryRowUnpacked(t, rtt, ctx, driver, unpacked, recordErr, run)
 }
 
-// instrumentQueryRowUnpacked is instrumentQueryRow for a statement that is already unpacked — an
+// instrumentQueryRowUnpacked is instrumentQueryRow for a statement that is already unpacked - an
 // execution of a prepared [Stmt].
 func instrumentQueryRowUnpacked(t *telemetry, rtt time.Duration, ctx context.Context, driver, unpacked string, recordErr func(error) error, run func(ctx context.Context, unpacked string) *sql.Row) *Row {
 	ctx, finish := t.begin(ctx, driver, unpacked)
 	// A context that expires during the simulated round trip needs no handling of its own here: the query
-	// below is issued with that same context, so the driver surfaces the cancellation at Scan — which is
+	// below is issued with that same context, so the driver surfaces the cancellation at Scan - which is
 	// where a QueryRow error surfaces in any case.
 	_ = simulateRTT(ctx, rtt)
 	return &Row{Row: run(ctx, unpacked), finish: finish, recordErr: recordErr}
 }
 
-// instrumentTxOp wraps a transaction lifecycle operation — BEGIN, COMMIT, ROLLBACK. database/sql exposes
+// instrumentTxOp wraps a transaction lifecycle operation - BEGIN, COMMIT, ROLLBACK. database/sql exposes
 // these as methods rather than SQL, so there is no statement text to unpack and the operation keyword goes
 // to beginAt as the "query".
 func instrumentTxOp[T any](t *telemetry, rtt time.Duration, ctx context.Context, driver, op string, run func(ctx context.Context) (T, error)) (T, error) {
@@ -623,7 +623,7 @@ streamed read, so a closure that ignores a QueryRow error cannot commit work bui
 [sql.ErrNoRows] is deliberately exempt: unlike a Rows iteration, where an empty result set is simply Next
 returning false, "no row" reaches a QueryRow caller as an error and is routine control flow
 (`if err == sql.ErrNoRows { ...default... }`). Latching it would doom every transaction that legitimately
-handles a missing row. Every other error — deadlock, type-conversion failure, connection drop — is latched.
+handles a missing row. Every other error - deadlock, type-conversion failure, connection drop - is latched.
 Outside a Transact-managed Tx, recordErr is nil and no latching occurs.
 
 Always call Scan. As with *sql.Row, only Scan releases the connection: Err ends the span and reports the
@@ -642,7 +642,7 @@ type Row struct {
 	done     bool
 }
 
-// latch records a non-nil error into the owning transaction, when there is one. sql.ErrNoRows is exempt —
+// latch records a non-nil error into the owning transaction, when there is one. sql.ErrNoRows is exempt -
 // see the type doc.
 func (r *Row) latch(err error) {
 	if err != nil && !errors.Is(err, sql.ErrNoRows) && r.recordErr != nil {
@@ -684,7 +684,7 @@ func (r *Row) complete(err error) {
 }
 
 // databaseAttr derives a low-cardinality, credential-free pool identifier for pool metrics: the database
-// name when it can be parsed, falling back to the driver name. The raw DSN is never used — it carries
+// name when it can be parsed, falling back to the driver name. The raw DSN is never used - it carries
 // credentials.
 func databaseAttr(driver, dsn string) string {
 	if name, err := databaseNameFromDataSourceName(driver, dsn); err == nil && name != "" {

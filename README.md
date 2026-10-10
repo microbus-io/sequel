@@ -39,18 +39,18 @@ Sequel exposes two constructors so the connection-pool strategy is self-document
 - **`Open(driver, dsn)`** returns a fresh `*DB` with its own pool. Each call returns a distinct instance; sequel does not coalesce by DSN and does not size the pool automatically. The standard `database/sql` defaults apply (unlimited open, 2 idle) until the caller adjusts them with `SetMaxOpenConns` / `SetMaxIdleConns`. Use this for a single heavy consumer (e.g. a long-running worker pool) where you want to size the pool to the workload.
 
 - **`OpenSingleton(driver, dsn)`** returns a coalesced `*DB`: multiple calls with the same `(driver, dsn)` share one `*sql.DB` and one connection pool. Sequel automatically sizes that pool based on the number of openers using a sqrt-based formula:
-  - `maxIdle ≈ sqrt(N)` where N is the number of openers
-  - `maxOpen ≈ (sqrt(N) * 2) + 2`
+  - `maxIdle ~= sqrt(N)` where N is the number of openers
+  - `maxOpen ~= (sqrt(N) * 2) + 2`
 
-  This is the right choice when many parts of the same process each open the same DSN occasionally — the pool grows gently with the number of openers and no caller has to think about pool sizing.
+  This is the right choice when many parts of the same process each open the same DSN occasionally - the pool grows gently with the number of openers and no caller has to think about pool sizing.
 
 ```go
-// Single heavy consumer — caller manages the pool.
+// Single heavy consumer - caller manages the pool.
 db, err := sequel.Open("", dsn)
 db.SetMaxOpenConns(32)
 db.SetMaxIdleConns(8)
 
-// Multiple consumers sharing a DSN — sequel manages one pool across them.
+// Multiple consumers sharing a DSN - sequel manages one pool across them.
 db, err := sequel.OpenSingleton("", dsn)
 ```
 
@@ -91,7 +91,7 @@ ALTER TABLE users ALTER COLUMN email NVARCHAR(384) NOT NULL;
 
 Sequel supports MySQL, PostgreSQL, CockroachDB, SQL Server, and SQLite through a unified API. Write your SQL once using MySQL-style `?` placeholders and virtual functions, and Sequel automatically adapts queries for the active driver.
 
-CockroachDB speaks the PostgreSQL wire protocol and shares the `pgx` driver, but it is exposed as a distinct driver name (`cockroachdb`) because callers may need to branch on Cockroach-specific behavior — retry semantics and async schema changes in particular. Internally, every PostgreSQL expansion (placeholders, virtual functions, DSN parsing) applies identically to `cockroachdb`.
+CockroachDB speaks the PostgreSQL wire protocol and shares the `pgx` driver, but it is exposed as a distinct driver name (`cockroachdb`) because callers may need to branch on Cockroach-specific behavior - retry semantics and async schema changes in particular. Internally, every PostgreSQL expansion (placeholders, virtual functions, DSN parsing) applies identically to `cockroachdb`.
 
 ### Automatic Placeholder Conversion
 
@@ -180,9 +180,9 @@ The return contract is the same on every driver:
 db.Query("SELECT JSON_FIELD(doc, '$.name') FROM users WHERE JSON_FIELD(doc, '$.address.city') = ?", city)
 ```
 
-The path supports member access and array indexes (`$.a.b`, `$.tags[0]`). The JSONPath `$` root is **optional** — `'$.name'` and `'name'` are the same path — so a path copied from the MySQL, SQLite or SQL Server documentation works as-is, and you can leave the `$` off when writing one yourself.
+The path supports member access and array indexes (`$.a.b`, `$.tags[0]`). The JSONPath `$` root is **optional** - `'$.name'` and `'name'` are the same path - so a path copied from the MySQL, SQLite or SQL Server documentation works as-is, and you can leave the `$` off when writing one yourself.
 
-The path must be a **literal**, not a `?` placeholder — PostgreSQL needs it as an array of keys and SQL Server needs it split across two functions, so it has to be known before the query is bound. Member names are restricted to `[A-Za-z_][A-Za-z0-9_]*`. The column expression is referenced twice on MySQL and SQL Server, so it must not itself contain a `?`.
+The path must be a **literal**, not a `?` placeholder - PostgreSQL needs it as an array of keys and SQL Server needs it split across two functions, so it has to be known before the query is bound. Member names are restricted to `[A-Za-z_][A-Za-z0-9_]*`. The column expression is referenced twice on MySQL and SQL Server, so it must not itself contain a `?`.
 
 > **SQL Server caps scalars at 4000 characters.** `JSON_VALUE` returns `NVARCHAR(4000)` and yields `NULL` for anything longer, so on SQL Server a JSON *string* over 4000 characters reads back as `NULL`. Objects and arrays are unaffected (they go through `JSON_QUERY`, which is `NVARCHAR(MAX)`), as is every other driver. Lifting the cap requires an `OPENJSON ... WITH` rowset, which is a different statement shape than a virtual function can expand into; select the whole column and extract in Go if you need large scalars there.
 
@@ -237,7 +237,7 @@ expanded, err := db.UnpackQuery("SELECT * FROM t WHERE updated_at > DATE_ADD_MIL
 id, err := db.InsertReturnID(ctx, "id", "INSERT INTO users (name, email) VALUES (?, ?)", name, email)
 ```
 
-The ID column must be a plain identifier matching `[A-Za-z_][A-Za-z0-9_]*`. Because it is spliced into the statement on PostgreSQL, CockroachDB, and SQL Server, quoted or exotic column names are rejected up front — on every driver, so the contract is uniform.
+The ID column must be a plain identifier matching `[A-Za-z_][A-Za-z0-9_]*`. Because it is spliced into the statement on PostgreSQL, CockroachDB, and SQL Server, quoted or exotic column names are rejected up front - on every driver, so the contract is uniform.
 
 ### DriverName()
 
@@ -245,7 +245,7 @@ The ID column must be a plain identifier matching `[A-Za-z_][A-Za-z0-9_]*`. Beca
 
 ## Transactions
 
-`db.BeginTx` returns a `sequel.Tx` that shadows `sql.Tx` with virtual-function expansion and placeholder conforming — use it exactly like `sql.Tx`.
+`db.BeginTx` returns a `sequel.Tx` that shadows `sql.Tx` with virtual-function expansion and placeholder conforming - use it exactly like `sql.Tx`.
 
 For transactions that must survive contention, `db.Transact` runs a closure in a transaction, commits on success, and **retries the whole closure on a deadlock or lock-contention error** with a short jittered backoff:
 
@@ -259,16 +259,16 @@ err := db.Transact(ctx, func(tx *sequel.Tx) error {
 })
 ```
 
-- **Retry-safe by re-running.** A retried attempt re-executes the closure from the start in a new transaction (the previous attempt is rolled back), so the closure must be safe to run more than once — any non-transactional side effects it performs may repeat. Because retries re-run the Go code rather than replay recorded statements, a transaction whose control flow depends on data committed by another transaction between attempts stays correct.
-- **No partial commits.** The `Tx` passed to the closure records the first error and short-circuits every statement after it, so the transaction never commits half its work even if the closure forgets to check an error. This covers every way an error surfaces: a failed `Exec`/`Query`/`InsertReturnID` statement, an error while iterating a result set (a `rows.Scan` failure or a streaming error from `rows.Err()`), a failed `QueryRow(...).Scan` — with `sql.ErrNoRows` exempt, since a missing row is normal control flow rather than a failure — executions of a prepared statement, whether prepared inside the transaction (`tx.Prepare`) or bound to it (`tx.Stmt`), and every failure or misuse of a batch: a failed statement or scan, and a batch never sent or never closed (`tx.Batch`, see [Statement Batches](#statement-batches)).
+- **Retry-safe by re-running.** A retried attempt re-executes the closure from the start in a new transaction (the previous attempt is rolled back), so the closure must be safe to run more than once - any non-transactional side effects it performs may repeat. Because retries re-run the Go code rather than replay recorded statements, a transaction whose control flow depends on data committed by another transaction between attempts stays correct.
+- **No partial commits.** The `Tx` passed to the closure records the first error and short-circuits every statement after it, so the transaction never commits half its work even if the closure forgets to check an error. This covers every way an error surfaces: a failed `Exec`/`Query`/`InsertReturnID` statement, an error while iterating a result set (a `rows.Scan` failure or a streaming error from `rows.Err()`), a failed `QueryRow(...).Scan` - with `sql.ErrNoRows` exempt, since a missing row is normal control flow rather than a failure - executions of a prepared statement, whether prepared inside the transaction (`tx.Prepare`) or bound to it (`tx.Stmt`), and every failure or misuse of a batch: a failed statement or scan, and a batch never sent or never closed (`tx.Batch`, see [Statement Batches](#statement-batches)).
 - **SQL Server `XACT_ABORT ON`.** Applied automatically inside `Transact` so any statement error aborts the whole transaction server-side.
 
-A `Tx` from `BeginTx` does neither error-recording nor retry — it behaves exactly like `sql.Tx`.
+A `Tx` from `BeginTx` does neither error-recording nor retry - it behaves exactly like `sql.Tx`.
 
 ## Statement Batches
 
 A transaction is usually a chain of round trips, one per statement. When several statements in a transaction do
-not need each other's *results* — only each other's *effects*, or nothing at all — queue them in a `Batch`, send
+not need each other's *results* - only each other's *effects*, or nothing at all - queue them in a `Batch`, send
 them together, then read their results in queue order, the way pgx reads a batch:
 
 ```go
@@ -300,7 +300,7 @@ err := db.Transact(ctx, func(tx *sequel.Tx) error {
 
 In a transaction run by `Transact` on PostgreSQL and CockroachDB, the batch goes out in one round trip; the
 transaction's `BEGIN` and `COMMIT` are round trips of their own. On the other drivers, and in a transaction from
-`BeginTx`, each statement runs as its result is read — so the same code runs everywhere and reads its results the
+`BeginTx`, each statement runs as its result is read - so the same code runs everywhere and reads its results the
 same way. (The few differences are listed below.)
 
 - **Reading results.** `Exec` returns a `sql.Result`; `QueryRow` returns a row to `Scan`, as with `sql.Row`, with
@@ -310,7 +310,7 @@ same way. (The few differences are listed below.)
 - **Always `Close`.** It runs any statement not read yet and returns the first failure. From `Send` until `Close`
   the transaction belongs to the batch: any other statement on it fails, and the transaction does not commit.
 - **Failures.** A failed statement's read returns its error, and so does every read after it. Inside `Transact`,
-  any failure — a statement's, a `Scan`'s, or a misuse such as a batch never sent or never closed — rolls the
+  any failure - a statement's, a `Scan`'s, or a misuse such as a batch never sent or never closed - rolls the
   transaction back, even if the closure ignores the error.
 - **In order.** A later statement sees the effects of an earlier one. A batch cannot pass one statement's result
   into another's arguments; that needs the result back first, which is what a second batch is for.
@@ -320,7 +320,7 @@ same way. (The few differences are listed below.)
 When the batch is one round trip:
 
 - **PostgreSQL prepares the whole batch first** (in pgx's default statement-cache mode), so a statement rejected
-  before anything runs — a syntax error, a missing table, an argument it cannot encode — fails every read,
+  before anything runs - a syntax error, a missing table, an argument it cannot encode - fails every read,
   including those of the statements queued before it. A failure while running, such as a duplicate key, fails
   only its read and those after it.
 - **Rows are held in memory** until read - each row is released once read past - so a very large result set
@@ -360,15 +360,15 @@ func startup(cfg Config) (*sequel.DB, error) {
 }
 ```
 
-Repeated calls within the same process with the same `(driver, baseDSN, uniqueTestID)` reuse the same testing database — the `DROP+CREATE` runs only once, for as long as a handle on it remains open. The returned DSN points at a database whose name has the `testing_NN_` prefix; sequel inspects this on `Close` and drops the database automatically when the last referencing `*DB` is closed — last across every handle, since `Open` returns a distinct `*DB` per call. There is no separate cleanup call to remember. A call after that point provisions the database again rather than returning a DSN for one that no longer exists. If a process exits before `Close` runs, the leftover-cleanup sweep on the next `CreateTestingDatabase` call removes stale databases older than 1–2 hours.
+Repeated calls within the same process with the same `(driver, baseDSN, uniqueTestID)` reuse the same testing database - the `DROP+CREATE` runs only once, for as long as a handle on it remains open. The returned DSN points at a database whose name has the `testing_NN_` prefix; sequel inspects this on `Close` and drops the database automatically when the last referencing `*DB` is closed - last across every handle, since `Open` returns a distinct `*DB` per call. There is no separate cleanup call to remember. A call after that point provisions the database again rather than returning a DSN for one that no longer exists. If a process exits before `Close` runs, the leftover-cleanup sweep on the next `CreateTestingDatabase` call removes stale databases older than 1-2 hours.
 
 ### Choosing the server with `SEQUEL_TESTING_DSN`
 
-When `CreateTestingDatabase` is called with **neither** a driver nor a base DSN, it falls back to the `SEQUEL_TESTING_DSN` environment variable. This lets you run the same test suite against any supported server without touching test code — leave the variable unset to use in-memory SQLite (the default, no server required), or set it to a base DSN to run against that server instead, with the driver inferred from the DSN:
+When `CreateTestingDatabase` is called with **neither** a driver nor a base DSN, it falls back to the `SEQUEL_TESTING_DSN` environment variable. This lets you run the same test suite against any supported server without touching test code - leave the variable unset to use in-memory SQLite (the default, no server required), or set it to a base DSN to run against that server instead, with the driver inferred from the DSN:
 
 ```go
 func TestUserService(t *testing.T) {
-    // "" driver + "" DSN → SEQUEL_TESTING_DSN, or in-memory SQLite if it is unset.
+    // "" driver + "" DSN -> SEQUEL_TESTING_DSN, or in-memory SQLite if it is unset.
     dsn, err := sequel.CreateTestingDatabase("", "", t.Name())
     if err != nil { t.Fatal(err) }
     db, err := sequel.OpenSingleton("", dsn)
@@ -378,21 +378,21 @@ func TestUserService(t *testing.T) {
 ```
 
 ```sh
-# Same tests, different engine — no code change.
+# Same tests, different engine - no code change.
 go test ./...                                                          # SQLite (default)
 SEQUEL_TESTING_DSN='postgres://user:pw@127.0.0.1:5432/' go test ./...  # PostgreSQL
 SEQUEL_TESTING_DSN='root:pw@tcp(127.0.0.1:3306)/'       go test ./...  # MySQL
 ```
 
-Passing an explicit driver — even with an empty DSN, which just selects that driver's localhost default — opts out of the fallback, so a test that deliberately targets a specific engine keeps using it regardless of the environment. Because the variable is read inside `CreateTestingDatabase`, any project that provisions its test databases through sequel inherits this behavior with no additional wiring.
+Passing an explicit driver - even with an empty DSN, which just selects that driver's localhost default - opts out of the fallback, so a test that deliberately targets a specific engine keeps using it regardless of the environment. Because the variable is read inside `CreateTestingDatabase`, any project that provisions its test databases through sequel inherits this behavior with no additional wiring.
 
 ### Simulating network latency with `SimulateRTT`
 
-Tests run against in-memory SQLite or a server on localhost, where a round trip costs microseconds. Code that is needlessly chatty — a loop that issues one query per element, a transaction that could have batched — therefore performs indistinguishably from code that is not, and the timeout paths never fire. `SimulateRTT` makes every operation sequel sends over the wire pause first, so the cost of a real network shows up in the test:
+Tests run against in-memory SQLite or a server on localhost, where a round trip costs microseconds. Code that is needlessly chatty - a loop that issues one query per element, a transaction that could have batched - therefore performs indistinguishably from code that is not, and the timeout paths never fire. `SimulateRTT` makes every operation sequel sends over the wire pause first, so the cost of a real network shows up in the test:
 
 ```go
 db, _ := sequel.Open("", dsn)
-db.SimulateRTT(20 * time.Millisecond) // testing only — this is deliberate latency injection
+db.SimulateRTT(20 * time.Millisecond) // testing only - this is deliberate latency injection
 
 start := time.Now()
 err := db.Transact(ctx, func(tx *sequel.Tx) error {
@@ -403,13 +403,13 @@ err := db.Transact(ctx, func(tx *sequel.Tx) error {
     }
     return nil
 })
-// 100 users → 102 round trips (BEGIN + 100 statements + COMMIT) → over 2 seconds.
+// 100 users -> 102 round trips (BEGIN + 100 statements + COMMIT) -> over 2 seconds.
 // The same loop takes microseconds against localhost, which is what hides the problem.
 
 db.SimulateRTT(0) // off again
 ```
 
-The delay is charged **per round trip**, not per call: the statement methods on `DB` and `Tx`, each execution of a prepared `Stmt`, `Begin`/`BeginTx`, `Commit`, `Rollback` and `Ping` each pay it once. Operations sequel is not in the path for are not delayed — a `*sql.Conn` talks to the driver directly, and fetching successive rows from an open `Rows` is batched by the driver, so charging a full round trip per `Next()` would model the wire worse than charging nothing.
+The delay is charged **per round trip**, not per call: the statement methods on `DB` and `Tx`, each execution of a prepared `Stmt`, `Begin`/`BeginTx`, `Commit`, `Rollback` and `Ping` each pay it once. Operations sequel is not in the path for are not delayed - a `*sql.Conn` talks to the driver directly, and fetching successive rows from an open `Rows` is batched by the driver, so charging a full round trip per `Next()` would model the wire worse than charging nothing.
 
 The `Context` variants honor their context: a deadline shorter than the simulated latency fails the operation with the context's error and never reaches the database, which is what a real round trip that outlives its deadline does. That makes cancellation and timeout handling testable without an unreliable server to provoke it.
 
@@ -417,15 +417,15 @@ A `Tx` captures the setting when the transaction begins, so a transaction runs a
 
 ## Observability
 
-Sequel emits OpenTelemetry traces and metrics, and `slog` logs. A freshly opened `*DB` is **not** uninstrumented: it starts on the process-wide `otel.GetTracerProvider()` / `otel.GetMeterProvider()`, so a program that configures OpenTelemetry globally gets sequel's spans and metrics with no further setup. Those globals are delegating no-ops until real providers are installed, and they start working the moment they are — no re-open needed. Logging defaults to a discard logger. To genuinely disable a signal, install an explicit no-op provider; "unset" does not mean "off".
+Sequel emits OpenTelemetry traces and metrics, and `slog` logs. A freshly opened `*DB` is **not** uninstrumented: it starts on the process-wide `otel.GetTracerProvider()` / `otel.GetMeterProvider()`, so a program that configures OpenTelemetry globally gets sequel's spans and metrics with no further setup. Those globals are delegating no-ops until real providers are installed, and they start working the moment they are - no re-open needed. Logging defaults to a discard logger. To genuinely disable a signal, install an explicit no-op provider; "unset" does not mean "off".
 
-Providers are attached **after** `Open`/`OpenSingleton` (which keep the standard `database/sql` signature) rather than at construction. Nothing is lost by this: `sql.Open` does no I/O — it only prepares a lazy pool — so there is no work inside `Open` worth instrumenting; every operation that does real work happens later on the returned `*DB`.
+Providers are attached **after** `Open`/`OpenSingleton` (which keep the standard `database/sql` signature) rather than at construction. Nothing is lost by this: `sql.Open` does no I/O - it only prepares a lazy pool - so there is no work inside `Open` worth instrumenting; every operation that does real work happens later on the returned `*DB`.
 
 ```go
 db, _ := sequel.Open("", dsn)
-db.SetTracerProvider(tracerProvider) // trace.TracerProvider — client spans per query/transaction/migration
-db.SetMeterProvider(meterProvider)   // metric.MeterProvider — sequel_* metrics
-db.SetLogger(logger)                 // *slog.Logger — migration events; per-query when enabled at Debug
+db.SetTracerProvider(tracerProvider) // trace.TracerProvider - client spans per query/transaction/migration
+db.SetMeterProvider(meterProvider)   // metric.MeterProvider - sequel_* metrics
+db.SetLogger(logger)                 // *slog.Logger - migration events; per-query when enabled at Debug
 ```
 
 Configure once, before the `*DB` is used concurrently. For an `OpenSingleton`-shared `*DB`, the providers are process-wide for that pool; set them from the owning caller (last writer wins). Pass `nil` to any setter to disable that signal.
@@ -434,9 +434,9 @@ Configure once, before the `*DB` is used concurrently. For an `OpenSingleton`-sh
 
 Each query, `Transact`, and `Migrate` gets a client span following OpenTelemetry database semantic conventions:
 
-- `db.system.name` — the driver (`mysql`, `pgx`, `cockroachdb`, `mssql`, `sqlite`)
-- `db.operation.name` — the SQL verb (`SELECT`, `INSERT`, …), whatever the dialect: common verbs are reported immediately and rarer ones are picked up on first use, so nothing needs to be on a list. The number of distinct verbs a process reports is capped (at 128) and only verb-shaped tokens count toward it, so the attribute stays low-cardinality even if an application interpolates uncontrolled input into its SQL; past the cap, further unrecognized verbs report as `OTHER` and sequel logs that once at Info
-- `db.collection.name` — the table, **only when it can be determined unambiguously** (omitted for joins, multi-table `FROM` lists, and subqueries, so a present value is trustworthy)
+- `db.system.name` - the driver (`mysql`, `pgx`, `cockroachdb`, `mssql`, `sqlite`)
+- `db.operation.name` - the SQL verb (`SELECT`, `INSERT`, ...), whatever the dialect: common verbs are reported immediately and rarer ones are picked up on first use, so nothing needs to be on a list. The number of distinct verbs a process reports is capped (at 128) and only verb-shaped tokens count toward it, so the attribute stays low-cardinality even if an application interpolates uncontrolled input into its SQL; past the cap, further unrecognized verbs report as `OTHER` and sequel logs that once at Info
+- `db.collection.name` - the table, **only when it can be determined unambiguously** (omitted for joins, multi-table `FROM` lists, and subqueries, so a present value is trustworthy)
 
 The span name is `"{operation} {table}"` (e.g. `SELECT users`), or just the operation when no table is captured. The statement text is never attached to a span; operation, table, and the caller's own parent span identify it, and the full parameterized statement is available in the per-query Debug log instead.
 
@@ -444,7 +444,7 @@ The span name is `"{operation} {table}"` (e.g. `SELECT users`), or just the oper
 
 A batch sent in one round trip is one span, `BATCH`, with `db.operation.batch.size` for the number of statements. A batch whose statements run one by one gets a span per statement.
 
-A call on an already-finalized transaction reports `sql.ErrTxDone` without reaching the database, and correspondingly emits **nothing** — no span, no duration sample. That covers the ubiquitous `defer tx.Rollback()` next to a successful `Commit`, and equally the transaction that `database/sql` finalized itself when its context was cancelled, so a cancelled request does not show up as a failed rollback.
+A call on an already-finalized transaction reports `sql.ErrTxDone` without reaching the database, and correspondingly emits **nothing** - no span, no duration sample. That covers the ubiquitous `defer tx.Rollback()` next to a successful `Commit`, and equally the transaction that `database/sql` finalized itself when its context was cancelled, so a cancelled request does not show up as a failed rollback.
 
 ### Metrics
 
@@ -469,17 +469,17 @@ or `increase()` rather than reading the raw value.
 
 ### Logs
 
-The library **does not log operation errors** — every error is returned to the caller, who is best placed to log it. Logging is reserved for:
+The library **does not log operation errors** - every error is returned to the caller, who is best placed to log it. Logging is reserved for:
 
-- **Info** — one-off events: each schema migration as it is attempted (regardless of outcome).
-- **Debug** — every query, including the full parameterized statement text, and each statement of a batch sent in one round trip. There is no separate sequel switch: the lines are gated on your own logger's level, so they cost nothing when Debug is disabled. (Statement text is never a privacy risk — sequel always parameterizes, so the text carries `?`/`$1` placeholders, never argument values.)
+- **Info** - one-off events: each schema migration as it is attempted (regardless of outcome).
+- **Debug** - every query, including the full parameterized statement text, and each statement of a batch sent in one round trip. There is no separate sequel switch: the lines are gated on your own logger's level, so they cost nothing when Debug is disabled. (Statement text is never a privacy risk - sequel always parameterizes, so the text carries `?`/`$1` placeholders, never argument values.)
 
 ### `Query`, `QueryRow` and `Prepare` return `*sequel.Rows` / `*sequel.Row` / `*sequel.Stmt`
 
 Query methods return sequel's own types rather than `database/sql`'s: `Query`/`QueryContext` return a `*sequel.Rows` (embedding `*sql.Rows`), `QueryRow`/`QueryRowContext` return a `*sequel.Row` (embedding `*sql.Row`), and `Prepare`/`PrepareContext` return a `*sequel.Stmt` (embedding `*sql.Stmt`). All embed, so ordinary call sites are unchanged:
 
 ```go
-rows, err := db.Query("SELECT id, name FROM users")   // type inference — no change needed
+rows, err := db.Query("SELECT id, name FROM users")   // type inference - no change needed
 for rows.Next() { rows.Scan(&id, &name) }
 err = db.QueryRow("SELECT name FROM users WHERE id=?", id).Scan(&name)
 stmt, err := db.Prepare("INSERT INTO users (name) VALUES (?)")
@@ -488,11 +488,11 @@ _, err = stmt.Exec("Rivka")
 
 Only code that *explicitly* types a result as `*sql.Rows` / `*sql.Row` / `*sql.Stmt`, or that implements the `Executor` interface itself, needs adjustment.
 
-These types exist for two reasons. **Instrumentation:** `database/sql` defers a `QueryRow` error to `Scan` and a streaming error to `rows.Err()`, so the shadows capture the error where it actually becomes available; executions of a prepared `Stmt` get spans, duration samples and the simulated round-trip delay like any other statement. **Transaction safety:** inside a `Transact` closure they latch errors into the transaction, so a closure that ignores a failed scan, a truncated read, or a failed prepared-statement execution cannot commit state built on it — see [Transactions](#transactions). Outside `Transact` — a `*DB` query, or a `Tx` from `BeginTx` — they are passthroughs with no latching.
+These types exist for two reasons. **Instrumentation:** `database/sql` defers a `QueryRow` error to `Scan` and a streaming error to `rows.Err()`, so the shadows capture the error where it actually becomes available; executions of a prepared `Stmt` get spans, duration samples and the simulated round-trip delay like any other statement. **Transaction safety:** inside a `Transact` closure they latch errors into the transaction, so a closure that ignores a failed scan, a truncated read, or a failed prepared-statement execution cannot commit state built on it - see [Transactions](#transactions). Outside `Transact` - a `*DB` query, or a `Tx` from `BeginTx` - they are passthroughs with no latching.
 
 ## Errors
 
-Errors returned by sequel wrap the driver's error with a stack trace (via [`github.com/microbus-io/errors`](https://github.com/microbus-io/errors)), recording where in your code the failure surfaced. The wrapping preserves `Unwrap`, so `errors.Is` and `errors.As` see through it — compare and unwrap exactly as you would any wrapped Go error:
+Errors returned by sequel wrap the driver's error with a stack trace (via [`github.com/microbus-io/errors`](https://github.com/microbus-io/errors)), recording where in your code the failure surfaced. The wrapping preserves `Unwrap`, so `errors.Is` and `errors.As` see through it - compare and unwrap exactly as you would any wrapped Go error:
 
 ```go
 if errors.Is(err, context.DeadlineExceeded) { ... }
@@ -502,7 +502,7 @@ if errors.As(err, &pgErr) { ... }
 
 The two `database/sql` sentinels are deliberately **not** wrapped: `sql.ErrNoRows` and `sql.ErrTxDone` are routine control flow rather than failures, and they pass through exactly as `database/sql` returns them, so existing `err == sql.ErrNoRows` comparisons keep working. `errors.Is(err, sql.ErrNoRows)` works too, and is the more robust habit.
 
-Every other error — a driver error, a context cancellation — is wrapped, so never compare those with `==`; use `errors.Is`/`errors.As`. (Code that compares a driver error with `==` is broken with plain `database/sql` as well — drivers return distinct error values per occurrence — so in practice this asks nothing new.)
+Every other error - a driver error, a context cancellation - is wrapped, so never compare those with `==`; use `errors.Is`/`errors.As`. (Code that compares a driver error with `==` is broken with plain `database/sql` as well - drivers return distinct error values per occurrence - so in practice this asks nothing new.)
 
 ## Legal
 

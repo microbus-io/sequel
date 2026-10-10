@@ -27,7 +27,7 @@ import (
 // TestTransact_RollsBackOnIgnoredPreparedStmtError proves that a prepared statement is not an escape
 // hatch from the no-partial-commit guarantee: a Transact closure that executes through a Stmt and ignores
 // its error cannot commit, on any engine. This matters most on MySQL and SQLite, which do not abort a
-// transaction server-side on a statement error — there, only the latch stands between an ignored error
+// transaction server-side on a statement error - there, only the latch stands between an ignored error
 // and a half-committed transaction.
 func TestTransact_RollsBackOnIgnoredPreparedStmtError(t *testing.T) {
 	t.Parallel()

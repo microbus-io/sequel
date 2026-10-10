@@ -314,7 +314,7 @@ func isLockContentionMessage(msg string) bool {
 
 // Close closes the database connection.
 //
-// When the underlying database name matches the testing pattern (testing_NN_…),
+// When the underlying database name matches the testing pattern (testing_NN_...),
 // the last handle to close drops the database from the server as a best-effort
 // cleanup, making [CreateTestingDatabase]-provisioned databases self-cleaning on
 // test teardown. Last across every handle on that database, not just this one:
@@ -436,7 +436,7 @@ transaction, and migration. A freshly opened *DB already uses the process-wide o
 call this to override it, or pass nil to revert to that global provider (whose default is a no-op).
 
 Observability is configured after Open/OpenSingleton (which keep the standard database/sql signature) rather
-than at construction. This loses nothing: sql.Open does no I/O — it only prepares a lazy pool — so there is
+than at construction. This loses nothing: sql.Open does no I/O - it only prepares a lazy pool - so there is
 no work inside Open worth a span; every operation that does real work happens later on the returned *DB.
 
 Configure before the *DB is used concurrently. For an OpenSingleton-shared *DB the providers are process-
@@ -469,8 +469,8 @@ func (db *DB) SetMeterProvider(mp metric.MeterProvider) {
 }
 
 // SetLogger attaches an slog.Logger. The library does not log operation errors (they are returned to the
-// caller, who logs them); it logs one-off events such as schema migrations at Info, and — when the logger
-// is enabled at Debug level — each query at Debug. Per-query logging is therefore controlled by the
+// caller, who logs them); it logs one-off events such as schema migrations at Info, and - when the logger
+// is enabled at Debug level - each query at Debug. Per-query logging is therefore controlled by the
 // logger's own level, not a separate switch. A freshly opened *DB uses a discard logger; pass nil here to
 // revert to that discard logger (disabling logging).
 func (db *DB) SetLogger(logger *slog.Logger) {
@@ -589,7 +589,7 @@ func (db *DB) PrepareContext(ctx context.Context, query string) (*Stmt, error) {
 }
 
 // Ping shadows sql.DB.Ping so a simulated round-trip delay ([DB.SimulateRTT]) applies to it: a ping is a
-// wire operation like any statement. It is not otherwise instrumented — sequel has never traced a ping.
+// wire operation like any statement. It is not otherwise instrumented - sequel has never traced a ping.
 func (db *DB) Ping() error {
 	_ = simulateRTT(context.Background(), db.rtt()) // an uncancellable context: the pause always elapses
 	return traceErr(db.DB.Ping())
@@ -629,8 +629,8 @@ func unpackQuery(driverName string, query string) (string, error) {
 // traceErr attaches a stack trace to an operation error at the API boundary, passing the database/sql
 // sentinels through untouched: sql.ErrNoRows and sql.ErrTxDone are routine control flow, not failures, and
 // callers are entitled to compare them with == exactly as they would against database/sql. The identity
-// check (not errors.Is) is deliberate — only the bare sentinel is ==-comparable in the first place.
-// Everything else — driver errors, context errors — gains the stack of the failing call site; the wrapper
+// check (not errors.Is) is deliberate - only the bare sentinel is ==-comparable in the first place.
+// Everything else - driver errors, context errors - gains the stack of the failing call site; the wrapper
 // preserves Unwrap, so errors.Is/errors.As and IsLockContentionError see through it.
 func traceErr(err error) error {
 	if err == nil || err == sql.ErrNoRows || err == sql.ErrTxDone {
@@ -772,7 +772,7 @@ func setXactAbort(ctx context.Context, sqlTx *sql.Tx, rtt time.Duration) error {
 }
 
 // InsertReturnID executes an INSERT statement and returns the auto-generated ID for the named ID column.
-// idColumn must be a plain identifier matching [A-Za-z_][A-Za-z0-9_]* — it is spliced into the statement
+// idColumn must be a plain identifier matching [A-Za-z_][A-Za-z0-9_]* - it is spliced into the statement
 // on some drivers, so quoted or exotic column names are rejected rather than escaped.
 func (db *DB) InsertReturnID(ctx context.Context, idColumn string, stmt string, args ...any) (int64, error) {
 	return insertReturnID(ctx, db, db.driverName, idColumn, stmt, args...)
@@ -781,7 +781,7 @@ func (db *DB) InsertReturnID(ctx context.Context, idColumn string, stmt string, 
 // identifierPattern is the charset accepted for an identifier that is spliced into SQL text, such as
 // InsertReturnID's idColumn (RETURNING <col> on PostgreSQL/CockroachDB, OUTPUT INSERTED.<col> on SQL
 // Server). Same principle as JSON_FIELD paths: the narrow charset is what makes the splice safe on every
-// dialect — a quote or bracket is rejected up front, not escaped.
+// dialect - a quote or bracket is rejected up front, not escaped.
 var identifierPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // insertReturnID executes an INSERT statement and returns the auto-generated ID for the named ID column.
@@ -836,12 +836,12 @@ func injectOutputInserted(stmt string, idColumn string) (string, error) {
 }
 
 // leftoverTestingDatabasePattern matches a database name that the leftover-cleanup sweep is allowed to
-// DROP. Candidates come from the server's own catalog — input sequel does not control, since any principal
-// with CREATE DATABASE rights can plant a name there — and the name is spliced into an unquoted DROP
+// DROP. Candidates come from the server's own catalog - input sequel does not control, since any principal
+// with CREATE DATABASE rights can plant a name there - and the name is spliced into an unquoted DROP
 // DATABASE statement executed with the testing credentials. The full-match anchor and the narrow charset
 // (exactly what CreateTestingDatabase can mint, which sanitizes to [a-z0-9_]) are what make that splice
-// safe: a name carrying a quote, space or semicolon — a batch injection on SQL Server, which executes
-// multi-statement batches — fails the match and is left alone rather than escaped.
+// safe: a name carrying a quote, space or semicolon - a batch injection on SQL Server, which executes
+// multi-statement batches - fails the match and is left alone rather than escaped.
 var leftoverTestingDatabasePattern = regexp.MustCompile(`^testing_[0-2][0-9]_[a-z0-9_]*$`)
 
 // dsnURLCredentialsPattern matches the userinfo of a URL-form DSN (postgres://user:pass@host).
@@ -857,7 +857,7 @@ var dsnMySQLCredentialsPattern = regexp.MustCompile(`^([^:@/]+):(.*)@`)
 var dsnPasswordParamPattern = regexp.MustCompile(`(?i)(password|pwd)=[^;& ]*`)
 
 // redactDataSourceName masks the credentials in a DSN so it can be quoted in an error message. DSNs carry
-// passwords, and errors end up in the caller's logs — a raw DSN in an error is a credential leak.
+// passwords, and errors end up in the caller's logs - a raw DSN in an error is a credential leak.
 func redactDataSourceName(dsn string) string {
 	if strings.Contains(dsn, "://") {
 		dsn = dsnURLCredentialsPattern.ReplaceAllString(dsn, "://$1:***@")
@@ -1028,7 +1028,7 @@ in-memory DSN) for testing and returns the resolved data source name. Pass the
 result to [Open] or [OpenSingleton] to open a connection.
 
 The returned DSN points at a database whose name has the testing_NN_ prefix. When
-the last *DB referencing that database is Closed, sequel drops it automatically —
+the last *DB referencing that database is Closed, sequel drops it automatically -
 no separate cleanup call is required.
 
 uniqueTestID scopes the database so that independent tests don't collide. Pass
@@ -1043,7 +1043,7 @@ that wants a per-run database:
 	db, err := sequel.OpenSingleton("", dsn)
 
 Within a single process, repeated calls with the same (driverName,
-baseDataSourceName, uniqueTestID) reuse the same testing database — the
+baseDataSourceName, uniqueTestID) reuse the same testing database - the
 underlying DROP+CREATE only happens on the first call. Once every handle on that
 database has been closed it is dropped, and a later call with the same triple
 provisions it again.
@@ -1056,7 +1056,7 @@ If neither a driver name nor a base data source name is provided, it falls back 
 environment variable. This lets any consumer that builds ephemeral test databases through sequel redirect
 its entire suite at a real server without changing test code: leave SEQUEL_TESTING_DSN unset to keep the
 SQLite default, or set it to a base DSN to run against that server instead, with the driver inferred from
-it. Naming a driver — even with an empty DSN — opts out of the fallback, so a test that explicitly asks for
+it. Naming a driver - even with an empty DSN - opts out of the fallback, so a test that explicitly asks for
 SQLite keeps running on SQLite regardless of the environment.
 
 If neither the arguments nor SEQUEL_TESTING_DSN select a server, the following localhost defaults are used

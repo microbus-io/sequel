@@ -62,7 +62,7 @@ func TestTelemetry_ParseOperation(t *testing.T) {
 		{"COMMIT;", "COMMIT", ""}, // a single-word statement may carry its terminator
 		{"UPSERT INTO kv (k, v) VALUES (?, ?)", "UPSERT", "kv"}, // CockroachDB
 		// Verbs outside the seed are learned on first use and report verbatim, so the seed never has to
-		// enumerate five dialects — there is no allowlist to be missing from.
+		// enumerate five dialects - there is no allowlist to be missing from.
 		{"OPTIMIZE TABLE t1", "OPTIMIZE", ""},   // MySQL
 		{"DBCC CHECKDB", "DBCC", ""},            // SQL Server
 		{"LISTEN channel", "LISTEN", ""},        // PostgreSQL
@@ -83,7 +83,7 @@ func TestTelemetry_ParseOperation(t *testing.T) {
 }
 
 // The learned verb set is bounded: past the cap, further verbs report as OTHER rather than minting
-// unbounded metric attribute values. Runs against its own instance, never the package-level set — filling
+// unbounded metric attribute values. Runs against its own instance, never the package-level set - filling
 // a shared set would change the labels every other test observes.
 func TestTelemetry_OperationLabelCap(t *testing.T) {
 	t.Parallel()
@@ -102,7 +102,7 @@ func TestTelemetry_OperationLabelCap(t *testing.T) {
 	// The cap is now full: a new verb is bucketed.
 	assert.Equal("OTHER", labels.label("OVERFLOW"))
 	assert.True(labels.capExceeded.Load(), "the operator-facing flag is set once the cap starts bucketing")
-	// Verbs already learned — and the seed above all — keep reporting verbatim afterward.
+	// Verbs already learned - and the seed above all - keep reporting verbatim afterward.
 	assert.Equal("SELECT", labels.label("SELECT"))
 	assert.Equal("V0", labels.label("V0"))
 }
@@ -202,7 +202,7 @@ func TestTelemetry_StatementLogsGatedByLevel(t *testing.T) {
 	assert := testarossa.For(t)
 
 	// A Debug-level logger captures the per-query statement; an Info-level logger does not, and never
-	// the span text — per-query logging is controlled by the logger's level, not a separate switch.
+	// the span text - per-query logging is controlled by the logger's level, not a separate switch.
 	run := func(name string, level slog.Level) string {
 		var logBuf bytes.Buffer
 		logger := slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: level}))
@@ -356,7 +356,7 @@ func TestTelemetry_TransactionLifecycleSpans(t *testing.T) {
 			"%s nests under its transaction rather than orphaning at the trace root", op)
 	}
 
-	// Each transaction begins and ends exactly once — the redundant Rollback that Transact skips after a
+	// Each transaction begins and ends exactly once - the redundant Rollback that Transact skips after a
 	// successful commit must not add a second.
 	counts := map[string]int{}
 	for _, s := range spans {
@@ -381,7 +381,7 @@ func TestTelemetry_CancelledTransactEmitsNoRollbackError(t *testing.T) {
 	db.SetTracerProvider(tp)
 	assert.NoError(db.Migrate(t.Name(), testdata.FS))
 
-	// Racy by nature — database/sql finalizes from its own goroutine — so repeat enough to catch it.
+	// Racy by nature - database/sql finalizes from its own goroutine - so repeat enough to catch it.
 	for i := range 100 {
 		ctx, cancel := context.WithCancel(context.Background())
 		_ = db.Transact(ctx, func(tx *Tx) error {
@@ -400,7 +400,7 @@ func TestTelemetry_CancelledTransactEmitsNoRollbackError(t *testing.T) {
 	}
 }
 
-// A finalized transaction reports ErrTxDone without emitting a second span — the `defer tx.Rollback()`
+// A finalized transaction reports ErrTxDone without emitting a second span - the `defer tx.Rollback()`
 // idiom alongside a successful Commit must stay free of spurious telemetry.
 func TestTelemetry_NoSpanForFinalizedTransaction(t *testing.T) {
 	t.Parallel()
@@ -430,7 +430,7 @@ func TestTelemetry_DefaultsToGlobalProviders(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)
 
-	// A freshly opened DB starts with the global OTEL providers and a discard logger — non-nil, but a no-op
+	// A freshly opened DB starts with the global OTEL providers and a discard logger - non-nil, but a no-op
 	// until the application installs real providers, so queries run normally without any explicit setup.
 	db := newSQLiteDB(t)
 	tl := db.telemetry.Load()

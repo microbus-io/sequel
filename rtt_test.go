@@ -156,7 +156,7 @@ func TestRTT_DelaysWireOperations(t *testing.T) {
 }
 
 // The delay is charged once per round trip, so a transaction pays for its BEGIN and COMMIT on top of
-// every statement it runs — which is the whole point: it makes a chatty transaction visibly expensive.
+// every statement it runs - which is the whole point: it makes a chatty transaction visibly expensive.
 func TestRTT_ChargedPerRoundTrip(t *testing.T) {
 	assert := testarossa.For(t)
 
@@ -199,7 +199,7 @@ func TestRTT_ChargedPerRoundTrip(t *testing.T) {
 }
 
 // A context whose deadline is shorter than the simulated round trip fails the operation with the
-// context's error and never reaches the database — the outcome a real round trip that outlives its
+// context's error and never reaches the database - the outcome a real round trip that outlives its
 // deadline produces.
 func TestRTT_HonorsContextDeadline(t *testing.T) {
 	assert := testarossa.For(t)

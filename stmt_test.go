@@ -45,7 +45,7 @@ func TestStmt_TransactLatchesIgnoredExecError(t *testing.T) {
 		defer stmt.Close()
 		stmt.ExecContext(ctx, 1) //nolint:errcheck
 		stmt.ExecContext(ctx, 1) //nolint:errcheck // duplicate PK: fails, and is deliberately ignored
-		// The recorded error must short-circuit this statement — it would otherwise succeed and commit.
+		// The recorded error must short-circuit this statement - it would otherwise succeed and commit.
 		stmt.ExecContext(ctx, 2) //nolint:errcheck
 		return nil               // ignore everything
 	})

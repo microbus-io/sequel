@@ -478,7 +478,7 @@ func TestDB_UnpackQuery_Composed(t *testing.T) {
 	assert.NoError(err)
 	assert.Equal("SELECT (EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - created_at)) * 1000.0)", q)
 
-	// NOW_UTC inside DATE_DIFF_MILLIS on SQLite — the comma inside STRFTIME must not split the arguments
+	// NOW_UTC inside DATE_DIFF_MILLIS on SQLite - the comma inside STRFTIME must not split the arguments
 	db = newTestDB("sqlite")
 	q, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(not_before, NOW_UTC())")
 	assert.NoError(err)
@@ -723,7 +723,7 @@ func TestDB_CreateTestingDatabaseCached(t *testing.T) {
 	assert := testarossa.For(t)
 
 	// Repeated calls with the same (driver, baseDSN, uniqueTestID) return the
-	// same resolved DSN — the DROP+CREATE happens once.
+	// same resolved DSN - the DROP+CREATE happens once.
 	dsn1, err := CreateTestingDatabase("sqlite", "", t.Name())
 	assert.NoError(err)
 	dsn2, err := CreateTestingDatabase("sqlite", "", t.Name())
@@ -736,7 +736,7 @@ func TestDB_CreateTestingDatabase_SharedSingleton(t *testing.T) {
 	assert := testarossa.For(t)
 
 	// Two consumers in the same test go through CreateTestingDatabase then
-	// OpenSingleton — they end up sharing one *DB and one pool.
+	// OpenSingleton - they end up sharing one *DB and one pool.
 	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
 	assert.NoError(err)
 	db1, err := OpenSingleton("sqlite", dsn)
@@ -977,8 +977,8 @@ func TestDB_InjectOutputInserted(t *testing.T) {
 	assert.Error(err)
 }
 
-// The leftover-cleanup sweep DROPs database names read from the server's own catalog — input any
-// principal with CREATE DATABASE rights can plant — spliced unquoted into the statement. The full-match
+// The leftover-cleanup sweep DROPs database names read from the server's own catalog - input any
+// principal with CREATE DATABASE rights can plant - spliced unquoted into the statement. The full-match
 // pattern is the injection guard: only names CreateTestingDatabase could have minted qualify.
 func TestDB_LeftoverSweepRejectsHostileNames(t *testing.T) {
 	t.Parallel()
@@ -1019,7 +1019,7 @@ func TestDB_RedactDataSourceName(t *testing.T) {
 }
 
 // The ID column is spliced into SQL on some drivers (RETURNING / OUTPUT INSERTED), so it is validated
-// against a narrow identifier charset on every driver — rejected up front, never escaped.
+// against a narrow identifier charset on every driver - rejected up front, never escaped.
 func TestDB_InsertReturnIDRejectsInvalidColumn(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)

@@ -42,7 +42,7 @@ var vfIdentPattern = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*\(`)
 // atomic load), which matters because every query that may contain a virtual function reads it; writes are
 // rare (process startup, occasional RegisterVirtualFunc) and clone-then-swap under virtualFuncsMutex. A
 // reader that loads the pointer is reading an immutable snapshot, so it can never race a concurrent
-// registration — the pattern sequel also uses for per-DB telemetry.
+// registration - the pattern sequel also uses for per-DB telemetry.
 var (
 	virtualFuncsMutex sync.Mutex // serializes writers so concurrent registrations don't lose updates
 	virtualFuncs      atomic.Pointer[map[string]virtualFunc]
@@ -168,7 +168,7 @@ func expandOnce(driverName, query string, vfs map[string]virtualFunc) (string, b
 		name := query[absStart : absEnd-1]
 		vf, ok := vfs[strings.ToUpper(name)]
 		if !ok {
-			// Not a virtual function — skip past the '(' and keep scanning.
+			// Not a virtual function - skip past the '(' and keep scanning.
 			b.WriteString(query[i:absEnd])
 			i = absEnd
 			continue
@@ -379,12 +379,12 @@ type jsonPathElem struct {
 }
 
 // parseJSONPath parses the supported subset of JSONPath: any number of member accesses (.name) and array
-// indexes ([0]). Wildcards, recursive descent, filters and quoted member names are rejected — see
+// indexes ([0]). Wildcards, recursive descent, filters and quoted member names are rejected - see
 // jsonPathElemPattern.
 //
 // The conventional JSONPath '$' root is accepted but optional, and 'name' is equivalent to '$.name'. The
-// path is never passed through to the database — PostgreSQL's #>> wants an array of keys, not a path string,
-// so parsing and re-rendering per dialect is mandatory anyway — which leaves the '$' carrying no information
+// path is never passed through to the database - PostgreSQL's #>> wants an array of keys, not a path string,
+// so parsing and re-rendering per dialect is mandatory anyway - which leaves the '$' carrying no information
 // that this function does not already supply itself. It is accepted because three of the four engines spell
 // paths that way natively, so a path copied from their documentation must not be rejected; it is optional
 // because demanding a token we then discard and re-emit is ceremony.
@@ -452,7 +452,7 @@ func parseJSONPath(path string) ([]jsonPathElem, error) {
 // the same path.
 //
 // The column expression is referenced more than once on MySQL and SQL Server, so it must not itself contain a
-// ? placeholder — a bound argument there would be consumed twice and misalign every later placeholder.
+// ? placeholder - a bound argument there would be consumed twice and misalign every later placeholder.
 //
 // Note the SQL Server ceiling: JSON_VALUE returns NVARCHAR(4000) and yields NULL (in lax mode) for a longer
 // scalar, so a JSON *string* over 4000 characters reads back as NULL there. Objects and arrays are unaffected
@@ -492,7 +492,7 @@ func vfJSONField(driverName string, args string) (string, error) {
 
 	switch driverName {
 	case "mysql":
-		// JSON_UNQUOTE maps a JSON null to the *string* 'null', not SQL NULL — the one place MySQL breaks the
+		// JSON_UNQUOTE maps a JSON null to the *string* 'null', not SQL NULL - the one place MySQL breaks the
 		// contract the other three keep. The JSON_TYPE guard restores it.
 		extract := "JSON_EXTRACT(" + col + ", " + p + ")"
 		return "(CASE WHEN JSON_TYPE(" + extract + ") = 'NULL' THEN NULL ELSE JSON_UNQUOTE(" + extract + ") END)", nil
@@ -515,7 +515,7 @@ func vfJSONField(driverName string, args string) (string, error) {
 		return "(COALESCE(JSON_QUERY(" + col + ", " + p + "), JSON_VALUE(" + col + ", " + p + ")))", nil
 	case "sqlite":
 		// json_extract already returns unquoted scalars, JSON text for objects/arrays, and SQL NULL for a JSON
-		// null or a missing path — the contract, exactly.
+		// null or a missing path - the contract, exactly.
 		return "(JSON_EXTRACT(" + col + ", " + p + "))", nil
 	default:
 		return "", errors.New("unsupported driver name: %s", driverName)

@@ -461,8 +461,8 @@ func TestVF_JSONFieldRejects(t *testing.T) {
 }
 
 // TestVF_JSONFieldRootOptional pins that the JSONPath '$' root is optional. The path never reaches the
-// database as written — PostgreSQL's #>> needs an array of keys, so every dialect gets a path re-rendered
-// from the parsed elements — which leaves the '$' carrying no information the function does not already
+// database as written - PostgreSQL's #>> needs an array of keys, so every dialect gets a path re-rendered
+// from the parsed elements - which leaves the '$' carrying no information the function does not already
 // supply itself. It is accepted so that a path copied from the MySQL/SQLite/SQL Server documentation works,
 // and optional because demanding a token we then discard and re-emit is ceremony.
 func TestVF_JSONFieldRootOptional(t *testing.T) {

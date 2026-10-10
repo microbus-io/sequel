@@ -21,7 +21,7 @@ limitations under the License.
 // The whole suite picks its database from the SEQUEL_TESTING_DSN environment variable, which sequel.CreateTestingDatabase
 // reads itself. An unset or empty value runs against in-memory SQLite, which needs no server, so the suite is
 // green out of the box. Setting SEQUEL_TESTING_DSN to a server's base DSN runs the exact same tests against that server
-// instead, which is how CI exercises MySQL, PostgreSQL and SQL Server — one job per provider, each pointing the
+// instead, which is how CI exercises MySQL, PostgreSQL and SQL Server - one job per provider, each pointing the
 // env var at its container. Because CreateTestingDatabase provisions an isolated, auto-dropped database per test
 // off the base DSN, the DSN must connect with CREATE/DROP DATABASE privilege.
 package fixtures
@@ -36,7 +36,7 @@ import (
 )
 
 // newTestDB provisions an isolated database for the calling test on the configured provider and opens it.
-// Passing empty driver and DSN lets sequel select the provider from SEQUEL_TESTING_DSN (empty → in-memory SQLite)
+// Passing empty driver and DSN lets sequel select the provider from SEQUEL_TESTING_DSN (empty -> in-memory SQLite)
 // and infer the driver, so the test body never names a driver. The database is dropped and the pool closed
 // when the test ends.
 func newTestDB(t *testing.T) *sequel.DB {
@@ -54,7 +54,7 @@ func newTestDB(t *testing.T) *sequel.DB {
 }
 
 // queryFloat runs a single-value numeric query and returns the result as a float64. Numeric results cross
-// drivers in inconsistent native types — DECIMAL as []byte on MySQL, numeric on pgx, BIGINT on SQL Server —
+// drivers in inconsistent native types - DECIMAL as []byte on MySQL, numeric on pgx, BIGINT on SQL Server -
 // so the value is scanned into a string (which database/sql produces for any of them) and parsed, keeping
 // the virtual-function arithmetic tests driver-agnostic.
 func queryFloat(t *testing.T, db *sequel.DB, query string, args ...any) float64 {

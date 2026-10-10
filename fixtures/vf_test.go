@@ -33,7 +33,7 @@ import (
 // result is correct, proving the per-dialect expansion is not just well-formed text but valid, working SQL
 // on MySQL, PostgreSQL, SQL Server and SQLite alike.
 
-// TestVF_NowUTC checks that two NOW_UTC() calls evaluated in one statement read the same instant — the
+// TestVF_NowUTC checks that two NOW_UTC() calls evaluated in one statement read the same instant - the
 // generated per-driver "current UTC timestamp" expression runs and the DATE_DIFF_MILLIS around it returns
 // approximately zero.
 func TestVF_NowUTC(t *testing.T) {
@@ -114,7 +114,7 @@ func TestVF_RegexpTextSearch(t *testing.T) {
 // jsonFieldDoc is the document the JSON_FIELD fixtures extract from. It carries one value of every JSON
 // type, because the contract JSON_FIELD promises (scalars unquoted, objects and arrays as JSON text, JSON
 // null as SQL NULL) is exactly the thing the four dialects disagree about until the expansion normalizes
-// them. The "long" field is a scalar past SQL Server's JSON_VALUE ceiling — see TestVF_JSONFieldLongScalar.
+// them. The "long" field is a scalar past SQL Server's JSON_VALUE ceiling - see TestVF_JSONFieldLongScalar.
 func jsonFieldDoc(t *testing.T) string {
 	t.Helper()
 	doc, err := json.Marshal(map[string]any{

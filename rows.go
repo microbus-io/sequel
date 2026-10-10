@@ -24,7 +24,7 @@ transaction, completing the "no partial commit" guarantee for streamed reads.
 
 Transact already records the first Exec/Query *statement* error and short-circuits the rest, so a closure
 that ignores a statement's error still cannot commit half its work. The gap that remained was the errors
-that surface *while iterating a result set* — a mid-stream Scan failure or a streaming error reported by
+that surface *while iterating a result set* - a mid-stream Scan failure or a streaming error reported by
 rows.Err(). Those were invisible to Transact, so a closure that read rows in a loop and forgot to check
 rows.Err() could build state from a truncated read and commit it. Rows closes that gap: Scan and the
 end-of-iteration Err are latched exactly like a statement error, so such a closure can no longer commit
@@ -32,8 +32,8 @@ partial work.
 
 It embeds *sql.Rows, so the usual `for rows.Next() { rows.Scan(...) }`, `rows.Err()`, and `rows.Close()`
 call sites are unchanged; only code that explicitly stores the result as *sql.Rows needs adjustment (the
-same source-compat caveat as [Row]). Outside a Transact-managed Tx — a *DB query, or a Tx obtained from
-[DB.BeginTx] — recordErr is nil, so Rows is a pure passthrough and behaves exactly like *sql.Rows.
+same source-compat caveat as [Row]). Outside a Transact-managed Tx - a *DB query, or a Tx obtained from
+[DB.BeginTx] - recordErr is nil, so Rows is a pure passthrough and behaves exactly like *sql.Rows.
 */
 type Rows struct {
 	*sql.Rows
@@ -59,7 +59,7 @@ func (r *Rows) Scan(dest ...any) error {
 
 // Next shadows sql.Rows.Next. When iteration ends (Next returns false) it latches any streaming error
 // (rows.Err()), so a `for rows.Next()` loop that never checks rows.Err() still aborts the transaction on
-// a mid-stream failure. An early break (Next still returning true) latches nothing — the caller stopped
+// a mid-stream failure. An early break (Next still returning true) latches nothing - the caller stopped
 // deliberately, and a streaming error would itself have made Next return false.
 func (r *Rows) Next() bool {
 	ok := r.Rows.Next()

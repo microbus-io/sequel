@@ -30,7 +30,7 @@ import (
 //
 // Asserts the flag, not the later Rollback's error, deliberately: once the context is cancelled
 // database/sql's awaitDone goroutine races to finalize, so that error is nondeterministic for database/sql
-// as much as for sequel. Do not "strengthen" this into a comparison against a raw *sql.Tx — that compares
+// as much as for sequel. Do not "strengthen" this into a comparison against a raw *sql.Tx - that compares
 // two independent races and flakes. The flag is what sequel controls.
 func TestTx_FailedCommitDoesNotMarkTransactionFinalized(t *testing.T) {
 	assert := testarossa.For(t)

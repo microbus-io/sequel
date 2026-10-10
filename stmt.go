@@ -27,7 +27,7 @@ Stmt is a prepared statement that shadows sql.Stmt so that executing it stays on
 execution emits a span and a duration sample, is classified for lock contention, and pays the simulated
 round-trip delay ([DB.SimulateRTT]). Inside a [DB.Transact] transaction, an execution error is recorded
 into the transaction and subsequent statements short-circuit, exactly as for a statement issued through
-[Tx] directly — a closure that ignores a prepared statement's error cannot commit partial work.
+[Tx] directly - a closure that ignores a prepared statement's error cannot commit partial work.
 
 It embeds *sql.Stmt, so stmt.Exec(...)/stmt.Query(...)/stmt.Close() call sites are unchanged; only code
 that explicitly stores the result of Prepare as *sql.Stmt needs adjustment (the same source-compat shape

@@ -36,8 +36,8 @@ It applies to the statement methods (Exec, Query, QueryRow, Prepare, and the Con
 
 Three things are not charged. A [sql.Conn] talks to the driver directly, with sequel out of the path.
 Fetching successive rows from an open [Rows] is batched by the driver, so a full round trip per Next would
-model the wire worse than nothing. Lifecycle — Close on a pool or a [Stmt], and the DROP that retires a
-testing database — is not caller-facing work.
+model the wire worse than nothing. Lifecycle - Close on a pool or a [Stmt], and the DROP that retires a
+testing database - is not caller-facing work.
 
 The Context variants honor their context: a deadline shorter than the simulated latency fails the
 operation with the context's error and never reaches the database, as a real round trip outliving its
@@ -46,7 +46,7 @@ deadline does.
 Zero turns the simulation off and is the default; a negative duration is treated as zero. The setting is
 safe to change while the pool is in use and applies to operations begun after it. A [Tx] captures it at
 begin, so one transaction runs at one latency. For a *DB shared by [OpenSingleton] it is process-wide for
-that pool — last writer wins — so set it from the owning caller.
+that pool - last writer wins - so set it from the owning caller.
 
 This is deliberate latency injection and slows real work exactly as advertised. Keep it behind the same
 switch that selects your test database.

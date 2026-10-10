@@ -32,7 +32,7 @@ import (
 // statements (returning that error without touching the database). This guarantees a transaction cannot
 // commit partial state when a caller forgets to check a statement's error, and it surfaces a deadlock
 // (rather than masking it as a later "COMMIT has no corresponding BEGIN" on some drivers) so Transact
-// can retry. A Tx obtained from [DB.BeginTx] does not do this — its statement methods behave exactly
+// can retry. A Tx obtained from [DB.BeginTx] does not do this - its statement methods behave exactly
 // like the underlying sql.Tx.
 type Tx struct {
 	*sql.Tx
@@ -43,8 +43,8 @@ type Tx struct {
 	// done is set only by a Commit/Rollback that returned nil; see finalize. Atomic to match sql.Tx, whose
 	// own finalization is a CAS on an atomic.Bool so that concurrent Commit/Rollback is race-free.
 	done atomic.Bool
-	// ctx is the context the transaction began with, kept so Commit/Rollback — which take none of their own
-	// — can parent their spans to the transaction. sql.Tx stores its context for the same reason.
+	// ctx is the context the transaction began with, kept so Commit/Rollback - which take none of their own -
+	// can parent their spans to the transaction. sql.Tx stores its context for the same reason.
 	ctx context.Context
 	t   *telemetry // observability snapshot taken when the transaction began (may be nil)
 	// conn is the connection the transaction runs on, held by Transact on the pgx drivers so a [Batch] can
@@ -146,7 +146,7 @@ func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Row
 
 // QueryRow shadows sql.Tx.QueryRow and conforms arg placeholders for the driver. It returns a [Row], which
 // embeds *sql.Row so existing QueryRow(...).Scan(...) call sites are unchanged. In Transact (autoErr) mode
-// the Row latches its Scan/Err error into the transaction (except sql.ErrNoRows — see [Row]).
+// the Row latches its Scan/Err error into the transaction (except sql.ErrNoRows - see [Row]).
 func (tx *Tx) QueryRow(query string, args ...any) *Row {
 	if err := tx.shortCircuit(); err != nil {
 		return &Row{shortErr: err}
@@ -198,7 +198,7 @@ func (tx *Tx) PrepareContext(ctx context.Context, query string) (*Stmt, error) {
 
 // Stmt shadows sql.Tx.Stmt: it binds a statement prepared on the [DB] to this transaction. The returned
 // [Stmt] is transaction-bound, so in Transact mode its execution errors are recorded and short-circuit
-// later statements — a prepared statement is not an escape hatch from the no-partial-commit guarantee.
+// later statements - a prepared statement is not an escape hatch from the no-partial-commit guarantee.
 func (tx *Tx) Stmt(stmt *Stmt) *Stmt {
 	return tx.StmtContext(context.Background(), stmt)
 }
@@ -278,7 +278,7 @@ func (tx *Tx) finalize(op string, run func() error) error {
 	if err == nil {
 		tx.done.Store(true)
 	}
-	// traceErr keeps ErrTxDone bare — whichever path answered it — so == comparisons keep working.
+	// traceErr keeps ErrTxDone bare - whichever path answered it - so == comparisons keep working.
 	return traceErr(err)
 }
 
@@ -293,7 +293,7 @@ func (tx *Tx) Batch() *Batch {
 }
 
 // InsertReturnID executes an INSERT statement and returns the auto-generated ID for the named ID column.
-// idColumn must be a plain identifier matching [A-Za-z_][A-Za-z0-9_]* — it is spliced into the statement
+// idColumn must be a plain identifier matching [A-Za-z_][A-Za-z0-9_]* - it is spliced into the statement
 // on some drivers, so quoted or exotic column names are rejected rather than escaped.
 func (tx *Tx) InsertReturnID(ctx context.Context, idColumn string, stmt string, args ...any) (int64, error) {
 	if err := tx.shortCircuit(); err != nil {
