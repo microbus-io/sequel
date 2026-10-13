@@ -268,11 +268,14 @@ func TestTelemetry_Metrics(t *testing.T) {
 	names := map[string]bool{}
 	// samples maps each histogram data point's attributes, rendered as "k=v,k=v" in key order, to its metric.
 	samples := map[string]string{}
+	// bounds maps each histogram to the bucket boundaries of its data points.
+	bounds := map[string][]float64{}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			names[m.Name] = true
 			if h, ok := m.Data.(metricdata.Histogram[float64]); ok {
 				for _, dp := range h.DataPoints {
+					bounds[m.Name] = dp.Bounds
 					var kv []string
 					for _, a := range dp.Attributes.ToSlice() {
 						kv = append(kv, string(a.Key)+"="+a.Value.Emit())
@@ -292,6 +295,10 @@ func TestTelemetry_Metrics(t *testing.T) {
 	} {
 		assert.Equal(metric, samples[attrs], "expected a %s sample with %s, got %v", metric, attrs, samples)
 	}
+	// Durations are recorded in seconds, so the SDK's default bounds (0, 5, 10, ... 10000), which are sized for
+	// milliseconds, would put nearly every sample in the first bucket.
+	assert.Equal(durationBuckets, bounds["sequel_query_duration"])
+	assert.Equal(durationBuckets, bounds["sequel_transaction_duration"])
 	for _, want := range []string{
 		"sequel_query_duration",
 		"sequel_transaction_duration",

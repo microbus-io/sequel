@@ -107,6 +107,13 @@ func (t *telemetry) tracing() bool {
 	return t.enabled() && t.tracer != nil
 }
 
+// durationBuckets are the bounds in seconds of both duration histograms: Prometheus' defaults, extended down to
+// half a millisecond, where point lookups on a nearby server land, and up to a minute, past MySQL's default 50s
+// lock wait timeout and the transactions that hold their locks that long.
+var durationBuckets = []float64{
+	0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60,
+}
+
 // initInstruments creates the sequel_ metric instruments and registers the connection-pool gauge callback
 // against the current meter. It is called under db.mutex when a MeterProvider is set. Instrument
 // construction errors are ignored: the OTEL API returns a working no-op instrument alongside the error, so
@@ -117,11 +124,13 @@ func (t *telemetry) initInstruments(db *DB) {
 		"sequel_query_duration",
 		metric.WithUnit("s"),
 		metric.WithDescription("Duration of database queries in seconds"),
+		metric.WithExplicitBucketBoundaries(durationBuckets...),
 	)
 	t.transactionDuration, _ = m.Float64Histogram(
 		"sequel_transaction_duration",
 		metric.WithUnit("s"),
 		metric.WithDescription("Duration of Transact calls in seconds, including retries"),
+		metric.WithExplicitBucketBoundaries(durationBuckets...),
 	)
 	// Counter instrument names carry no _total suffix; the Prometheus exporter appends it at scrape time.
 	t.lockContention, _ = m.Int64Counter(
