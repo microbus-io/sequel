@@ -31,9 +31,6 @@ type virtualFunc struct {
 	handler func(driverName string, args string) (string, error)
 }
 
-// virtualFuncCacheSize bounds the number of expanded queries retained in the LRU cache.
-const virtualFuncCacheSize = 4096
-
 // vfIdentPattern matches an identifier directly followed by '('.
 // It is intentionally a single, VF-list-independent pass over the query.
 var vfIdentPattern = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*\(`)
@@ -46,8 +43,6 @@ var vfIdentPattern = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*\(`)
 var (
 	virtualFuncsMutex sync.Mutex // serializes writers so concurrent registrations don't lose updates
 	virtualFuncs      atomic.Pointer[map[string]virtualFunc]
-
-	expandCache = newVFCache(virtualFuncCacheSize)
 )
 
 func init() {
@@ -80,7 +75,7 @@ func RegisterVirtualFunc(name string, handler func(driverName string, args strin
 	virtualFuncs.Store(&clone)
 	virtualFuncsMutex.Unlock()
 	// Registration invalidates previously-cached expansions.
-	expandCache.clear()
+	queries.clear()
 }
 
 // unregisterVirtualFunc removes a registered virtual function. It follows the same clone-then-swap
@@ -98,7 +93,7 @@ func unregisterVirtualFunc(name string) {
 	}
 	virtualFuncs.Store(&clone)
 	virtualFuncsMutex.Unlock()
-	expandCache.clear()
+	queries.clear()
 }
 
 // expandVirtualFuncs replaces virtual function calls in the query with driver-specific expressions.
@@ -106,31 +101,8 @@ func unregisterVirtualFunc(name string) {
 // Multiple passes are performed until no more expansions occur, allowing inner virtual functions
 // to be expanded before outer ones that depend on them.
 //
-// The result is cached in a bounded LRU keyed on (driverName, query), so repeated calls with the
-// same literal query short-circuit to a map lookup.
+// It does not cache; statements are cached unpacked, by [lookupQuery].
 func expandVirtualFuncs(driverName string, query string) (string, error) {
-	return expandVirtualFuncsWithCache(driverName, query, expandCache)
-}
-
-// expandVirtualFuncsWithCache is the testable form of expandVirtualFuncs: it expands using the
-// given cache (or no cache if nil). The cache stores both successful expansions and errors, so a
-// query whose handler returns an error does not have to be re-scanned every time.
-func expandVirtualFuncsWithCache(driverName string, query string, cache *vfCache) (string, error) {
-	key := vfCacheKey{driver: driverName, query: query}
-	if cache != nil {
-		if v, ok := cache.get(key); ok {
-			return v.expanded, v.err
-		}
-	}
-	expanded, err := expandVirtualFuncsUncached(driverName, query)
-	if cache != nil {
-		cache.put(key, vfCacheValue{expanded: expanded, err: err})
-	}
-	return expanded, err
-}
-
-// expandVirtualFuncsUncached performs the actual macro expansion, with no caching.
-func expandVirtualFuncsUncached(driverName string, query string) (string, error) {
 	// Lock-free load of an immutable snapshot; a concurrent RegisterVirtualFunc swaps in a new map and
 	// leaves this one untouched, so the scan below can read vfs without holding any lock.
 	vfs := *virtualFuncs.Load()

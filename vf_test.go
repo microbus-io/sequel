@@ -17,18 +17,15 @@ limitations under the License.
 package sequel
 
 import (
-	"fmt"
-	"strings"
-	"sync"
 	"testing"
 
 	"github.com/microbus-io/testarossa"
 )
 
-// callExpand runs expansion using a fresh local cache, so the test stays independent of any
-// global cache state and is safe to run in parallel with other tests.
+// callExpand runs expansion without the query cache, so the test stays independent of any global cache
+// state and is safe to run in parallel with other tests.
 func callExpand(driverName, query string) (string, error) {
-	return expandVirtualFuncsWithCache(driverName, query, nil)
+	return expandVirtualFuncs(driverName, query)
 }
 
 func TestVF_BasicExpansion(t *testing.T) {
@@ -174,139 +171,6 @@ func TestVF_HandlerErrorPropagated(t *testing.T) {
 	assert.Error(err)
 }
 
-func TestVF_CacheHitReturnsSameValue(t *testing.T) {
-	t.Parallel()
-	assert := testarossa.For(t)
-
-	cache := newVFCache(64)
-	in := "SELECT DATE_ADD_MILLIS(NOW_UTC(), ?) WHERE id=?"
-
-	cold, err := expandVirtualFuncsWithCache("mysql", in, cache)
-	assert.NoError(err)
-	assert.Equal(1, cache.len())
-
-	hot, err := expandVirtualFuncsWithCache("mysql", in, cache)
-	assert.NoError(err)
-	assert.Equal(cold, hot)
-	assert.Equal(1, cache.len())
-}
-
-func TestVF_CacheKeyedOnDriver(t *testing.T) {
-	t.Parallel()
-	assert := testarossa.For(t)
-
-	cache := newVFCache(64)
-	in := "SELECT NOW_UTC()"
-
-	mysqlOut, err := expandVirtualFuncsWithCache("mysql", in, cache)
-	assert.NoError(err)
-	pgxOut, err := expandVirtualFuncsWithCache("pgx", in, cache)
-	assert.NoError(err)
-	assert.NotEqual(mysqlOut, pgxOut)
-	assert.Equal(2, cache.len())
-}
-
-func TestVF_CacheErrorsToo(t *testing.T) {
-	t.Parallel()
-	assert := testarossa.For(t)
-
-	cache := newVFCache(64)
-
-	_, err := expandVirtualFuncsWithCache("mysql", "SELECT DATE_ADD_MILLIS(only_one)", cache)
-	assert.Error(err)
-	first := err.Error()
-	assert.Equal(1, cache.len())
-
-	_, err = expandVirtualFuncsWithCache("mysql", "SELECT DATE_ADD_MILLIS(only_one)", cache)
-	assert.Error(err)
-	assert.Equal(first, err.Error())
-	assert.Equal(1, cache.len())
-}
-
-func TestVF_CacheLRUEvictsOldest(t *testing.T) {
-	t.Parallel()
-	assert := testarossa.For(t)
-
-	cache := newVFCache(3)
-
-	for i := 0; i < 3; i++ {
-		q := fmt.Sprintf("SELECT NOW_UTC() /* %d */", i)
-		_, err := expandVirtualFuncsWithCache("mysql", q, cache)
-		assert.NoError(err)
-	}
-	assert.Equal(3, cache.len())
-
-	// Touch query #0 so #1 becomes the LRU.
-	_, err := expandVirtualFuncsWithCache("mysql", "SELECT NOW_UTC() /* 0 */", cache)
-	assert.NoError(err)
-
-	// Insert a fourth, evicting query #1.
-	_, err = expandVirtualFuncsWithCache("mysql", "SELECT NOW_UTC() /* 3 */", cache)
-	assert.NoError(err)
-	assert.Equal(3, cache.len())
-
-	_, evictedHit := cache.get(vfCacheKey{driver: "mysql", query: "SELECT NOW_UTC() /* 1 */"})
-	assert.False(evictedHit)
-	for _, idx := range []int{0, 2, 3} {
-		_, ok := cache.get(vfCacheKey{
-			driver: "mysql",
-			query:  fmt.Sprintf("SELECT NOW_UTC() /* %d */", idx),
-		})
-		assert.True(ok)
-	}
-}
-
-func TestVF_CacheDisabledWhenCapacityZero(t *testing.T) {
-	t.Parallel()
-	assert := testarossa.For(t)
-
-	cache := newVFCache(0)
-	_, err := expandVirtualFuncsWithCache("mysql", "SELECT NOW_UTC()", cache)
-	assert.NoError(err)
-	assert.Equal(0, cache.len())
-
-	q, err := expandVirtualFuncsWithCache("mysql", "SELECT NOW_UTC()", cache)
-	assert.NoError(err)
-	assert.Equal("SELECT (UTC_TIMESTAMP(3))", q)
-	assert.Equal(0, cache.len())
-}
-
-func TestVF_NilCacheDisablesCache(t *testing.T) {
-	t.Parallel()
-	assert := testarossa.For(t)
-
-	q, err := expandVirtualFuncsWithCache("mysql", "SELECT NOW_UTC()", nil)
-	assert.NoError(err)
-	assert.Equal("SELECT (UTC_TIMESTAMP(3))", q)
-}
-
-// TestVF_CacheInvalidatedOnRegister verifies that RegisterVirtualFunc clears the global cache.
-// This test cannot run in parallel because it mutates the global VF map and cache.
-func TestVF_CacheInvalidatedOnRegister(t *testing.T) {
-	assert := testarossa.For(t)
-
-	// Use a unique VF name so other tests are not affected.
-	const vfName = "TEST_VF_INVALIDATION_ABCXYZ"
-
-	t.Cleanup(func() { unregisterVirtualFunc(vfName) })
-
-	// Prime the global cache with at least one entry.
-	_, err := expandVirtualFuncs("mysql", "SELECT NOW_UTC() /* TestVF_CacheInvalidatedOnRegister */")
-	assert.NoError(err)
-	assert.NotEqual(0, expandCache.len())
-
-	// Registration must invalidate the cache.
-	RegisterVirtualFunc(vfName, func(driverName, args string) (string, error) {
-		return "/*test*/", nil
-	})
-	assert.Equal(0, expandCache.len())
-
-	// And the freshly registered VF is picked up.
-	q, err := expandVirtualFuncs("mysql", "SELECT "+vfName+"()")
-	assert.NoError(err)
-	assert.Equal("SELECT /*test*/", q)
-}
-
 func TestVF_NewlyRegisteredVFExpanded(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)
@@ -323,34 +187,6 @@ func TestVF_NewlyRegisteredVFExpanded(t *testing.T) {
 	assert.Equal("SELECT DOUBLE(price) FROM t", q)
 }
 
-func TestVF_ConcurrentCallsAreSafe(t *testing.T) {
-	t.Parallel()
-
-	cache := newVFCache(256)
-	const workers = 32
-	const iters = 200
-	var wg sync.WaitGroup
-	wg.Add(workers)
-	for w := 0; w < workers; w++ {
-		go func(w int) {
-			defer wg.Done()
-			for i := 0; i < iters; i++ {
-				q := fmt.Sprintf("SELECT NOW_UTC() /* w=%d i=%d */", w%4, i%4)
-				out, err := expandVirtualFuncsWithCache("mysql", q, cache)
-				if err != nil {
-					t.Errorf("unexpected error: %v", err)
-					return
-				}
-				if !strings.Contains(out, "(UTC_TIMESTAMP(3))") {
-					t.Errorf("unexpected result: %q", out)
-					return
-				}
-			}
-		}(w)
-	}
-	wg.Wait()
-}
-
 func TestVF_NoMatchReturnsSameString(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)
@@ -359,35 +195,6 @@ func TestVF_NoMatchReturnsSameString(t *testing.T) {
 	out, err := callExpand("mysql", in)
 	assert.NoError(err)
 	assert.Equal(in, out)
-}
-
-// BenchmarkExpandVirtualFuncs_Hot measures the cache-hit path.
-func BenchmarkExpandVirtualFuncs_Hot(b *testing.B) {
-	const q = "UPDATE microbus_steps SET lease_expires=DATE_ADD_MILLIS(NOW_UTC(), ?) WHERE step_id=?"
-	cache := newVFCache(64)
-	if _, err := expandVirtualFuncsWithCache("pgx", q, cache); err != nil {
-		b.Fatal(err)
-	}
-	b.ReportAllocs()
-	for b.Loop() {
-		if _, err := expandVirtualFuncsWithCache("pgx", q, cache); err != nil {
-			b.Fatal(err)
-		}
-	}
-}
-
-// BenchmarkExpandVirtualFuncs_Cold measures the cache-miss path: a unique query every iteration.
-func BenchmarkExpandVirtualFuncs_Cold(b *testing.B) {
-	b.ReportAllocs()
-	for i := 0; b.Loop(); i++ {
-		q := fmt.Sprintf(
-			"UPDATE microbus_steps SET lease_expires=DATE_ADD_MILLIS(NOW_UTC(), ?) WHERE step_id=? /* %d */",
-			i,
-		)
-		if _, err := expandVirtualFuncsWithCache("pgx", q, nil); err != nil {
-			b.Fatal(err)
-		}
-	}
 }
 
 func TestVF_JSONField(t *testing.T) {

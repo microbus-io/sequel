@@ -91,7 +91,7 @@ func (tx *Tx) Exec(query string, args ...any) (sql.Result, error) {
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	res, err := instrumentExec(tx.t, tx.rtt, context.Background(), tx.driverName, query,
+	res, err := instrumentExec(tx.t, tx.rtt, context.Background(), lookupQuery(tx.driverName, query),
 		func(_ context.Context, q string) (sql.Result, error) {
 			return tx.Tx.Exec(q, args...)
 		})
@@ -103,7 +103,7 @@ func (tx *Tx) ExecContext(ctx context.Context, query string, args ...any) (sql.R
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	res, err := instrumentExec(tx.t, tx.rtt, ctx, tx.driverName, query,
+	res, err := instrumentExec(tx.t, tx.rtt, ctx, lookupQuery(tx.driverName, query),
 		func(ctx context.Context, q string) (sql.Result, error) {
 			return tx.Tx.ExecContext(ctx, q, args...)
 		})
@@ -118,14 +118,14 @@ func (tx *Tx) Query(query string, args ...any) (*Rows, error) {
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	rows, err := instrumentExec(tx.t, tx.rtt, context.Background(), tx.driverName, query,
+	rows, err := instrumentExec(tx.t, tx.rtt, context.Background(), lookupQuery(tx.driverName, query),
 		func(_ context.Context, q string) (*sql.Rows, error) {
 			return tx.Tx.Query(q, args...)
 		})
 	if err != nil {
 		return nil, tx.recordErr(err)
 	}
-	return &Rows{Rows: rows, recordErr: tx.recordErr}, nil
+	return &Rows{Rows: rows, tx: tx}, nil
 }
 
 // QueryContext shadows sql.Tx.QueryContext and conforms arg placeholders for the driver. It returns a
@@ -134,14 +134,14 @@ func (tx *Tx) QueryContext(ctx context.Context, query string, args ...any) (*Row
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	rows, err := instrumentExec(tx.t, tx.rtt, ctx, tx.driverName, query,
+	rows, err := instrumentExec(tx.t, tx.rtt, ctx, lookupQuery(tx.driverName, query),
 		func(ctx context.Context, q string) (*sql.Rows, error) {
 			return tx.Tx.QueryContext(ctx, q, args...)
 		})
 	if err != nil {
 		return nil, tx.recordErr(err)
 	}
-	return &Rows{Rows: rows, recordErr: tx.recordErr}, nil
+	return &Rows{Rows: rows, tx: tx}, nil
 }
 
 // QueryRow shadows sql.Tx.QueryRow and conforms arg placeholders for the driver. It returns a [Row], which
@@ -151,7 +151,7 @@ func (tx *Tx) QueryRow(query string, args ...any) *Row {
 	if err := tx.shortCircuit(); err != nil {
 		return &Row{shortErr: err}
 	}
-	return instrumentQueryRow(tx.t, tx.rtt, context.Background(), tx.driverName, query, tx.recordErr,
+	return instrumentQueryRow(tx.t, tx.rtt, context.Background(), lookupQuery(tx.driverName, query), tx,
 		func(_ context.Context, q string) *sql.Row {
 			return tx.Tx.QueryRow(q, args...)
 		})
@@ -163,7 +163,7 @@ func (tx *Tx) QueryRowContext(ctx context.Context, query string, args ...any) *R
 	if err := tx.shortCircuit(); err != nil {
 		return &Row{shortErr: err}
 	}
-	return instrumentQueryRow(tx.t, tx.rtt, ctx, tx.driverName, query, tx.recordErr,
+	return instrumentQueryRow(tx.t, tx.rtt, ctx, lookupQuery(tx.driverName, query), tx,
 		func(ctx context.Context, q string) *sql.Row {
 			return tx.Tx.QueryRowContext(ctx, q, args...)
 		})
@@ -184,16 +184,15 @@ func (tx *Tx) PrepareContext(ctx context.Context, query string) (*Stmt, error) {
 	if err := tx.shortCircuit(); err != nil {
 		return nil, err
 	}
-	var unpacked string
-	sqlStmt, err := instrumentExec(tx.t, tx.rtt, ctx, tx.driverName, query,
+	pq := lookupQuery(tx.driverName, query)
+	sqlStmt, err := instrumentExec(tx.t, tx.rtt, ctx, pq,
 		func(ctx context.Context, q string) (*sql.Stmt, error) {
-			unpacked = q
 			return tx.Tx.PrepareContext(ctx, q)
 		})
 	if err != nil {
 		return nil, tx.recordErr(err)
 	}
-	return &Stmt{Stmt: sqlStmt, query: unpacked, driverName: tx.driverName, tx: tx}, nil
+	return &Stmt{Stmt: sqlStmt, pq: pq, driverName: tx.driverName, tx: tx}, nil
 }
 
 // Stmt shadows sql.Tx.Stmt: it binds a statement prepared on the [DB] to this transaction. The returned
@@ -206,14 +205,14 @@ func (tx *Tx) Stmt(stmt *Stmt) *Stmt {
 // StmtContext shadows sql.Tx.StmtContext (see Stmt).
 func (tx *Tx) StmtContext(ctx context.Context, stmt *Stmt) *Stmt {
 	if stmt.err != nil {
-		return &Stmt{query: stmt.query, driverName: tx.driverName, tx: tx, err: stmt.err}
+		return &Stmt{pq: stmt.pq, driverName: tx.driverName, tx: tx, err: stmt.err}
 	}
 	if tx.openBatch != nil && !tx.batchExecuting {
 		// Binding may prepare on the connection, which an open batch's result set may still be using.
-		return &Stmt{query: stmt.query, driverName: tx.driverName, tx: tx, err: tx.shortCircuit()}
+		return &Stmt{pq: stmt.pq, driverName: tx.driverName, tx: tx, err: tx.shortCircuit()}
 	}
 	// The statement text was unpacked for the same pool, so it carries over; only the binding changes.
-	return &Stmt{Stmt: tx.Tx.StmtContext(ctx, stmt.Stmt), query: stmt.query, driverName: tx.driverName, tx: tx}
+	return &Stmt{Stmt: tx.Tx.StmtContext(ctx, stmt.Stmt), pq: stmt.pq, driverName: tx.driverName, tx: tx}
 }
 
 /*

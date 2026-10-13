@@ -22,6 +22,7 @@ import (
 	"log/slog"
 	"maps"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -179,114 +180,167 @@ func (t *telemetry) clearInstruments() {
 }
 
 /*
-begin starts instrumentation for a single query-shaped operation and returns a (possibly new) context
-carrying the span plus a finish func to call with the operation's error. query is the executed (unpacked)
-SQL; its leading keyword and, when unambiguous, its table become the db.operation.name / db.collection.name
-attributes and the span name. The finish func records duration, classifies lock contention, sets the span
-status, and - when the logger is enabled at Debug level - emits a Debug log. Safe to call on a nil
-*telemetry (no-op).
+queryOp is one query-shaped operation being instrumented, from begin to finish. It is a value rather than a
+closure, so starting and finishing an operation allocates nothing of sequel's own. Its zero value, from a nil
+*telemetry, finishes as a no-op.
 */
-func (t *telemetry) begin(ctx context.Context, driver, query string) (context.Context, func(err error)) {
-	return t.beginAt(ctx, driver, query, time.Now())
+type queryOp struct {
+	t     *telemetry
+	pq    *preparedQuery
+	ctx   context.Context // carries the span, when one was started
+	span  trace.Span
+	start time.Time
+}
+
+/*
+begin starts instrumentation for a single query-shaped operation. The statement's leading keyword and, when
+unambiguous, its table are its db.operation.name / db.collection.name attributes and its span name; all of them
+come precomputed with the [preparedQuery]. The returned op's ctx carries the span, and its finish records
+duration, classifies lock contention, sets the span status, and - when the logger is enabled at Debug level -
+emits a Debug log. Safe to call on a nil *telemetry (no-op).
+*/
+func (t *telemetry) begin(ctx context.Context, pq *preparedQuery) queryOp {
+	if !t.enabled() {
+		return queryOp{ctx: ctx}
+	}
+	op := queryOp{t: t, pq: pq, ctx: ctx, start: time.Now()}
+	t.logOperationCapOnce(ctx)
+	if t.tracer != nil {
+		op.ctx, op.span = t.tracer.Start(ctx, pq.spanName, pq.spanOptions...)
+	}
+	return op
 }
 
 // beginAt is begin with an explicit start instant, for an operation whose instrumentation can only be
 // decided after it has run (see instrumentTxEnd). Back-dating keeps the span covering the whole operation.
-func (t *telemetry) beginAt(ctx context.Context, driver, query string, start time.Time) (context.Context, func(err error)) {
+func (t *telemetry) beginAt(ctx context.Context, pq *preparedQuery, start time.Time) queryOp {
 	if !t.enabled() {
-		return ctx, func(error) {}
+		return queryOp{ctx: ctx}
 	}
-	op, table := parseOperation(query)
+	op := queryOp{t: t, pq: pq, ctx: ctx, start: start}
 	t.logOperationCapOnce(ctx)
-
-	var span trace.Span
 	if t.tracer != nil {
-		spanName := op
-		if table != "" {
-			spanName = op + " " + table
-		}
-		attrs := []attribute.KeyValue{
-			attribute.String("db.system.name", driver),
-			attribute.String("db.operation.name", op),
-		}
-		if table != "" {
-			attrs = append(attrs, attribute.String("db.collection.name", table))
-		}
-		ctx, span = t.tracer.Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindClient),
-			trace.WithTimestamp(start), trace.WithAttributes(attrs...))
+		// Clipped, so the append copies rather than writing into the shared slice.
+		opts := append(slices.Clip(pq.spanOptions), trace.WithTimestamp(start))
+		op.ctx, op.span = t.tracer.Start(ctx, pq.spanName, opts...)
 	}
+	return op
+}
 
-	return ctx, func(err error) {
-		dur := time.Since(start).Seconds()
-		status := "ok"
+// finish ends the operation with its error.
+func (op *queryOp) finish(err error) {
+	t, pq := op.t, op.pq
+	if t == nil {
+		return
+	}
+	dur := time.Since(op.start).Seconds()
+	record := pq.recordOK
+	if err != nil {
+		record = pq.recordFailed
+		if t.lockContention != nil && IsLockContentionError(err) {
+			t.lockContention.Add(op.ctx, 1, pq.addContention...)
+		}
+	}
+	if t.queryDuration != nil {
+		t.queryDuration.Record(op.ctx, dur, record...)
+	}
+	if op.span != nil {
 		if err != nil {
-			status = "error"
-			if t.lockContention != nil && IsLockContentionError(err) {
-				t.lockContention.Add(ctx, 1, metric.WithAttributes(
-					attribute.String("db.system.name", driver),
-					attribute.String("db.operation.name", op),
-				))
-			}
+			op.span.RecordError(err)
+			op.span.SetStatus(codes.Error, err.Error())
 		}
-		if t.queryDuration != nil {
-			t.queryDuration.Record(ctx, dur, metric.WithAttributes(
-				attribute.String("db.system.name", driver),
-				attribute.String("db.operation.name", op),
-				attribute.String("status", status),
-			))
-		}
-		if span != nil {
-			if err != nil {
-				span.RecordError(err)
-				span.SetStatus(codes.Error, err.Error())
-			}
-			span.End()
-		}
-		if t.logger != nil && t.logger.Enabled(ctx, slog.LevelDebug) {
-			args := []any{"driver", driver, "operation", op, "query", query, "duration_s", dur}
-			if err != nil {
-				// Logged at Debug, not Error: the library returns every error to the caller, who logs it.
-				t.logger.DebugContext(ctx, "sequel query failed", append(args, "error", err.Error())...)
-			} else {
-				t.logger.DebugContext(ctx, "sequel query", args...)
-			}
+		op.span.End()
+	}
+	if t.logger != nil && t.logger.Enabled(op.ctx, slog.LevelDebug) {
+		args := []any{"driver", pq.key.driver, "operation", pq.op, "query", pq.text, "duration_s", dur}
+		if err != nil {
+			// Logged at Debug, not Error: the library returns every error to the caller, who logs it.
+			t.logger.DebugContext(op.ctx, "sequel query failed", append(args, "error", err.Error())...)
+		} else {
+			t.logger.DebugContext(op.ctx, "sequel query", args...)
 		}
 	}
 }
 
-// beginTransact starts instrumentation for a whole Transact call (covering all retry attempts) and returns
-// a context carrying the span plus a finish func taking the final attempt count and error. Safe on a nil
-// *telemetry (no-op).
-func (t *telemetry) beginTransact(ctx context.Context, driver string) (context.Context, func(attempts int, err error)) {
+// transactLabels are the span options and metric attributes of a Transact on one driver, precomputed so a
+// transaction allocates nothing of sequel's own to report them.
+type transactLabels struct {
+	spanOptions      []trace.SpanStartOption
+	recordCommitted  []metric.RecordOption
+	recordRolledBack []metric.RecordOption
+}
+
+// transactLabelsByDriver holds the transactLabels of each driver name, built on first use.
+var transactLabelsByDriver sync.Map // string -> *transactLabels
+
+// transactLabelsOf returns the transactLabels of a driver.
+func transactLabelsOf(driver string) *transactLabels {
+	if v, ok := transactLabelsByDriver.Load(driver); ok {
+		return v.(*transactLabels)
+	}
+	system := attribute.String("db.system.name", driver)
+	labels := &transactLabels{
+		spanOptions: []trace.SpanStartOption{
+			trace.WithSpanKind(trace.SpanKindClient),
+			trace.WithAttributes(system),
+		},
+		recordCommitted: []metric.RecordOption{
+			metric.WithAttributeSet(attribute.NewSet(system, attribute.String("outcome", "committed"))),
+		},
+		recordRolledBack: []metric.RecordOption{
+			metric.WithAttributeSet(attribute.NewSet(system, attribute.String("outcome", "rolledback"))),
+		},
+	}
+	v, _ := transactLabelsByDriver.LoadOrStore(driver, labels)
+	return v.(*transactLabels)
+}
+
+// transactOp is a whole Transact call being instrumented, covering all retry attempts. Like [queryOp], its zero
+// value finishes as a no-op.
+type transactOp struct {
+	t      *telemetry
+	labels *transactLabels
+	ctx    context.Context // carries the span, when one was started
+	span   trace.Span
+	start  time.Time
+}
+
+// beginTransact starts instrumentation for a whole Transact call. The returned op's ctx carries the span. Safe
+// on a nil *telemetry (no-op).
+func (t *telemetry) beginTransact(ctx context.Context, driver string) transactOp {
 	if !t.enabled() {
-		return ctx, func(int, error) {}
+		return transactOp{ctx: ctx}
 	}
-	start := time.Now()
-	var span trace.Span
+	op := transactOp{t: t, labels: transactLabelsOf(driver), ctx: ctx, start: time.Now()}
 	if t.tracer != nil {
-		ctx, span = t.tracer.Start(ctx, "transact", trace.WithSpanKind(trace.SpanKindClient),
-			trace.WithAttributes(attribute.String("db.system.name", driver)))
+		op.ctx, op.span = t.tracer.Start(ctx, "transact", op.labels.spanOptions...)
 	}
-	return ctx, func(attempts int, err error) {
-		dur := time.Since(start).Seconds()
-		outcome := "committed"
+	return op
+}
+
+// finish ends the Transact with its final attempt count and error.
+func (op *transactOp) finish(attempts int, err error) {
+	t := op.t
+	if t == nil {
+		return
+	}
+	dur := time.Since(op.start).Seconds()
+	if t.transactionDuration != nil {
+		record := op.labels.recordCommitted
 		if err != nil {
-			outcome = "rolledback"
+			record = op.labels.recordRolledBack
 		}
-		if t.transactionDuration != nil {
-			t.transactionDuration.Record(ctx, dur, metric.WithAttributes(
-				attribute.String("db.system.name", driver),
-				attribute.String("outcome", outcome),
-			))
+		t.transactionDuration.Record(op.ctx, dur, record...)
+	}
+	if op.span != nil {
+		if op.span.IsRecording() {
+			op.span.SetAttributes(attribute.Int("db.transaction.attempts", attempts))
 		}
-		if span != nil {
-			span.SetAttributes(attribute.Int("db.transaction.attempts", attempts))
-			if err != nil {
-				span.RecordError(err)
-				span.SetStatus(codes.Error, err.Error())
-			}
-			span.End()
+		if err != nil {
+			op.span.RecordError(err)
+			op.span.SetStatus(codes.Error, err.Error())
 		}
+		op.span.End()
 	}
 }
 
@@ -526,66 +580,56 @@ func isIdentDelim(c byte) bool {
 	return isSQLSpace(c) || c == ',' || c == '(' || c == ')' || c == ';'
 }
 
-// instrumentExec wraps an Exec/Query/Prepare-shaped operation: it unpacks the query once, opens a span,
-// pauses for the simulated round-trip time (see [DB.SimulateRTT]; normally zero), runs the operation, and
-// finishes instrumentation with the result error. The operation error is wrapped by traceErr - the stack
-// is attached around the raw error, so driver error types stay intact for IsLockContentionError and the
-// database/sql sentinels pass through untouched.
-func instrumentExec[T any](t *telemetry, rtt time.Duration, ctx context.Context, driver, query string, run func(ctx context.Context, unpacked string) (T, error)) (T, error) {
-	var zero T
-	unpacked, err := unpackQuery(driver, query)
-	if err != nil {
-		_, finish := t.begin(ctx, driver, query)
-		finish(err)
-		return zero, errors.Trace(err)
-	}
-	return instrumentUnpacked(t, rtt, ctx, driver, unpacked, run)
-}
-
-// instrumentUnpacked is instrumentExec for a statement that is already unpacked - an execution of a
-// prepared [Stmt], whose text was expanded and conformed once at Prepare time.
+// instrumentExec wraps an Exec/Query/Prepare-shaped operation on a statement looked up with [lookupQuery]: it
+// opens a span, pauses for the simulated round-trip time (see [DB.SimulateRTT]; normally zero), runs the
+// operation on the unpacked text, and finishes instrumentation with the result error. A statement that failed
+// to unpack is reported without running. The operation error is wrapped by traceErr - the stack is attached
+// around the raw error, so driver error types stay intact for IsLockContentionError and the database/sql
+// sentinels pass through untouched.
 //
 // The pause sits inside the span rather than before it, so an operation's recorded duration includes the
 // latency being simulated. That is the point of simulating it: the numbers a test reads should be the ones
-// a caller would experience. Unpacking is local string work, not a round trip, so it stays outside.
-func instrumentUnpacked[T any](t *telemetry, rtt time.Duration, ctx context.Context, driver, unpacked string, run func(ctx context.Context, unpacked string) (T, error)) (T, error) {
-	ctx, finish := t.begin(ctx, driver, unpacked)
-	if err := simulateRTT(ctx, rtt); err != nil {
-		finish(err)
-		var zero T
+// a caller would experience.
+func instrumentExec[T any](t *telemetry, rtt time.Duration, ctx context.Context, pq *preparedQuery, run func(ctx context.Context, unpacked string) (T, error)) (T, error) {
+	var zero T
+	op := t.begin(ctx, pq)
+	if pq.err != nil {
+		op.finish(pq.err)
+		return zero, errors.Trace(pq.err)
+	}
+	if err := simulateRTT(op.ctx, rtt); err != nil {
+		op.finish(err)
 		return zero, errors.Trace(err)
 	}
-	res, err := run(ctx, unpacked)
+	res, err := run(op.ctx, pq.text)
 	// finish sees the raw error: spans, metrics and the Debug log record what the driver reported, without
 	// the wrapper.
-	finish(err)
+	op.finish(err)
 	return res, traceErr(err)
 }
 
 // instrumentQueryRow wraps QueryRow/QueryRowContext. Because database/sql defers the query error to Scan,
-// the returned *Row carries the finish func and reports the operation's error (and duration ending) when
-// the caller calls Scan or Err. An unpack error is swallowed here exactly as the original shadow methods do
-// (the empty query then surfaces a driver error at Scan time).
-func instrumentQueryRow(t *telemetry, rtt time.Duration, ctx context.Context, driver, query string, recordErr func(error) error, run func(ctx context.Context, unpacked string) *sql.Row) *Row {
-	unpacked, _ := unpackQuery(driver, query)
-	return instrumentQueryRowUnpacked(t, rtt, ctx, driver, unpacked, recordErr, run)
-}
-
-// instrumentQueryRowUnpacked is instrumentQueryRow for a statement that is already unpacked - an
-// execution of a prepared [Stmt].
-func instrumentQueryRowUnpacked(t *telemetry, rtt time.Duration, ctx context.Context, driver, unpacked string, recordErr func(error) error, run func(ctx context.Context, unpacked string) *sql.Row) *Row {
-	ctx, finish := t.begin(ctx, driver, unpacked)
+// the returned *Row carries the operation and reports its error (and duration ending) when the caller calls
+// Scan or Err. An unpack error is swallowed here exactly as the original shadow methods do: the empty
+// statement run in its place surfaces a driver error at Scan time. Telemetry still labels the operation from
+// the statement as written. tx is the transaction whose error the Row latches, nil for none.
+func instrumentQueryRow(t *telemetry, rtt time.Duration, ctx context.Context, pq *preparedQuery, tx *Tx, run func(ctx context.Context, unpacked string) *sql.Row) *Row {
+	unpacked := pq.text
+	if pq.err != nil {
+		unpacked = ""
+	}
+	op := t.begin(ctx, pq)
 	// A context that expires during the simulated round trip needs no handling of its own here: the query
 	// below is issued with that same context, so the driver surfaces the cancellation at Scan - which is
 	// where a QueryRow error surfaces in any case.
-	_ = simulateRTT(ctx, rtt)
-	return &Row{Row: run(ctx, unpacked), finish: finish, recordErr: recordErr}
+	_ = simulateRTT(op.ctx, rtt)
+	return &Row{Row: run(op.ctx, unpacked), op: op, tx: tx}
 }
 
 // instrumentTxOp wraps a transaction lifecycle operation - BEGIN, COMMIT, ROLLBACK. database/sql exposes
-// these as methods rather than SQL, so there is no statement text to unpack and the operation keyword goes
-// to beginAt as the "query".
-func instrumentTxOp[T any](t *telemetry, rtt time.Duration, ctx context.Context, driver, op string, run func(ctx context.Context) (T, error)) (T, error) {
+// these as methods rather than SQL, so there is no statement text to unpack and the operation keyword is
+// looked up as the statement.
+func instrumentTxOp[T any](t *telemetry, rtt time.Duration, ctx context.Context, driver, opName string, run func(ctx context.Context) (T, error)) (T, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -599,14 +643,14 @@ func instrumentTxOp[T any](t *telemetry, rtt time.Duration, ctx context.Context,
 		// stamp an error span on every cancelled Transact, whose deferred rollback lands here.
 		return res, err
 	}
-	_, finish := t.beginAt(ctx, driver, op, start)
-	finish(err)
+	op := t.beginAt(ctx, lookupQuery(driver, opName), start)
+	op.finish(err)
 	return res, err
 }
 
 // instrumentTxEnd is instrumentTxOp for COMMIT and ROLLBACK, which return no value.
-func instrumentTxEnd(t *telemetry, rtt time.Duration, ctx context.Context, driver, op string, run func() error) error {
-	_, err := instrumentTxOp(t, rtt, ctx, driver, op,
+func instrumentTxEnd(t *telemetry, rtt time.Duration, ctx context.Context, driver, opName string, run func() error) error {
+	_, err := instrumentTxOp(t, rtt, ctx, driver, opName,
 		func(context.Context) (any, error) { return nil, run() })
 	return err
 }
@@ -624,7 +668,7 @@ streamed read, so a closure that ignores a QueryRow error cannot commit work bui
 returning false, "no row" reaches a QueryRow caller as an error and is routine control flow
 (`if err == sql.ErrNoRows { ...default... }`). Latching it would doom every transaction that legitimately
 handles a missing row. Every other error - deadlock, type-conversion failure, connection drop - is latched.
-Outside a Transact-managed Tx, recordErr is nil and no latching occurs.
+Outside a Transact-managed Tx no latching occurs.
 
 Always call Scan. As with *sql.Row, only Scan releases the connection: Err ends the span and reports the
 query's error, but after a successful query the connection stays held until Scan is called. A Row that is
@@ -632,12 +676,13 @@ never scanned therefore holds its connection, and if Err is not called either, l
 */
 type Row struct {
 	*sql.Row
-	finish func(error)
-	// recordErr latches an error into the owning autoErr Tx; nil for a *DB query or a non-Transact Tx.
-	recordErr func(error) error
+	op queryOp
+	// tx is the transaction the Row's error is latched into (recording only in autoErr mode); nil for a *DB
+	// query.
+	tx *Tx
 	// shortErr is the already-recorded transaction error for a Row returned by a short-circuited Tx
 	// query. When set, the embedded *sql.Row is nil and Scan/Err report shortErr without touching the
-	// database; no span was ever started, so finish is nil too.
+	// database; no span was ever started, so op is zero too.
 	shortErr error
 	done     bool
 }
@@ -645,8 +690,8 @@ type Row struct {
 // latch records a non-nil error into the owning transaction, when there is one. sql.ErrNoRows is exempt -
 // see the type doc.
 func (r *Row) latch(err error) {
-	if err != nil && !errors.Is(err, sql.ErrNoRows) && r.recordErr != nil {
-		r.recordErr(err)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) && r.tx != nil {
+		r.tx.recordErr(err)
 	}
 }
 
@@ -675,11 +720,11 @@ func (r *Row) Err() error {
 	return traceErr(err)
 }
 
-// complete fires the finish func once. A Row is not meant for concurrent use, so no synchronization.
+// complete finishes the operation once. A Row is not meant for concurrent use, so no synchronization.
 func (r *Row) complete(err error) {
-	if r.finish != nil && !r.done {
+	if !r.done {
 		r.done = true
-		r.finish(err)
+		r.op.finish(err)
 	}
 }
 

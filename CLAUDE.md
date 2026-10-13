@@ -463,7 +463,7 @@ same latching `Rows`/`Row`.
 
 `DB.Prepare` returns the same type even though there is no latch outside a transaction, because the
 `Executor` interface requires `DB` and `Tx` to agree on the signature - and because a DB-prepared statement
-is the natural argument to `Tx.Stmt`, which re-binds it (`stmt.query` carries the unpacked text; only the
+is the natural argument to `Tx.Stmt`, which re-binds it (`stmt.pq` carries the unpacked statement; only the
 tx binding changes). This is also why `Tx.Stmt` takes a `*sequel.Stmt` rather than `*sql.Stmt`: the common
 flow `db.Prepare` -> `tx.Stmt(stmt)` must keep compiling. A DB-bound `Stmt` reads telemetry and the
 simulated delay *live* per execution (matching `DB` methods); a Tx-bound one uses the transaction's
@@ -494,6 +494,70 @@ Two exemptions, and one ordering rule, are load-bearing:
 - Latches (`recordErr`, `Rows`/`Row` `latch`) may receive either form; they classify with `errors.Is`/
   `errors.As`, so it does not matter which.
 
+## Per-statement work is computed once (`querycache.go`)
+
+Everything sequel derives from a statement depends only on its driver and text: the virtual-function expansion,
+the placeholder conforming, the operation and table, the span name, and the attribute sets of its spans and metrics.
+`lookupQuery` computes all of it once into an immutable `preparedQuery` and every later execution reuses it. Before,
+only the expansion was cached; conforming and `parseOperation` (which upper-cased the whole statement) ran on every
+call, and the span options and `attribute.NewSet` were rebuilt every time, which made sequel a large share of a
+consumer's allocations. The option slices are shared and handed to OTel with `...`, so they must never be appended
+to in place - `beginAt` clips before adding its timestamp.
+
+Caching the operation label is safe even though the label set is learned at runtime: the set only grows and its cap
+never resets, so a label once computed never changes. Learning still happens on first sighting - now when a
+statement is first looked up rather than first executed, which `UnpackQuery` and batched statements also do.
+
+### Lock-free hits, CLOCK eviction
+
+The cache used to be an LRU behind one mutex, and a hit called `MoveToFront`: every statement in the process took
+the same lock and wrote to the same list. The alternatives considered:
+
+- **Copy-on-write snapshot** (the `operationLabels` pattern) suits a 128-entry set that is almost never written. Here
+  a miss clones up to 4096 entries, and an application that interpolates literals into its SQL misses on nearly
+  every statement.
+- **Fill to a cap, then stop inserting** keeps whatever arrived first. One burst of one-off statements and the
+  statements the process keeps running are uncached for the rest of its life.
+
+So a hit is a `sync.Map` load (lock-free on Go 1.24+) plus setting the entry's `referenced` flag, checked first so
+that a statement already marked is read without a write - the hit path dirties no shared cache line. A miss computes
+the entry outside any lock and inserts under the mutex, where a CLOCK hand clears flags until it finds an entry not
+hit since its last pass. A new entry starts unreferenced, so a statement that runs once is evicted ahead of the ones
+that keep being hit, and a statement that keeps running survives any stream of one-off statements
+(`TestQueryCache_HotEntrySurvivesOneOffs`). Hits set flags without the lock, so they can re-mark entries behind the
+hand while it sweeps; the sweep stops after two full turns and evicts where it stands.
+
+`RegisterVirtualFunc` clears the cache. An entry computed against the old registry and inserted after the clear would
+be stale, so `clear` bumps a generation and `insert` drops an entry computed under an older one.
+
+### A cached error must have its stack clipped
+
+Unpacking errors are cached too, and each execution returns `errors.Trace(pq.err)`. `Trace` builds a new error that
+**shares** the wrapped error's `Stack` slice and appends a frame to it, so if that slice has spare capacity,
+concurrent executions write the same slot. `newPreparedQuery` clips the stack, so every append reallocates. A
+malformed `JSON_FIELD` path is traced three deep, which leaves spare capacity; `TestQueryCache_ConcurrentErrorTrace`
+fails under `-race` without the clip. The race predates this cache: the LRU cached the same errors.
+
+### `queryOp`, not a closure
+
+`begin` returns a `queryOp` value with a `finish` method rather than a finish closure, because a returned closure is
+a heap allocation per statement. `Row` holds the op inline. The same goes for `transactOp`, whose labels are built
+once per driver. `Row` and `Rows` hold the `*Tx` to latch into rather than the method value `tx.recordErr`, which
+allocated a closure per query.
+
+### What is left, and what was rejected
+
+On the global no-op tracer each statement still allocates a non-recording span and its context (`global.(*tracer)
+.newSpan`). Skipping the span would mean detecting that no tracer is installed behind the global delegate, which the
+OTel API does not expose. Comparing `otel.GetTracerProvider()` with the provider captured at `Open` would work, but
+it would also skip spans that OTel's eBPF auto-instrumentation creates from the delegate.
+
+Pooled buffers with unsafe `[]byte`-to-string conversion were rejected for the unpacked text. The string does not
+stay inside sequel: pgx keys its prepared-statement cache by the SQL string, `db.collection.name` is a substring of it
+that an OTel batch processor exports after the call returns, and an async `slog` handler can keep the Debug line.
+Recycling the buffer would rewrite a pgx map key in place and could run one statement's prepared plan with another's
+arguments. Caching gives the same steady-state saving with immutable strings.
+
 ## Hardening against uncontrolled input
 
 Sequel splices text into SQL, error messages, and telemetry attributes in a handful of places. The rule in
@@ -523,7 +587,7 @@ Four places carry input sequel does not control:
 
 Related, and already the case: pool metrics identify a pool by parsed database name, never the raw DSN;
 spans never carry statement text; the Debug log carries parameterized text only (placeholders, no argument
-values); and the virtual-function expansion cache is a bounded LRU.
+values); and the statement cache is bounded, with eviction (see "Per-statement work is computed once").
 
 ## Observability (`telemetry.go`)
 
@@ -651,7 +715,7 @@ All three originally went straight to the underlying `sql.DB`/`sql.Tx`, so they 
 `sequel_query_duration` sample. Their latency was inside the parent `transact` span's wall time but not
 broken out, so a slow commit showed up only as time in `transact` that no child span accounted for. They
 share one wrapper (`instrumentTxOp`) because `database/sql` exposes all three as methods rather than SQL -
-there is no statement text to unpack, and the operation keyword goes to `beginAt` as the "query".
+there is no statement text to unpack, and the operation keyword is looked up as the statement.
 
 The sharper problem was the **contention counter**. A serialization failure very often surfaces at `COMMIT`
 rather than at a statement - that is the normal shape on CockroachDB and on PostgreSQL under `SERIALIZABLE`,

@@ -168,13 +168,14 @@ func (b *Batch) pipeline(ctx context.Context) (*pgtype.Map, error) {
 	for _, it := range b.items {
 		unpacked, err := unpackQuery(driver, it.query)
 		if err != nil {
-			_, finish := t.begin(ctx, driver, "BATCH")
-			finish(err)
+			op := t.begin(ctx, lookupQuery(driver, "BATCH"))
+			op.finish(err)
 			return nil, b.failFrom(0, err)
 		}
 		it.unpacked = unpacked
 	}
-	ctx, finish := t.begin(ctx, driver, "BATCH")
+	batchOp := t.begin(ctx, lookupQuery(driver, "BATCH"))
+	ctx = batchOp.ctx
 	if t.tracing() {
 		trace.SpanFromContext(ctx).SetAttributes(attribute.Int("db.operation.batch.size", len(b.items)))
 	}
@@ -184,7 +185,7 @@ func (b *Batch) pipeline(ctx context.Context) (*pgtype.Map, error) {
 		}
 	}
 	if err := simulateRTT(ctx, tx.rtt); err != nil {
-		finish(err)
+		batchOp.finish(err)
 		return nil, b.failFrom(0, err)
 	}
 	var typeMap *pgtype.Map
@@ -229,7 +230,7 @@ func (b *Batch) pipeline(ctx context.Context) (*pgtype.Map, error) {
 		return first
 	})
 	if panicked != nil {
-		finish(err)
+		batchOp.finish(err)
 		panic(panicked)
 	}
 	if errors.Is(err, sql.ErrConnDone) {
@@ -241,7 +242,7 @@ func (b *Batch) pipeline(ctx context.Context) (*pgtype.Map, error) {
 		// The borrow itself failed, or the transaction was over: nothing was sent.
 		first = b.failFrom(0, err)
 	}
-	finish(first)
+	batchOp.finish(first)
 	return typeMap, first
 }
 

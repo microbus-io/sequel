@@ -33,19 +33,19 @@ partial work.
 It embeds *sql.Rows, so the usual `for rows.Next() { rows.Scan(...) }`, `rows.Err()`, and `rows.Close()`
 call sites are unchanged; only code that explicitly stores the result as *sql.Rows needs adjustment (the
 same source-compat caveat as [Row]). Outside a Transact-managed Tx - a *DB query, or a Tx obtained from
-[DB.BeginTx] - recordErr is nil, so Rows is a pure passthrough and behaves exactly like *sql.Rows.
+[DB.BeginTx] - nothing is latched, so Rows is a pure passthrough and behaves exactly like *sql.Rows.
 */
 type Rows struct {
 	*sql.Rows
-	// recordErr latches an error into the owning autoErr Tx (and returns it unchanged); nil for a *DB
-	// query or a non-Transact Tx, where Rows is a pure passthrough.
-	recordErr func(error) error
+	// tx is the transaction errors are latched into (recording only in autoErr mode); nil for a *DB query,
+	// where Rows is a pure passthrough.
+	tx *Tx
 }
 
 // latch records a non-nil error into the owning transaction, when there is one.
 func (r *Rows) latch(err error) {
-	if err != nil && r.recordErr != nil {
-		r.recordErr(err)
+	if err != nil && r.tx != nil {
+		r.tx.recordErr(err)
 	}
 }
 

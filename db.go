@@ -505,7 +505,7 @@ func (db *DB) snapshotStats() (sql.DBStats, bool) {
 
 // Exec shadows sql.DB.Exec and conforms arg placeholders for the driver.
 func (db *DB) Exec(query string, args ...any) (sql.Result, error) {
-	return instrumentExec(db.telemetry.Load(), db.rtt(), context.Background(), db.driverName, query,
+	return instrumentExec(db.telemetry.Load(), db.rtt(), context.Background(), lookupQuery(db.driverName, query),
 		func(_ context.Context, q string) (sql.Result, error) {
 			return db.DB.Exec(q, args...)
 		})
@@ -513,7 +513,7 @@ func (db *DB) Exec(query string, args ...any) (sql.Result, error) {
 
 // ExecContext shadows sql.DB.ExecContext and conforms arg placeholders for the driver.
 func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error) {
-	return instrumentExec(db.telemetry.Load(), db.rtt(), ctx, db.driverName, query,
+	return instrumentExec(db.telemetry.Load(), db.rtt(), ctx, lookupQuery(db.driverName, query),
 		func(ctx context.Context, q string) (sql.Result, error) {
 			return db.DB.ExecContext(ctx, q, args...)
 		})
@@ -523,7 +523,7 @@ func (db *DB) ExecContext(ctx context.Context, query string, args ...any) (sql.R
 // embeds *sql.Rows so existing rows.Next()/rows.Scan()/rows.Err() call sites are unchanged. A *DB query
 // is not transactional, so Rows here is a pure passthrough (no error latching).
 func (db *DB) Query(query string, args ...any) (*Rows, error) {
-	rows, err := instrumentExec(db.telemetry.Load(), db.rtt(), context.Background(), db.driverName, query,
+	rows, err := instrumentExec(db.telemetry.Load(), db.rtt(), context.Background(), lookupQuery(db.driverName, query),
 		func(_ context.Context, q string) (*sql.Rows, error) {
 			return db.DB.Query(q, args...)
 		})
@@ -536,7 +536,7 @@ func (db *DB) Query(query string, args ...any) (*Rows, error) {
 // QueryContext shadows sql.DB.QueryContext and conforms arg placeholders for the driver. It returns a
 // [Rows] (see Query); a *DB query does not latch errors into any transaction.
 func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*Rows, error) {
-	rows, err := instrumentExec(db.telemetry.Load(), db.rtt(), ctx, db.driverName, query,
+	rows, err := instrumentExec(db.telemetry.Load(), db.rtt(), ctx, lookupQuery(db.driverName, query),
 		func(ctx context.Context, q string) (*sql.Rows, error) {
 			return db.DB.QueryContext(ctx, q, args...)
 		})
@@ -549,7 +549,7 @@ func (db *DB) QueryContext(ctx context.Context, query string, args ...any) (*Row
 // QueryRow shadows sql.DB.QueryRow and conforms arg placeholders for the driver. It returns a [Row], which
 // embeds *sql.Row so existing QueryRow(...).Scan(...) call sites are unchanged.
 func (db *DB) QueryRow(query string, args ...any) *Row {
-	return instrumentQueryRow(db.telemetry.Load(), db.rtt(), context.Background(), db.driverName, query, nil,
+	return instrumentQueryRow(db.telemetry.Load(), db.rtt(), context.Background(), lookupQuery(db.driverName, query), nil,
 		func(_ context.Context, q string) *sql.Row {
 			return db.DB.QueryRow(q, args...)
 		})
@@ -558,7 +558,7 @@ func (db *DB) QueryRow(query string, args ...any) *Row {
 // QueryRowContext shadows sql.DB.QueryRowContext and conforms arg placeholders for the driver. It returns a
 // [Row], which embeds *sql.Row so existing QueryRowContext(...).Scan(...) call sites are unchanged.
 func (db *DB) QueryRowContext(ctx context.Context, query string, args ...any) *Row {
-	return instrumentQueryRow(db.telemetry.Load(), db.rtt(), ctx, db.driverName, query, nil,
+	return instrumentQueryRow(db.telemetry.Load(), db.rtt(), ctx, lookupQuery(db.driverName, query), nil,
 		func(ctx context.Context, q string) *sql.Row {
 			return db.DB.QueryRowContext(ctx, q, args...)
 		})
@@ -576,16 +576,15 @@ func (db *DB) Prepare(query string) (*Stmt, error) {
 // PrepareContext shadows sql.DB.PrepareContext and conforms arg placeholders for the driver. It returns a
 // [Stmt] (see Prepare).
 func (db *DB) PrepareContext(ctx context.Context, query string) (*Stmt, error) {
-	var unpacked string
-	sqlStmt, err := instrumentExec(db.telemetry.Load(), db.rtt(), ctx, db.driverName, query,
+	pq := lookupQuery(db.driverName, query)
+	sqlStmt, err := instrumentExec(db.telemetry.Load(), db.rtt(), ctx, pq,
 		func(ctx context.Context, q string) (*sql.Stmt, error) {
-			unpacked = q
 			return db.DB.PrepareContext(ctx, q)
 		})
 	if err != nil {
 		return nil, err
 	}
-	return &Stmt{Stmt: sqlStmt, query: unpacked, driverName: db.driverName, db: db}, nil
+	return &Stmt{Stmt: sqlStmt, pq: pq, driverName: db.driverName, db: db}, nil
 }
 
 // Ping shadows sql.DB.Ping so a simulated round-trip delay ([DB.SimulateRTT]) applies to it: a ping is a
@@ -616,14 +615,13 @@ func (db *DB) UnpackQuery(query string) (string, error) {
 	return unpackQuery(db.driverName, query)
 }
 
-// unpackQuery expands virtual functions and conforms arg placeholders for the driver.
+// unpackQuery expands virtual functions and conforms arg placeholders for the driver, through the query cache.
 func unpackQuery(driverName string, query string) (string, error) {
-	query, err := expandVirtualFuncs(driverName, query)
-	if err != nil {
-		return "", errors.Trace(err)
+	pq := lookupQuery(driverName, query)
+	if pq.err != nil {
+		return "", errors.Trace(pq.err)
 	}
-	query = conformPlaceholders(driverName, query)
-	return query, nil
+	return pq.text, nil
 }
 
 // traceErr attaches a stack trace to an operation error at the API boundary, passing the database/sql
@@ -704,9 +702,10 @@ func transactBackoff(n int) {
 // fn cannot commit partial work even if it does not check every statement's error. For SQL Server,
 // SET XACT_ABORT ON is applied so that any statement error aborts the whole transaction.
 func (db *DB) Transact(ctx context.Context, fn func(tx *Tx) error) (err error) {
-	ctx, finish := db.telemetry.Load().beginTransact(ctx, db.driverName)
+	op := db.telemetry.Load().beginTransact(ctx, db.driverName)
+	ctx = op.ctx
 	attempts := 0
-	defer func() { finish(attempts, err) }()
+	defer func() { op.finish(attempts, err) }()
 	for attempt := range transactMaxAttempts {
 		if attempt > 0 {
 			transactBackoff(attempt)

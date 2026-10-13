@@ -256,6 +256,7 @@ func TestTelemetry_Metrics(t *testing.T) {
 
 	var count int
 	assert.NoError(db.QueryRow("SELECT COUNT(id) FROM foo").Scan(&count))
+	assert.Error(db.QueryRow("SELECT id FROM no_such_table").Scan(&count))
 	assert.NoError(db.Transact(context.Background(), func(tx *Tx) error {
 		_, err := tx.Exec("INSERT INTO foo (id, str) VALUES (?, ?)", 99, "z")
 		return err
@@ -265,10 +266,31 @@ func TestTelemetry_Metrics(t *testing.T) {
 	assert.NoError(reader.Collect(context.Background(), &rm))
 
 	names := map[string]bool{}
+	// samples maps each histogram data point's attributes, rendered as "k=v,k=v" in key order, to its metric.
+	samples := map[string]string{}
 	for _, sm := range rm.ScopeMetrics {
 		for _, m := range sm.Metrics {
 			names[m.Name] = true
+			if h, ok := m.Data.(metricdata.Histogram[float64]); ok {
+				for _, dp := range h.DataPoints {
+					var kv []string
+					for _, a := range dp.Attributes.ToSlice() {
+						kv = append(kv, string(a.Key)+"="+a.Value.Emit())
+					}
+					samples[strings.Join(kv, ",")] = m.Name
+				}
+			}
 		}
+	}
+	for attrs, metric := range map[string]string{
+		"db.operation.name=SELECT,db.system.name=sqlite,status=ok":    "sequel_query_duration",
+		"db.operation.name=SELECT,db.system.name=sqlite,status=error": "sequel_query_duration",
+		"db.operation.name=INSERT,db.system.name=sqlite,status=ok":    "sequel_query_duration",
+		"db.operation.name=BEGIN,db.system.name=sqlite,status=ok":     "sequel_query_duration",
+		"db.operation.name=COMMIT,db.system.name=sqlite,status=ok":    "sequel_query_duration",
+		"db.system.name=sqlite,outcome=committed":                     "sequel_transaction_duration",
+	} {
+		assert.Equal(metric, samples[attrs], "expected a %s sample with %s, got %v", metric, attrs, samples)
 	}
 	for _, want := range []string{
 		"sequel_query_duration",

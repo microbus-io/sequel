@@ -40,7 +40,7 @@ lifecycle, not caller-facing work.
 */
 type Stmt struct {
 	*sql.Stmt
-	query      string // the unpacked (expanded and conformed) statement, for instrumentation
+	pq         *preparedQuery // the statement, unpacked when it was prepared
 	driverName string
 	db         *DB // for a DB-prepared Stmt: telemetry and simulated delay are read live per execution
 	tx         *Tx // for a Tx-bound Stmt: latch, short-circuit and snapshots come from the transaction
@@ -94,15 +94,6 @@ func (s *Stmt) recordErr(err error) error {
 	return err
 }
 
-// rowsRecorder is the latch handed to a [Rows]/[Row] produced by this statement: the transaction's when
-// bound to one, nil (pure passthrough) otherwise.
-func (s *Stmt) rowsRecorder() func(error) error {
-	if s.tx != nil {
-		return s.tx.recordErr
-	}
-	return nil
-}
-
 // Exec shadows sql.Stmt.Exec.
 func (s *Stmt) Exec(args ...any) (sql.Result, error) {
 	return s.ExecContext(context.Background(), args...)
@@ -113,7 +104,7 @@ func (s *Stmt) ExecContext(ctx context.Context, args ...any) (sql.Result, error)
 	if err := s.shortCircuit(); err != nil {
 		return nil, err
 	}
-	res, err := instrumentUnpacked(s.telemetry(), s.rttDelay(), ctx, s.driverName, s.query,
+	res, err := instrumentExec(s.telemetry(), s.rttDelay(), ctx, s.pq,
 		func(ctx context.Context, _ string) (sql.Result, error) {
 			return s.Stmt.ExecContext(ctx, args...)
 		})
@@ -131,14 +122,14 @@ func (s *Stmt) QueryContext(ctx context.Context, args ...any) (*Rows, error) {
 	if err := s.shortCircuit(); err != nil {
 		return nil, err
 	}
-	rows, err := instrumentUnpacked(s.telemetry(), s.rttDelay(), ctx, s.driverName, s.query,
+	rows, err := instrumentExec(s.telemetry(), s.rttDelay(), ctx, s.pq,
 		func(ctx context.Context, _ string) (*sql.Rows, error) {
 			return s.Stmt.QueryContext(ctx, args...)
 		})
 	if err != nil {
 		return nil, s.recordErr(err)
 	}
-	return &Rows{Rows: rows, recordErr: s.rowsRecorder()}, nil
+	return &Rows{Rows: rows, tx: s.tx}, nil
 }
 
 // QueryRow shadows sql.Stmt.QueryRow. It returns a [Row], which embeds *sql.Row so existing
@@ -152,7 +143,7 @@ func (s *Stmt) QueryRowContext(ctx context.Context, args ...any) *Row {
 	if err := s.shortCircuit(); err != nil {
 		return &Row{shortErr: err}
 	}
-	return instrumentQueryRowUnpacked(s.telemetry(), s.rttDelay(), ctx, s.driverName, s.query, s.rowsRecorder(),
+	return instrumentQueryRow(s.telemetry(), s.rttDelay(), ctx, s.pq, s.tx,
 		func(ctx context.Context, _ string) *sql.Row {
 			return s.Stmt.QueryRowContext(ctx, args...)
 		})
