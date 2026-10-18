@@ -62,6 +62,10 @@ func init() {
 // matches NOW_UTC(), now_utc(), Now_Utc(), etc.
 // The handler receives the driver name and the string found between the parentheses,
 // and returns the replacement SQL expression, or an error.
+//
+// On SQL Server, the ? placeholders in the arguments arrive already numbered ($1, $2, ...), so a handler may
+// reorder or repeat them. A handler must not introduce a new ? there: the statement then fails to unpack,
+// because the ordinals around it are already fixed.
 func RegisterVirtualFunc(name string, handler func(driverName string, args string) (string, error)) {
 	upper := strings.ToUpper(name)
 	virtualFuncsMutex.Lock()
@@ -300,12 +304,28 @@ func vfDateAddMillis(driverName string, args string) (string, error) {
 	case "pgx", "cockroachdb":
 		return "(" + baseExpr + " + MAKE_INTERVAL(secs => (" + millis + ") / 1000.0))", nil
 	case "mssql":
-		return "DATEADD(MILLISECOND, " + millis + ", " + baseExpr + ")", nil
+		return mssqlDateAddMillis(baseExpr, millis), nil
 	case "sqlite":
 		return "(STRFTIME('%Y-%m-%d %H:%M:%f', " + baseExpr + ", ((" + millis + ") / 1000.0) || ' seconds'))", nil
 	default:
 		return "", errors.New("unsupported driver name: %s", driverName)
 	}
+}
+
+// mssqlDateAddMillis expands DATE_ADD_MILLIS for SQL Server. DATEADD takes an int, so the milliseconds are
+// split into whole hours plus a remainder under an hour, each of which fits. Placeholders arrive numbered
+// ($1, $2...), so millis can be referenced twice.
+func mssqlDateAddMillis(baseExpr, millis string) string {
+	if n, err := strconv.ParseInt(millis, 10, 64); err == nil {
+		// Not up to the int limits: DATEADD(MILLISECOND, -2147483648, ...) overflows although its argument fits
+		if n > -3600000 && n < 3600000 {
+			return "DATEADD(MILLISECOND, " + millis + ", " + baseExpr + ")"
+		}
+		return "DATEADD(MILLISECOND, " + strconv.FormatInt(n%3600000, 10) +
+			", DATEADD(HOUR, " + strconv.FormatInt(n/3600000, 10) + ", " + baseExpr + "))"
+	}
+	ms := "CAST(" + millis + " AS BIGINT)"
+	return "DATEADD(MILLISECOND, " + ms + " % 3600000, DATEADD(HOUR, " + ms + " / 3600000, " + baseExpr + "))"
 }
 
 // vfDateDiffMillis is the handler for the DATE_DIFF_MILLIS() virtual function.
@@ -423,8 +443,8 @@ func parseJSONPath(path string) ([]jsonPathElem, error) {
 // access and array indexes only. The conventional JSONPath '$' root is optional, so '$.name' and 'name' are
 // the same path.
 //
-// The column expression is referenced more than once on MySQL and SQL Server, so it must not itself contain a
-// ? placeholder - a bound argument there would be consumed twice and misalign every later placeholder.
+// The column expression is referenced more than once on MySQL, so it must not itself contain a ? placeholder -
+// a bound argument there would be consumed twice and misalign every later placeholder.
 //
 // Note the SQL Server ceiling: JSON_VALUE returns NVARCHAR(4000) and yields NULL (in lax mode) for a longer
 // scalar, so a JSON *string* over 4000 characters reads back as NULL there. Objects and arrays are unaffected

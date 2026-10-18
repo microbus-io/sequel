@@ -247,9 +247,35 @@ func TestDB_ConformArgPlaceholders_NonPgx(t *testing.T) {
 	stmt := `SELECT * FROM foo WHERE id=? AND name=?`
 	assert.Equal(stmt, db.ConformArgPlaceholders(stmt))
 
-	// MSSQL driver should also return unchanged
-	db = &DB{driverName: "mssql"}
+	// SQLite driver should also return unchanged
+	db = &DB{driverName: "sqlite"}
 	assert.Equal(stmt, db.ConformArgPlaceholders(stmt))
+
+	// SQL Server numbers its placeholders like Postgres
+	db = &DB{driverName: "mssql"}
+	assert.Equal(`SELECT * FROM foo WHERE id=$1 AND name=$2`, db.ConformArgPlaceholders(stmt))
+}
+
+func TestDB_ConformArgPlaceholders_CommentsAndBrackets(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	for _, driverName := range []string{"pgx", "mssql"} {
+		db := &DB{driverName: driverName}
+		assert.Equal("SELECT a -- why?\nFROM t WHERE id=$1", db.ConformArgPlaceholders("SELECT a -- why?\nFROM t WHERE id=?"))
+		assert.Equal("SELECT a /* why? */ FROM t WHERE id=$1 AND b=$2", db.ConformArgPlaceholders("SELECT a /* why? */ FROM t WHERE id=? AND b=?"))
+		assert.Equal("SELECT a FROM t WHERE id=$1 -- why?", db.ConformArgPlaceholders("SELECT a FROM t WHERE id=? -- why?"))
+		assert.Equal("SELECT a FROM t WHERE id=$1 /* why?", db.ConformArgPlaceholders("SELECT a FROM t WHERE id=? /* why?"))
+		assert.Equal("SELECT a /*/ why? */ FROM t WHERE id=$1", db.ConformArgPlaceholders("SELECT a /*/ why? */ FROM t WHERE id=?"))
+		assert.Equal("SELECT a FROM t WHERE x=$1-$2", db.ConformArgPlaceholders("SELECT a FROM t WHERE x=?-?"))
+		assert.Equal("SELECT a FROM t WHERE s='it''s ?' AND id=$1", db.ConformArgPlaceholders("SELECT a FROM t WHERE s='it''s ?' AND id=?"))
+	}
+
+	// Brackets quote an identifier on SQL Server only; elsewhere they subscript an array
+	db := &DB{driverName: "mssql"}
+	assert.Equal("SELECT [why?], [a]]?] FROM t WHERE id=$1", db.ConformArgPlaceholders("SELECT [why?], [a]]?] FROM t WHERE id=?"))
+	db = &DB{driverName: "pgx"}
+	assert.Equal("SELECT arr[$1] FROM t WHERE id=$2", db.ConformArgPlaceholders("SELECT arr[?] FROM t WHERE id=?"))
 }
 
 func TestDB_NowUTC(t *testing.T) {
@@ -327,7 +353,7 @@ func TestDB_UnpackQuery_NowUTC(t *testing.T) {
 	db = newTestDB("mssql")
 	q, err = db.UnpackQuery("UPDATE t SET updated_at=NOW_UTC() WHERE id=?")
 	assert.NoError(err)
-	assert.Equal("UPDATE t SET updated_at=(CONVERT(DATETIME2(3), SYSUTCDATETIME())) WHERE id=?", q)
+	assert.Equal("UPDATE t SET updated_at=(CONVERT(DATETIME2(3), SYSUTCDATETIME())) WHERE id=$1", q)
 
 	db = newTestDB("sqlite")
 	q, err = db.UnpackQuery("UPDATE t SET updated_at=NOW_UTC() WHERE id=?")
@@ -385,6 +411,24 @@ func TestDB_UnpackQuery_DateAddMillis(t *testing.T) {
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, 5000)")
 	assert.NoError(err)
 	assert.Equal("SELECT DATEADD(MILLISECOND, 5000, created_at)", q)
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, -2592000000)")
+	assert.NoError(err)
+	assert.Equal("SELECT DATEADD(MILLISECOND, 0, DATEADD(HOUR, -720, created_at))", q)
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, 3599999)")
+	assert.NoError(err)
+	assert.Equal("SELECT DATEADD(MILLISECOND, 3599999, created_at)", q)
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, 3723004)")
+	assert.NoError(err)
+	assert.Equal("SELECT DATEADD(MILLISECOND, 123004, DATEADD(HOUR, 1, created_at))", q)
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, -2147483648)")
+	assert.NoError(err)
+	assert.Equal("SELECT DATEADD(MILLISECOND, -1883648, DATEADD(HOUR, -596, created_at))", q)
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, ttl_ms)")
+	assert.NoError(err)
+	assert.Equal("SELECT DATEADD(MILLISECOND, CAST(ttl_ms AS BIGINT) % 3600000, DATEADD(HOUR, CAST(ttl_ms AS BIGINT) / 3600000, created_at))", q)
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, ?) WHERE id=?")
+	assert.NoError(err)
+	assert.Equal("SELECT DATEADD(MILLISECOND, CAST($1 AS BIGINT) % 3600000, DATEADD(HOUR, CAST($1 AS BIGINT) / 3600000, created_at)) WHERE id=$2", q)
 
 	db = newTestDB("sqlite")
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, 5000)")
@@ -449,7 +493,10 @@ func TestDB_UnpackQuery_LimitOffset(t *testing.T) {
 	db = newTestDB("mssql")
 	q, err = db.UnpackQuery("SELECT * FROM users ORDER BY id LIMIT_OFFSET(?, ?)")
 	assert.NoError(err)
-	assert.Equal("SELECT * FROM users ORDER BY id OFFSET ? ROWS FETCH NEXT ? ROWS ONLY", q)
+	assert.Equal("SELECT * FROM users ORDER BY id OFFSET $2 ROWS FETCH NEXT $1 ROWS ONLY", q)
+	q, err = db.UnpackQuery("SELECT * FROM users WHERE tenant=? ORDER BY id LIMIT_OFFSET(?, ?)")
+	assert.NoError(err)
+	assert.Equal("SELECT * FROM users WHERE tenant=$1 ORDER BY id OFFSET $3 ROWS FETCH NEXT $2 ROWS ONLY", q)
 
 	db = newTestDB("sqlite")
 	q, err = db.UnpackQuery("SELECT * FROM users ORDER BY id LIMIT_OFFSET(10, 0)")

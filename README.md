@@ -95,7 +95,7 @@ CockroachDB speaks the PostgreSQL wire protocol and shares the `pgx` driver, but
 
 ### Automatic Placeholder Conversion
 
-All query methods (`Exec`, `Query`, `QueryRow`, `Prepare`, and their `Context` variants) automatically convert `?` placeholders to the driver's native syntax. For PostgreSQL, `?` becomes `$1`, `$2`, etc. For MySQL, SQL Server, and SQLite, `?` is left as-is. Placeholders inside quoted strings are left untouched.
+All query methods (`Exec`, `Query`, `QueryRow`, `Prepare`, and their `Context` variants) automatically convert `?` placeholders to the driver's native syntax. For PostgreSQL and SQL Server, `?` becomes `$1`, `$2`, etc. For MySQL and SQLite, `?` is left as-is. A `?` inside a quoted string or a comment, or on SQL Server inside a bracketed identifier, is left untouched.
 
 ```go
 // Works on all drivers - placeholders are converted automatically
@@ -135,8 +135,11 @@ On SQL Server the value is rounded to millisecond precision so it matches the ot
 |------------|-----------------------------------------------------------------------------------|
 | MySQL      | `DATE_ADD(created_at, INTERVAL (?) * 1000 MICROSECOND)`                          |
 | PostgreSQL | `created_at + MAKE_INTERVAL(secs => (?) / 1000.0)`                              |
-| SQL Server | `DATEADD(MILLISECOND, ?, created_at)`                                             |
+| SQL Server | `DATEADD(MILLISECOND, CAST($1 AS BIGINT) % 3600000, DATEADD(HOUR, CAST($1 AS BIGINT) / 3600000, created_at))` |
 | SQLite     | `STRFTIME('%Y-%m-%d %H:%M:%f', created_at, '+' \|\| ((?) / 1000.0) \|\| ' seconds')` |
+
+On SQL Server, `DATEADD` takes an `int`, so the milliseconds are split into hours plus a remainder to reach
+intervals past ~24.8 days.
 
 **`DATE_DIFF_MILLIS(a, b)`** returns the difference `(a - b)` in milliseconds.
 
@@ -149,12 +152,12 @@ On SQL Server the value is rounded to millisecond precision so it matches the ot
 
 **`LIMIT_OFFSET(limit, offset)`** provides cross-driver pagination. Note that SQL Server requires an `ORDER BY` clause.
 
-| Driver     | `LIMIT_OFFSET(10, 0)` expands to                      |
-|------------|--------------------------------------------------------|
-| MySQL      | `LIMIT 10 OFFSET 0`                                   |
-| PostgreSQL | `LIMIT 10 OFFSET 0`                                   |
-| SQL Server | `OFFSET 0 ROWS FETCH NEXT 10 ROWS ONLY`               |
-| SQLite     | `LIMIT 10 OFFSET 0`                                   |
+| Driver     | `LIMIT_OFFSET(?, ?)` expands to             |
+|------------|----------------------------------------------|
+| MySQL      | `LIMIT ? OFFSET ?`                          |
+| PostgreSQL | `LIMIT $1 OFFSET $2`                        |
+| SQL Server | `OFFSET $2 ROWS FETCH NEXT $1 ROWS ONLY`    |
+| SQLite     | `LIMIT ? OFFSET ?`                          |
 
 ```go
 db.Query("SELECT * FROM users ORDER BY id LIMIT_OFFSET(?, ?)", limit, offset)
@@ -182,7 +185,7 @@ db.Query("SELECT JSON_FIELD(doc, '$.name') FROM users WHERE JSON_FIELD(doc, '$.a
 
 The path supports member access and array indexes (`$.a.b`, `$.tags[0]`). The JSONPath `$` root is **optional** - `'$.name'` and `'name'` are the same path - so a path copied from the MySQL, SQLite or SQL Server documentation works as-is, and you can leave the `$` off when writing one yourself.
 
-The path must be a **literal**, not a `?` placeholder - PostgreSQL needs it as an array of keys and SQL Server needs it split across two functions, so it has to be known before the query is bound. Member names are restricted to `[A-Za-z_][A-Za-z0-9_]*`. The column expression is referenced twice on MySQL and SQL Server, so it must not itself contain a `?`.
+The path must be a **literal**, not a `?` placeholder - PostgreSQL needs it as an array of keys and SQL Server needs it split across two functions, so it has to be known before the query is bound. Member names are restricted to `[A-Za-z_][A-Za-z0-9_]*`. The column expression is referenced twice on MySQL, so it must not itself contain a `?` there.
 
 > **SQL Server caps scalars at 4000 characters.** `JSON_VALUE` returns `NVARCHAR(4000)` and yields `NULL` for anything longer, so on SQL Server a JSON *string* over 4000 characters reads back as `NULL`. Objects and arrays are unaffected (they go through `JSON_QUERY`, which is `NVARCHAR(MAX)`), as is every other driver. Lifting the cap requires an `OPENJSON ... WITH` rowset, which is a different statement shape than a virtual function can expand into; select the whole column and extract in Go if you need large scalars there.
 
@@ -213,6 +216,10 @@ sequel.RegisterVirtualFunc("BOOL", func(driverName string, args string) (string,
     }
 })
 ```
+
+On SQL Server, a handler receives the arguments' placeholders already numbered (`$1`, `$2`, ...), so it may reorder
+or repeat them, as `LIMIT_OFFSET` and `DATE_ADD_MILLIS` do. A handler must not add a `?` of its own there: the
+statement fails to unpack.
 
 #### UnpackQuery
 

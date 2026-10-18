@@ -187,6 +187,32 @@ func TestVF_NewlyRegisteredVFExpanded(t *testing.T) {
 	assert.Equal("SELECT DOUBLE(price) FROM t", q)
 }
 
+func TestVF_IntroducedPlaceholderRejectedOnMSSQL(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	const vfName = "TEST_VF_TENANT_XYZ"
+	t.Cleanup(func() { unregisterVirtualFunc(vfName) })
+
+	RegisterVirtualFunc(vfName, func(driverName, args string) (string, error) {
+		return "tenant_id=?", nil
+	})
+
+	// Elsewhere, a ? introduced by a virtual function is numbered in text order
+	q, err := unpackQuery("pgx", "SELECT a FROM t WHERE "+vfName+"() AND id=?")
+	assert.NoError(err)
+	assert.Equal("SELECT a FROM t WHERE tenant_id=$1 AND id=$2", q)
+
+	// SQL Server numbers before expansion, so it cannot place the introduced ?
+	_, err = unpackQuery("mssql", "SELECT a FROM t WHERE "+vfName+"() AND id=?")
+	assert.Error(err)
+
+	// A ? the virtual function only passes through arrives numbered
+	q, err = unpackQuery("mssql", "SELECT a FROM t WHERE REGEXP_TEXT_SEARCH(? IN name) AND id=?")
+	assert.NoError(err)
+	assert.Equal("SELECT a FROM t WHERE REGEXP_LIKE(name, $1, 'i') AND id=$2", q)
+}
+
 func TestVF_NoMatchReturnsSameString(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)

@@ -70,6 +70,64 @@ a comparison preserves ordering and the phantom disappears. The general principl
 must never exceed the instant it represents at the precision the schema actually stores, and the only way
 to guarantee that across store-and-compare is to generate at the column's precision.
 
+## SQL Server numbers placeholders before expansion
+
+On PostgreSQL, `?` becomes `$1, $2, ...` *after* virtual functions expand; on SQL Server it happens *before*
+(`newPreparedQuery`), so a handler sees `$N` in its arguments and may reorder or repeat them. Two built-ins need
+that, and neither can be written correctly against bare `?`:
+
+- **`LIMIT_OFFSET(limit, offset)`** expands to `OFFSET <offset> ROWS FETCH NEXT <limit> ROWS ONLY`. With bare `?`
+  the driver binds in text order, so the caller's limit went to `OFFSET` and the offset to `FETCH` - silently the
+  wrong page. A scalar subquery cannot fix it: `OFFSET` and `FETCH` are separate expressions, each allowing only a
+  subquery with no outer references, so neither can hand a value to the other.
+- **`DATE_ADD_MILLIS`** has to reference its milliseconds twice (below), and a bare `?` referenced twice is consumed
+  twice, misaligning every later placeholder.
+
+`go-mssqldb`'s `mssql` driver - the one sequel opens - accepts `$N` as an ordinal alongside `?`
+(`internal/querytext`), turning both into `@pN`, so `$N` may appear in any order and any number of times. That is
+what lets a handler stay a plain text expander: it does not need to know its own bind index, which it could not.
+
+Two consequences carry the safety:
+
+- **The conformer must skip what the driver skips.** The driver ignores a `?` in quotes, comments and
+  `[bracketed identifiers]` (with `]]` as an escaped bracket). Before, sequel left SQL Server's `?` alone and the
+  driver numbered them; now sequel numbers them, so a `?` it numbered inside a comment would shift every later
+  ordinal. `conformPlaceholders` therefore skips comments on PostgreSQL and SQL Server and brackets on SQL Server
+  only - on PostgreSQL `arr[?]` is an array subscript and must be numbered.
+- **A handler must not introduce a `?` on SQL Server.** The ordinals are fixed before it runs, so a new bare `?`
+  would collide with `$1` (the driver numbers bare `?` from 1, independently of `$N`). Re-conforming the expansion
+  and finding a change means one was introduced, and the statement fails to unpack rather than binding the wrong
+  arguments. On PostgreSQL, conforming after expansion still numbers such a `?` in text order. The built-ins only
+  pass their arguments' placeholders through, so this constrains custom functions only.
+
+## SQL Server intervals past `int` (`DATE_ADD_MILLIS()`)
+
+`DATEADD` takes its number as an `int`, so `DATEADD(MILLISECOND, ms, base)` fails with an arithmetic overflow
+for any interval past 2^31-1 ms - about 24.8 days. That is well inside normal use: a 30-day retention purge or a
+30-day sleep. `DATE_DIFF_MILLIS` has no such limit, because it uses `DATEDIFF_BIG`. There is no `DATEADD_BIG`, so the
+interval is split into whole hours plus a remainder under an hour,
+`DATEADD(MILLISECOND, CAST(ms AS BIGINT) % 3600000, DATEADD(HOUR, CAST(ms AS BIGINT) / 3600000, base))`, and each part
+fits in an `int` across the whole `DATETIME2` range. Hours rather than days is not a time-zone concern, since
+`DATEADD` on `DATETIME2` is zone-free and a day there is always 24h; it simply removes the question. Integer division
+truncates toward zero and `%` takes the sign of the dividend, the same in T-SQL as in Go, so negative intervals split
+correctly. The `CAST` makes `%` legal for a float argument.
+
+The split references `ms` twice, which is safe only because placeholders are numbered before expansion (above). An
+earlier version bound `ms` once in a scalar subquery instead, which SQL Server rejects inside an aggregate, a
+`GROUP BY`, a `DEFAULT` or a `CHECK`; numbered placeholders removed the need for it.
+
+An integer literal is split in Go, and is left as a single `DATEADD` only under an hour. The cutoff is not the `int`
+range, because SQL Server's `DATEADD(MILLISECOND, -2147483648, ...)` overflows `DATETIME2` although its argument fits
+in an `int` - found by `TestVF_DateMillisExact`, which checks exact results at both `int` limits.
+
+## Virtual functions are tested for accuracy, with binds
+
+Every virtual function has a fixture that checks *results*, not just that the expansion runs, and passes its
+arguments as binds with binds on both sides. The `LIMIT_OFFSET` swap went unnoticed because its fixture passed only
+literals, and a literal cannot reveal a bind-order bug. Keep that shape when adding a function or a dialect: exact
+values where the engine allows them (`tsLiteral` gives a fixed base for date arithmetic), argument values that differ
+from each other so a swap changes the answer, and the edge values of any limit the expansion works around.
+
 ## Cross-driver JSON extraction (`JSON_FIELD()`)
 
 `JSON_FIELD(col, '$.path')` pulls one field out of a JSON column. The interesting question was never the
@@ -132,9 +190,10 @@ it is validated, discarded, and then re-emitted by us. So `'$.name'` and `'name'
 is *optional* because demanding a token we then throw away is ceremony. `TestVF_JSONFieldRootOptional` pins the
 equivalence on every driver.
 
-Separately, the MySQL and SQL Server expansions reference the **column expression twice**, so it must not
-itself contain a `?` - a bound argument there would be consumed twice and misalign every later placeholder.
-Columns don't normally carry binds, so this is a documented constraint rather than an enforced one.
+Separately, the MySQL expansion references the **column expression twice**, so it must not itself contain a `?`
+there - a bound argument would be consumed twice and misalign every later placeholder. (SQL Server references it
+twice too, but its placeholders are numbered before expansion, so a repeated `$N` is harmless.) Columns don't
+normally carry binds, so this is a documented constraint rather than an enforced one.
 
 ## Transactions: `DB.Transact`
 

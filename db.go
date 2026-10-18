@@ -610,7 +610,7 @@ func (db *DB) DriverName() string {
 
 // UnpackQuery expands virtual functions (e.g. NOW_UTC(), REGEXP_TEXT_SEARCH()) into
 // driver-specific SQL expressions, and conforms arg placeholders
-// to the syntax expected by the driver (e.g. ? to $1, $2 for PostgreSQL).
+// to the syntax expected by the driver (e.g. ? to $1, $2 for PostgreSQL and SQL Server).
 func (db *DB) UnpackQuery(query string) (string, error) {
 	return unpackQuery(db.driverName, query)
 }
@@ -1506,18 +1506,21 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 	return nil
 }
 
-// conformPlaceholders replaces the ? arg placeholders in a SQL statement to $1, $2 etc. for a Postgres driver.
-// Question marks inside quoted strings (single or double quotes) are left as-is.
+// conformPlaceholders replaces the ? arg placeholders in a SQL statement with the ordinals $1, $2 etc. for the
+// Postgres and SQL Server drivers. Question marks inside quoted strings (single or double quotes), comments and,
+// on SQL Server, bracketed identifiers are left as-is.
 func conformPlaceholders(driverName string, stmt string) string {
-	if driverName != "pgx" && driverName != "cockroachdb" {
+	if driverName != "pgx" && driverName != "cockroachdb" && driverName != "mssql" {
 		return stmt
 	}
 	n := strings.Count(stmt, "?")
 	if n == 0 {
 		return stmt
 	}
-	// Fast path: no quotes means no risk of replacing inside strings
-	if !strings.ContainsAny(stmt, `'"`) {
+	brackets := driverName == "mssql"
+	// Fast path: nothing a ? could hide in
+	if !strings.ContainsAny(stmt, `'"`) && !strings.Contains(stmt, "--") && !strings.Contains(stmt, "/*") &&
+		!(brackets && strings.Contains(stmt, "[")) {
 		var sb strings.Builder
 		sb.Grow(len(stmt) + n*3)
 		argIndex := 1
@@ -1535,31 +1538,52 @@ func conformPlaceholders(driverName string, stmt string) string {
 		}
 		return sb.String()
 	}
-	// Slow path: scan character by character to skip quoted regions
+	// Slow path: scan character by character, copying skipped regions verbatim. An escaped quote ('') closes
+	// the region and immediately reopens it, which copies the same bytes; an escaped bracket (]]) does not
+	// reopen, so it is skipped over explicitly.
 	var sb strings.Builder
 	sb.Grow(len(stmt) + n*3)
 	argIndex := 1
 	for i := 0; i < len(stmt); i++ {
 		ch := stmt[i]
-		if ch == '\'' || ch == '"' {
-			// Copy everything up to and including the closing quote
-			quote := ch
-			sb.WriteByte(ch)
-			i++
-			for i < len(stmt) {
-				sb.WriteByte(stmt[i])
-				if stmt[i] == quote {
-					break
-				}
-				i++
-			}
-		} else if ch == '?' {
+		var closer string
+		switch {
+		case ch == '\'' || ch == '"':
+			closer = string(ch)
+		case ch == '[' && brackets:
+			closer = "]"
+		case ch == '-' && strings.HasPrefix(stmt[i:], "--"):
+			closer = "\n"
+		case ch == '/' && strings.HasPrefix(stmt[i:], "/*"):
+			closer = "*/"
+		case ch == '?':
 			sb.WriteString("$")
 			sb.WriteString(strconv.Itoa(argIndex))
 			argIndex++
-		} else {
+			continue
+		default:
 			sb.WriteByte(ch)
+			continue
 		}
+		// Copy everything up to and including the closer, or to the end if it is unterminated
+		end := i + 1
+		if closer == "*/" {
+			end++ // so that /*/ does not close itself
+		}
+		for {
+			j := strings.Index(stmt[end:], closer)
+			if j < 0 {
+				end = len(stmt)
+				break
+			}
+			end += j + len(closer)
+			if closer != "]" || end >= len(stmt) || stmt[end] != ']' {
+				break
+			}
+			end++
+		}
+		sb.WriteString(stmt[i:end])
+		i = end - 1
 	}
 	return sb.String()
 }

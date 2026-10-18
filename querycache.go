@@ -70,7 +70,20 @@ type preparedQuery struct {
 // newPreparedQuery unpacks a statement and derives its telemetry labels.
 func newPreparedQuery(driverName string, query string) *preparedQuery {
 	pq := &preparedQuery{key: queryKey{driver: driverName, query: query}}
-	expanded, err := expandVirtualFuncs(driverName, query)
+	var expanded string
+	var err error
+	if driverName == "mssql" {
+		// Numbered before expansion, so that a virtual function can reorder or repeat its arguments' placeholders
+		expanded, err = expandVirtualFuncs(driverName, conformPlaceholders(driverName, query))
+		if err == nil && conformPlaceholders(driverName, expanded) != expanded {
+			err = errors.New("a virtual function introduced a ? placeholder, which cannot be numbered on SQL Server")
+		}
+	} else {
+		expanded, err = expandVirtualFuncs(driverName, query)
+		if err == nil {
+			expanded = conformPlaceholders(driverName, expanded)
+		}
+	}
 	if err != nil {
 		if te, ok := err.(*errors.TracedError); ok {
 			te.Stack = slices.Clip(te.Stack)
@@ -78,7 +91,7 @@ func newPreparedQuery(driverName string, query string) *preparedQuery {
 		pq.text = query
 		pq.err = err
 	} else {
-		pq.text = conformPlaceholders(driverName, expanded)
+		pq.text = expanded
 	}
 
 	op, table := parseOperation(pq.text)
