@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/microbus-io/testarossa"
 )
 
@@ -1091,4 +1092,111 @@ func TestDB_InsertReturnIDRejectsInvalidColumn(t *testing.T) {
 	var n int
 	assert.NoError(db.QueryRow("SELECT COUNT(*) FROM ins_ident").Scan(&n))
 	assert.Equal(1, n, "rejected calls must not have executed the statement")
+}
+
+// Every PostgreSQL DSN gains timezone=UTC unless the caller chose a session time zone, in the DSN or the
+// environment, and the rewrite changes nothing else the driver parses: not the hosts, the credentials, nor
+// the database, in URL or keyword form.
+func TestDB_PinSessionTimeZoneUTC(t *testing.T) {
+	// Not parallel: t.Setenv. Clear what the driver reads from the environment that could set a time zone or
+	// fail the parse, so a developer's own shell cannot decide the outcome.
+	for _, env := range []string{"PGTZ", "PGOPTIONS", "PGSERVICE", "PGSERVICEFILE", "PGSSLMODE", "PGSSLROOTCERT", "PGSSLCERT", "PGSSLKEY"} {
+		t.Setenv(env, "")
+	}
+	assert := testarossa.For(t)
+
+	pinned := []struct {
+		dsn    string
+		expect string
+	}{
+		{"postgres://u:p@h:5432/db", "postgres://u:p@h:5432/db?timezone=UTC"},
+		{"postgres://u:p@h:5432/db?sslmode=disable", "postgres://u:p@h:5432/db?sslmode=disable&timezone=UTC"},
+		{"postgres://u:p@h:5432/", "postgres://u:p@h:5432/?timezone=UTC"},
+		{"postgres://u:p@h:5432", "postgres://u:p@h:5432?timezone=UTC"},
+		{"postgresql://u:p@h/db", "postgresql://u:p@h/db?timezone=UTC"},
+		{"postgres://u:p@h/db?", "postgres://u:p@h/db?timezone=UTC"},
+		{"postgres://u:p@h/db?sslmode=disable&", "postgres://u:p@h/db?sslmode=disable&timezone=UTC"},
+		{"postgres://u:pa?ss@h/db", "postgres://u:pa?ss@h/db?timezone=UTC"},
+		{"postgres://u:p@h1:5432,h2:5433/db?target_session_attrs=any", "postgres://u:p@h1:5432,h2:5433/db?target_session_attrs=any&timezone=UTC"},
+		{"postgres://u:p@[::1]:5432/db", "postgres://u:p@[::1]:5432/db?timezone=UTC"},
+		{"postgres://u:p@h/db?options=-c%20search_path%3Dx", "postgres://u:p@h/db?options=-c%20search_path%3Dx&timezone=UTC"},
+		{"host=h user=u password=p dbname=db", "timezone=UTC host=h user=u password=p dbname=db"},
+		{`host=h user=u password=abc\`, `timezone=UTC host=h user=u password=abc\`},
+		{"host=h user=u password='a b' dbname=db", "timezone=UTC host=h user=u password='a b' dbname=db"},
+		{"postgres://u:p@h/db?options=-c%20search_path%3Dtimezone_schema", "postgres://u:p@h/db?options=-c%20search_path%3Dtimezone_schema&timezone=UTC"},
+	}
+	for _, c := range pinned {
+		out := pinSessionTimeZoneUTC(c.dsn)
+		assert.Equal(c.expect, out, "for %q", c.dsn)
+		assert.Equal(out, pinSessionTimeZoneUTC(out), "pinning is idempotent for %q", c.dsn)
+
+		before, err := pgx.ParseConfig(c.dsn)
+		assert.NoError(err, "for %q", c.dsn)
+		after, err := pgx.ParseConfig(out)
+		if !assert.NoError(err, "for %q", out) {
+			continue
+		}
+		assert.Equal("UTC", after.RuntimeParams["timezone"], "for %q", c.dsn)
+		assert.Equal(before.Host, after.Host, "for %q", c.dsn)
+		assert.Equal(before.Port, after.Port, "for %q", c.dsn)
+		assert.Equal(before.User, after.User, "for %q", c.dsn)
+		assert.Equal(before.Password, after.Password, "for %q", c.dsn)
+		assert.Equal(before.Database, after.Database, "for %q", c.dsn)
+		assert.Equal(len(before.Fallbacks), len(after.Fallbacks), "for %q", c.dsn)
+		assert.Equal(before.ConnectTimeout, after.ConnectTimeout, "for %q", c.dsn)
+		assert.Equal(before.TLSConfig == nil, after.TLSConfig == nil, "for %q", c.dsn)
+		delete(after.RuntimeParams, "timezone")
+		assert.Equal(before.RuntimeParams, after.RuntimeParams, "for %q", c.dsn)
+	}
+
+	// A time zone the caller named, in any spelling the server accepts, is kept. So is a name registered with
+	// the pgx stdlib's RegisterConnConfig, which is a lookup key rather than a DSN.
+	untouched := []string{
+		"postgres://u:p@h/db?timezone=Asia/Tokyo",
+		"postgres://u:p@h/db?TimeZone=Asia/Tokyo",
+		"postgres://u:p@h/db?options=-c%20TimeZone%3DAsia/Tokyo",
+		"postgres://u:p@h/db?options=-ctimezone%3DAsia/Tokyo",
+		"postgres://u:p@h/db?options=--timezone%3DAsia/Tokyo",
+		"host=h user=u timezone=Asia/Tokyo",
+		"host=h user=u options='-c timezone=Asia/Tokyo'",
+		"registeredConnConfig0",
+	}
+	for _, dsn := range untouched {
+		assert.Equal(dsn, pinSessionTimeZoneUTC(dsn))
+	}
+
+	// A DSN the driver cannot parse now may parse on a later connection (a certificate or service file that
+	// appears after Open), so it is judged by its text: pinned unless it mentions a time zone.
+	missingCert := "postgres://u:p@h/db?sslmode=verify-full&sslrootcert=/nonexistent/sequel/ca.pem"
+	_, err := pgx.ParseConfig(missingCert)
+	assert.Error(err)
+	assert.Equal(missingCert+"&timezone=UTC", pinSessionTimeZoneUTC(missingCert))
+	assert.Equal(missingCert+"&TimeZone=Asia/Tokyo", pinSessionTimeZoneUTC(missingCert+"&TimeZone=Asia/Tokyo"))
+	assert.Equal("timezone=UTC host=h user", pinSessionTimeZoneUTC("host=h user"))
+
+	// A time zone set through the environment is the caller's choice too.
+	t.Setenv("PGTZ", "Asia/Tokyo")
+	assert.Equal("postgres://u:p@h/db", pinSessionTimeZoneUTC("postgres://u:p@h/db"))
+	t.Setenv("PGTZ", "")
+	t.Setenv("PGOPTIONS", "-c timezone=Asia/Tokyo")
+	assert.Equal("postgres://u:p@h/db", pinSessionTimeZoneUTC("postgres://u:p@h/db"))
+	t.Setenv("PGOPTIONS", "-c search_path=x")
+	assert.Equal("postgres://u:p@h/db?timezone=UTC", pinSessionTimeZoneUTC("postgres://u:p@h/db"))
+	t.Setenv("PGOPTIONS", "")
+
+	// Open and OpenSingleton reach it through normalizeDriverAndDSN, for both PostgreSQL driver names and
+	// an inferred driver, and for no other driver.
+	for _, driver := range []string{"pgx", "cockroachdb", ""} {
+		_, dsn, err := normalizeDriverAndDSN(driver, "postgres://u:p@h:5432/db")
+		assert.Expect(dsn, "postgres://u:p@h:5432/db?timezone=UTC", err, nil)
+	}
+	_, dsn, err := normalizeDriverAndDSN("mssql", "sqlserver://u:p@h:1433")
+	assert.Expect(dsn, "sqlserver://u:p@h:1433", err, nil)
+
+	// A pinned keyword DSN still names its pool by database, never by the DSN text, which carries the
+	// password.
+	_, dsn, err = normalizeDriverAndDSN("pgx", "host=h user=u password=secret dbname=mydb")
+	assert.NoError(err)
+	assert.Equal("mydb", databaseAttr("pgx", dsn))
+	assert.Equal("pgx", databaseAttr("pgx", "host=h user=u password=secret"))
 }

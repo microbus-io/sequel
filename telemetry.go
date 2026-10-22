@@ -28,6 +28,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/microbus-io/errors"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -741,6 +742,15 @@ func (r *Row) complete(err error) {
 // name when it can be parsed, falling back to the driver name. The raw DSN is never used - it carries
 // credentials.
 func databaseAttr(driver, dsn string) string {
+	if (driver == "pgx" || driver == "cockroachdb") &&
+		!strings.HasPrefix(dsn, "postgres://") && !strings.HasPrefix(dsn, "postgresql://") {
+		// A keyword DSN has no URL path, so databaseNameFromDataSourceName returns the whole string,
+		// credentials included. Ask the driver's parser instead.
+		if cfg, err := pgx.ParseConfig(dsn); err == nil && cfg.Database != "" {
+			return cfg.Database
+		}
+		return driver
+	}
 	if name, err := databaseNameFromDataSourceName(driver, dsn); err == nil && name != "" {
 		return name
 	}

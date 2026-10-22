@@ -112,6 +112,14 @@ Example data source name for each of the supported drivers:
   - cockroachdb: postgres://username:password@hostname:26257/
   - mssql: sqlserver://username:password@hostname:1433
   - sqlite: file:path/to/database.sqlite
+
+On "pgx" and "cockroachdb", every connection starts its session in the UTC time zone,
+whatever the server, database or role default, so that NOW_UTC() stores the right instant
+in TIMESTAMP and TIMESTAMPTZ columns alike. A time zone the caller chooses is kept instead:
+a timezone parameter in the data source name or in a service file it names, an options
+parameter that sets timezone, or the PGTZ or PGOPTIONS environment variable. A name from
+the pgx stdlib's RegisterConnConfig is passed through unchanged; set timezone in its
+RuntimeParams.
 */
 func Open(driverName string, dataSourceName string) (db *DB, err error) {
 	driverName, dataSourceName, err = normalizeDriverAndDSN(driverName, dataSourceName)
@@ -194,8 +202,8 @@ func OpenSingleton(driverName string, dataSourceName string) (db *DB, err error)
 }
 
 // normalizeDriverAndDSN normalizes driver name aliases, infers the driver name when
-// missing, and applies driver-specific DSN tweaks (MySQL connection params, SQLite
-// busy_timeout pragma).
+// missing, and applies driver-specific DSN tweaks (MySQL connection params, the
+// PostgreSQL session time zone, SQLite busy_timeout pragma).
 func normalizeDriverAndDSN(driverName, dataSourceName string) (string, string, error) {
 	if dataSourceName == "" {
 		return "", "", errors.New("data source name is required")
@@ -227,6 +235,8 @@ func normalizeDriverAndDSN(driverName, dataSourceName string) (string, string, e
 		cfg.Params["readTimeout"] = "8s"
 		cfg.Params["writeTimeout"] = "8s"
 		dataSourceName = cfg.FormatDSN()
+	case "pgx", "cockroachdb":
+		dataSourceName = pinSessionTimeZoneUTC(dataSourceName)
 	case "sqlite":
 		if !strings.Contains(dataSourceName, "busy_timeout") {
 			// Set a busy_timeout so that concurrent writers retry on lock contention
@@ -241,6 +251,63 @@ func normalizeDriverAndDSN(driverName, dataSourceName string) (string, string, e
 		}
 	}
 	return driverName, dataSourceName, nil
+}
+
+// pinSessionTimeZoneUTC adds timezone=UTC to a PostgreSQL DSN unless the caller already chose a session
+// time zone. A name registered with the pgx stdlib's RegisterConnConfig is a lookup key, not a DSN, and is
+// returned unchanged: rewriting it would break the lookup.
+func pinSessionTimeZoneUTC(dsn string) string {
+	if strings.HasPrefix(dsn, "registeredConnConfig") || callerChoseTimeZone(dsn) {
+		return dsn
+	}
+	rest, isURL := strings.CutPrefix(dsn, "postgres://")
+	if !isURL {
+		rest, isURL = strings.CutPrefix(dsn, "postgresql://")
+	}
+	if !isURL {
+		// Prepended, not appended: a keyword DSN may end in a backslash, which would escape the separator.
+		return "timezone=UTC " + dsn
+	}
+	// The driver takes everything before an '@' that precedes the first '/' as userinfo, so a raw '?' in a
+	// password does not start the query. Look for the query only after it.
+	if i := strings.IndexAny(rest, "@/"); i >= 0 && rest[i] == '@' {
+		rest = rest[i+1:]
+	}
+	switch {
+	case !strings.Contains(rest, "?"):
+		return dsn + "?timezone=UTC"
+	case strings.HasSuffix(dsn, "?"), strings.HasSuffix(dsn, "&"):
+		// The driver rejects an empty query pair, so "?&timezone=UTC" would not parse.
+		return dsn + "timezone=UTC"
+	default:
+		return dsn + "&timezone=UTC"
+	}
+}
+
+// optionsTimeZonePattern matches a timezone setting inside a PostgreSQL options value: -c timezone=...,
+// -ctimezone=... or --timezone=..., in any letter case.
+var optionsTimeZonePattern = regexp.MustCompile(`(?i)(^|\s)(-c\s*|--)timezone\s*=`)
+
+// callerChoseTimeZone reports whether a PostgreSQL DSN, a service file it names, or the PGTZ / PGOPTIONS
+// environment variables set the session time zone.
+func callerChoseTimeZone(dsn string) bool {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		// The driver parses again on every connection, and a file missing now (a certificate, a service
+		// file) may be there by then. Judge by the text and the environment, erring towards the caller.
+		return strings.Contains(strings.ToLower(dsn), "timezone") ||
+			os.Getenv("PGTZ") != "" ||
+			strings.Contains(strings.ToLower(os.Getenv("PGOPTIONS")), "timezone")
+	}
+	for k, v := range cfg.RuntimeParams {
+		if strings.EqualFold(k, "timezone") {
+			return true
+		}
+		if strings.EqualFold(k, "options") && optionsTimeZonePattern.MatchString(v) {
+			return true
+		}
+	}
+	return false
 }
 
 // IsLockContentionError returns true if the error indicates database lock contention or a deadlock.

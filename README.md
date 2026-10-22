@@ -120,6 +120,18 @@ Virtual functions are driver-agnostic function calls in your SQL that Sequel exp
 
 On SQL Server the value is rounded to millisecond precision so it matches the other drivers and the precision of a `DATETIME2(3)` column. `SYSUTCDATETIME()` alone is 100-nanosecond precision, which rounds *up* when stored into a millisecond column and can leave a just-written "now" timestamp slightly in the future relative to a later `NOW_UTC()` comparison.
 
+The value is the UTC wall-clock time **without a time zone**. Store it in a column type that has no zone either:
+
+| Driver     | Column type    |
+|------------|----------------|
+| MySQL      | `DATETIME(3)`  |
+| PostgreSQL | `TIMESTAMP`    |
+| SQL Server | `DATETIME2(3)` |
+
+These types store the value as written and read it back unchanged, whatever the session's time zone. Zoned types (`TIMESTAMPTZ` on PostgreSQL, `TIMESTAMP` on MySQL) convert a zone-less value through the session's time zone, so on a session that is not in UTC they store a different instant.
+
+On PostgreSQL and CockroachDB, sequel opens every connection with its session time zone set to UTC, overriding a non-UTC default on the server, database or role. That makes `NOW_UTC()` correct in a `TIMESTAMPTZ` column too. If you choose a time zone yourself, sequel keeps it: a `timezone` parameter in the DSN or in a service file it names, an `options` parameter that sets `timezone`, or the `PGTZ` or `PGOPTIONS` environment variable. On such a session, `NOW_UTC()` is still correct in a `TIMESTAMP` column but not in a `TIMESTAMPTZ` one. A configuration registered with pgx's `stdlib.RegisterConnConfig` is passed through unchanged, so set `timezone` in its `RuntimeParams` yourself. A `SET timezone` statement you run changes that one connection, which then returns to the pool.
+
 **`REGEXP_TEXT_SEARCH(expr IN col1, col2, ...)`** performs a case-insensitive regular expression search across one or more columns.
 
 | Driver     | `REGEXP_TEXT_SEARCH(? IN name, email)` expands to             |

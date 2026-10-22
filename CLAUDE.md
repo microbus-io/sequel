@@ -53,7 +53,7 @@ thing, or it says nothing and this file says the thing.
 `NOW_UTC()` is contracted to return the current UTC timestamp **at millisecond precision** on every
 driver. The non-obvious case is SQL Server. The other drivers already generate at a precision their
 natural timestamp column stores exactly - MySQL `UTC_TIMESTAMP(3)` and SQLite `%f` are milliseconds,
-PostgreSQL `NOW()` is microseconds into a microsecond `timestamptz`. SQL Server's `SYSUTCDATETIME()`,
+PostgreSQL `NOW()` is microseconds into a microsecond `TIMESTAMP`. SQL Server's `SYSUTCDATETIME()`,
 however, is `DATETIME2(7)` (100-nanosecond) precision, finer than the `DATETIME2(3)` columns it is
 typically stored in.
 
@@ -69,6 +69,46 @@ comparison are all rounded the same way. Rounding is monotonic, so consistent ro
 a comparison preserves ordering and the phantom disappears. The general principle: a `NOW_UTC()` value
 must never exceed the instant it represents at the precision the schema actually stores, and the only way
 to guarantee that across store-and-compare is to generate at the column's precision.
+
+## PostgreSQL sessions are pinned to UTC (`pinSessionTimeZoneUTC`)
+
+`NOW_UTC()` on PostgreSQL is `NOW() AT TIME ZONE 'UTC'`, a zone-less `timestamp` holding UTC wall time.
+Written into or compared with a `TIMESTAMPTZ` it is converted through the session's `TimeZone`, so on a
+server, database or role whose default is not UTC every stored instant is off by the offset (and by a
+different offset across a DST change). `TIMESTAMP` columns, sequel's own `sequel_migrations` included, are
+correct on any session. So `normalizeDriverAndDSN` adds `timezone=UTC` to every pgx and CockroachDB DSN.
+
+- **Do not change `NOW_UTC()` to return `timestamptz` instead.** That fixes `TIMESTAMPTZ` columns and breaks
+  every `TIMESTAMP` column on a non-UTC session, which then stores local wall time.
+- **A startup parameter, not an `AfterConnect` `SET`.** It travels in the startup message, so it costs no
+  round trip, reaches every pooled connection, and keeps the DSN a plain string (the singleton key and the
+  testing-database bookkeeping are both keyed on it). Client startup parameters outrank database and role
+  defaults, so the pin wins over `ALTER DATABASE/ROLE ... SET timezone`. CockroachDB accepts it as a session
+  variable too.
+- **A caller's own time zone is kept**, by decision: the one party that named a zone meant it, and the
+  recommended `TIMESTAMP` columns are unaffected either way. Detection runs on `pgx.ParseConfig`, so it
+  sees the environment (`PGTZ` -> `timezone`, `PGOPTIONS` -> `options`) and service files exactly as the
+  driver will. GUC names are case-insensitive, so `TimeZone=` counts; and pgx sends case-variant
+  duplicates in map order, so a pin beside a caller's `TimeZone=` would win on some connections and lose
+  on others. An `options` value that sets `timezone` (`optionsTimeZonePattern`) counts: PostgreSQL applies
+  `options` before the other startup parameters, so a `timezone=UTC` beside it would silently override the
+  caller. (CockroachDB applies them the other way round; leaving `options` alone is right on both.)
+- **The parse at `Open` is a snapshot.** The pgx stdlib parses the DSN again for every new connection, so a
+  DSN that fails now (a certificate or service file mounted after startup) may connect later. On a parse
+  failure the decision falls back to the text and the environment, erring towards the caller: any
+  `timezone` in the DSN, `PGTZ`, or a `timezone` in `PGOPTIONS` leaves it alone. A name from
+  `stdlib.RegisterConnConfig` (`registeredConnConfigN`) is a registry key and is never rewritten; its
+  `RuntimeParams` are the caller's.
+- **The rewrite must mirror the driver's parser.** A keyword DSN is prepended to, because a trailing
+  unquoted backslash would escape an appended separator. For a URL, pgconn takes everything before an `@`
+  that precedes the first `/` as userinfo, so a raw `?` in a password does not start the query; and it
+  rejects an empty query pair, so a DSN ending in `?` or `&` gets no extra separator.
+  `TestDB_PinSessionTimeZoneUTC` re-parses every rewrite and checks nothing but `timezone` changed.
+- `TestTimeZone_NowUTCSurvivesANonUTCDatabase` (fixtures) sets the testing database's default to
+  `America/Los_Angeles`, proves a raw `sql.Open` session sees it, then checks a sequel session is UTC and
+  `NOW_UTC()` round-trips through both column types. Measure a `TIMESTAMPTZ` against `NOW()`, never
+  against `NOW_UTC()`: the comparison converts both through the same session zone and the error cancels.
+  It skips on CockroachDB, where a database default does not reach the root user the suite connects as.
 
 ## SQL Server numbers placeholders before expansion
 
