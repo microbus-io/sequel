@@ -91,6 +91,9 @@ type DB struct {
 	// read on every operation and may be changed while the pool is in use, so it is atomic rather than
 	// guarded by mutex.
 	simulatedRTT atomic.Int64
+	// migrationsTableReady is set once Migrate has made sure sequel_migrations exists, so later calls skip
+	// that round trip.
+	migrationsTableReady atomic.Bool
 }
 
 /*
@@ -1304,13 +1307,8 @@ func (db *DB) adjustConnectionLimits() {
 	db.DB.SetMaxIdleConns(int(maxIdle))
 }
 
-// Migrate reads all #.sql files from the FS, and executes any new migrations in order of their file name.
-// The order of execution is guaranteed only within the context of a sequence name.
-func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
-	ctx, finishMigrate := db.telemetry.Load().beginMigrate(context.Background(), db.driverName, sequenceName)
-	defer func() { finishMigrate(err) }()
-
-	// Init the schema migration table
+// createMigrationsTable creates the sequel_migrations table if it does not exist.
+func (db *DB) createMigrationsTable() error {
 	stmt := ""
 	switch db.driverName {
 	case "mysql":
@@ -1358,7 +1356,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 	default:
 		return errors.New("unsupported driver name: %s", db.driverName)
 	}
-	_, err = db.Exec(stmt)
+	_, err := db.Exec(stmt)
 	if err != nil {
 		// Concurrent first runs race this CREATE: the existence check precedes the catalog insert, so a loser
 		// fails on a duplicate although the table now exists. Proceed if it does.
@@ -1366,11 +1364,28 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		if db.QueryRow(`SELECT COUNT(*) FROM sequel_migrations WHERE 1=0`).Scan(&n) != nil {
 			return errors.Trace(err)
 		}
-		err = nil
+	}
+	return nil
+}
+
+// Migrate reads all #.sql files from the FS, and executes any new migrations in order of their file name.
+// The order of execution is guaranteed only within the context of a sequence name.
+func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
+	ctx, finishMigrate := db.telemetry.Load().beginMigrate(context.Background(), db.driverName, sequenceName)
+	defer func() { finishMigrate(err) }()
+
+	// Init the schema migration table, once per DB
+	if !db.migrationsTableReady.Load() {
+		err = db.createMigrationsTable()
+		if err != nil {
+			return errors.Trace(err)
+		}
+		db.migrationsTableReady.Store(true)
 	}
 
 	// Query for the high watermark
 	var nullableWatermark sql.NullInt32
+	stmt := ""
 	switch db.driverName {
 	case "mysql", "pgx", "cockroachdb":
 		stmt = `SELECT MAX(seq_num) FROM sequel_migrations WHERE seq_name=? AND completed=TRUE`
@@ -1498,7 +1513,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 
 		done := make(chan error)
 		go func() {
-			for _, stmt := range strings.Split(statement, ";\n") {
+			for stmt := range strings.SplitSeq(statement, ";\n") {
 				stmt = strings.TrimSpace(stmt)
 				if stmt == "" {
 					continue

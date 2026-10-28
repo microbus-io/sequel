@@ -20,10 +20,13 @@ import (
 	"context"
 	"encoding/json"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/microbus-io/testarossa"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 func TestDB_ConformArgPlaceholders(t *testing.T) {
@@ -1199,4 +1202,31 @@ func TestDB_PinSessionTimeZoneUTC(t *testing.T) {
 	assert.NoError(err)
 	assert.Equal("mydb", databaseAttr("pgx", dsn))
 	assert.Equal("pgx", databaseAttr("pgx", "host=h user=u password=secret"))
+}
+
+// TestMigrate_CreatesItsTableOnce pins that a DB makes sure of sequel_migrations once, not on every Migrate.
+func TestMigrate_CreatesItsTableOnce(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+
+	db := newSQLiteDB(t)
+	db.SetTracerProvider(tp)
+	// A migration that creates nothing, so every CREATE span is the migrations table's.
+	fsys := fstest.MapFS{"1.sql": &fstest.MapFile{Data: []byte("SELECT 1")}}
+	assert.NoError(db.Migrate(t.Name()+"_a", fsys))
+	assert.NoError(db.Migrate(t.Name()+"_b", fsys))
+	assert.NoError(db.Migrate(t.Name()+"_a", fsys))
+
+	creates := 0
+	var names []string
+	for _, s := range tracetest.SpanStubsFromReadOnlySpans(sr.Ended()) {
+		names = append(names, s.Name)
+		if s.Name == "CREATE" {
+			creates++
+		}
+	}
+	assert.Equal(1, creates, "spans: %v", names)
 }
