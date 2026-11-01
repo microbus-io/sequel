@@ -1374,15 +1374,6 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 	ctx, finishMigrate := db.telemetry.Load().beginMigrate(context.Background(), db.driverName, sequenceName)
 	defer func() { finishMigrate(err) }()
 
-	// Init the schema migration table, once per DB
-	if !db.migrationsTableReady.Load() {
-		err = db.createMigrationsTable()
-		if err != nil {
-			return errors.Trace(err)
-		}
-		db.migrationsTableReady.Store(true)
-	}
-
 	// Query for the high watermark
 	var nullableWatermark sql.NullInt32
 	stmt := ""
@@ -1394,8 +1385,25 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 	default:
 		return errors.New("unsupported driver name: %s", db.driverName)
 	}
-	row := db.QueryRow(stmt, sequenceName)
-	err = row.Scan(&nullableWatermark)
+	// The migrations table is made once per DB. The table can still go away under an open DB - the database
+	// recreated (an in-memory SQLite, a testing database), or the table dropped - so a read that fails after the
+	// table was taken as made makes it again and reads once more.
+	assumed := db.migrationsTableReady.Load()
+	for {
+		if !db.migrationsTableReady.Load() {
+			err = db.createMigrationsTable()
+			if err != nil {
+				return errors.Trace(err)
+			}
+			db.migrationsTableReady.Store(true)
+		}
+		err = db.QueryRow(stmt, sequenceName).Scan(&nullableWatermark)
+		if err == nil || !assumed {
+			break
+		}
+		assumed = false
+		db.migrationsTableReady.Store(false)
+	}
 	if err != nil {
 		return errors.Trace(err)
 	}
@@ -1478,14 +1486,15 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			continue
 		}
 
-		// Try to obtain a lock
+		// Try to obtain a lock. A row just inserted, or just released, holds the moment it was written, so the
+		// comparison must include it: with a strict < a lock taken within that millisecond fails and sleeps.
 		switch db.driverName {
 		case "mysql", "pgx", "cockroachdb":
 			stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000)
-					WHERE seq_name=? AND seq_num=? AND locked_before<NOW_UTC() AND completed=FALSE`
+					WHERE seq_name=? AND seq_num=? AND locked_before<=NOW_UTC() AND completed=FALSE`
 		case "mssql", "sqlite":
 			stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000)
-					WHERE seq_name=? AND seq_num=? AND locked_before<NOW_UTC() AND completed=0`
+					WHERE seq_name=? AND seq_num=? AND locked_before<=NOW_UTC() AND completed=0`
 		default:
 			return errors.New("unsupported driver name: %s", db.driverName)
 		}
@@ -1498,7 +1507,8 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			return errors.Trace(err)
 		}
 		if affected == 0 {
-			time.Sleep(20 * time.Millisecond)
+			// Another runner holds the lock: poll until it completes the migration or its lease lapses.
+			time.Sleep(5 * time.Millisecond)
 			continue
 		}
 

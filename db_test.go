@@ -19,6 +19,8 @@ package sequel
 import (
 	"context"
 	"encoding/json"
+	"strconv"
+	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -1229,4 +1231,73 @@ func TestMigrate_CreatesItsTableOnce(t *testing.T) {
 		}
 	}
 	assert.Equal(1, creates, "spans: %v", names)
+}
+
+// TestMigrate_AFreshMigrationTakesItsLockAtOnce pins that a migration's lock is taken on the first attempt when no
+// one holds it: each migration makes two UPDATEs, taking the lock and marking it complete. A new row's lock is held
+// until the moment it was inserted, so a strict comparison fails the first attempt whenever it lands in the same
+// millisecond, and the attempt is repeated after a 20ms sleep.
+func TestMigrate_AFreshMigrationTakesItsLockAtOnce(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	sr := tracetest.NewSpanRecorder()
+	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
+
+	db := newSQLiteDB(t)
+	db.SetTracerProvider(tp)
+	const files = 10
+	fsys := fstest.MapFS{}
+	for i := 1; i <= files; i++ {
+		fsys[strconv.Itoa(i)+".sql"] = &fstest.MapFile{Data: []byte("SELECT 1")}
+	}
+	assert.NoError(db.Migrate(t.Name(), fsys))
+
+	updates := 0
+	var names []string
+	for _, s := range tracetest.SpanStubsFromReadOnlySpans(sr.Ended()) {
+		names = append(names, s.Name)
+		if strings.HasPrefix(s.Name, "UPDATE") {
+			updates++
+		}
+	}
+	assert.Equal(2*files, updates, "spans: %v", names)
+}
+
+// TestMigrate_AReopenedSingletonMakesItsTableAgain pins that a singleton closed by its last user and opened again
+// still migrates: the database under it may be new, as an in-memory SQLite is once its last connection closes, and
+// the DB took its migrations table as made.
+func TestMigrate_AReopenedSingletonMakesItsTableAgain(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	fsys := fstest.MapFS{"1.sql": &fstest.MapFile{Data: []byte("SELECT 1")}}
+	db, err := OpenSingleton("sqlite", dsn)
+	assert.NoError(err)
+	assert.NoError(db.Migrate(t.Name(), fsys))
+	assert.NoError(db.Close())
+
+	db, err = OpenSingleton("sqlite", dsn)
+	assert.NoError(err)
+	defer db.Close()
+	assert.NoError(db.Migrate(t.Name(), fsys))
+}
+
+// TestMigrate_ADroppedTableIsMadeAgain pins that Migrate makes sequel_migrations again when it is dropped under an
+// open DB that already took it as made, rather than failing until the DB is reopened.
+func TestMigrate_ADroppedTableIsMadeAgain(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newSQLiteDB(t)
+	fsys := fstest.MapFS{"1.sql": &fstest.MapFile{Data: []byte("SELECT 1")}}
+	assert.NoError(db.Migrate(t.Name()+"_a", fsys))
+	_, err := db.Exec("DROP TABLE sequel_migrations")
+	assert.NoError(err)
+	assert.NoError(db.Migrate(t.Name()+"_b", fsys))
+	var n int
+	assert.NoError(db.QueryRow("SELECT COUNT(*) FROM sequel_migrations").Scan(&n))
+	assert.Equal(1, n)
 }
