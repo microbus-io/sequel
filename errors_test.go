@@ -136,6 +136,17 @@ func TestErrors_IsUndefinedTableError(t *testing.T) {
 	assert.True(IsUndefinedTableError(errors.Join(errors.New("op failed"), &pgconn.PgError{Code: "42P01"})))
 	// A typed error's code decides, whatever its message says.
 	assert.False(IsUndefinedTableError(&pgconn.PgError{Code: "23505", Message: "no such table"}))
+	// PostgreSQL and CockroachDB report a qualifier with no FROM-clause entry as 42P01 too, but no table is missing.
+	assert.True(IsUndefinedTableError(&pgconn.PgError{Code: "42P01",
+		Message: `relation "users" does not exist`, Routine: "parserOpenTable"}))
+	assert.False(IsUndefinedTableError(&pgconn.PgError{Code: "42P01",
+		Message: `missing FROM-clause entry for table "f"`, Routine: "errorMissingRTE"}))
+	assert.False(IsUndefinedTableError(&pgconn.PgError{Code: "42P01",
+		Message: `invalid reference to FROM-clause entry for table "users"`, Routine: "errorMissingRTE"}))
+	assert.False(IsUndefinedTableError(&pgconn.PgError{Code: "42P01",
+		Message: `fehlender Eintrag in FROM-Klausel für Tabelle »f«`, Routine: "errorMissingRTE"})) // Localized
+	assert.False(IsUndefinedTableError(&pgconn.PgError{Code: "42P01",
+		Message: `missing FROM-clause entry for table "f"`})) // CockroachDB
 
 	// Substring fallback.
 	undefined := []string{
@@ -152,6 +163,8 @@ func TestErrors_IsUndefinedTableError(t *testing.T) {
 		"connection refused",
 		"SQL logic error: no such column: name (1)",
 		"SQLITE_BUSY: database is locked",
+		`ERROR: missing FROM-clause entry for table "f" (SQLSTATE 42P01)`,                  // PostgreSQL
+		`ERROR: invalid reference to FROM-clause entry for table "users" (SQLSTATE 42P01)`, // PostgreSQL
 	}
 	for _, msg := range defined {
 		assert.False(IsUndefinedTableError(errors.New(msg)), "should not be undefined table: %s", msg)

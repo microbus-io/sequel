@@ -383,7 +383,9 @@ func isLockContentionMessage(msg string) bool {
 }
 
 // IsUndefinedTableError returns true if the error indicates that a statement named a table that does not exist.
-// Recognizes the error from SQLite, MySQL, MariaDB, PostgreSQL, SQL Server, and CockroachDB.
+// Recognizes the error from SQLite, MySQL, MariaDB, PostgreSQL, SQL Server, and CockroachDB. A column qualified by
+// a name that is not in the FROM clause is not a missing table, although PostgreSQL and CockroachDB report it with
+// the same SQLSTATE 42P01.
 //
 // As with [IsLockContentionError], the driver's native error code is preferred, and a substring match is the
 // fallback for errors whose driver type is not in the chain.
@@ -394,8 +396,10 @@ func IsUndefinedTableError(err error) bool {
 
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		// 42P01 undefined_table (PostgreSQL and CockroachDB).
-		return pgErr.Code == "42P01"
+		// 42P01 undefined_table (PostgreSQL and CockroachDB), which also reports a qualifier that names no
+		// FROM-clause entry. PostgreSQL raises both of those in errorMissingRTE; the routine name is not localized,
+		// and the message covers CockroachDB, which sends no PostgreSQL routine.
+		return pgErr.Code == "42P01" && pgErr.Routine != "errorMissingRTE" && !isFromClauseEntryMessage(pgErr.Message)
 	}
 	var myErr *mysql.MySQLError
 	if errors.As(err, &myErr) {
@@ -415,6 +419,8 @@ func IsUndefinedTableError(err error) bool {
 // error chain, and for SQLite's, which carry no distinct code.
 func isUndefinedTableMessage(msg string) bool {
 	switch {
+	case isFromClauseEntryMessage(msg): // PostgreSQL, CockroachDB: a bad qualifier, under the same 42P01
+		return false
 	case strings.Contains(msg, "no such table"): // SQLite
 		return true
 	case strings.Contains(msg, "Error 1146"): // MySQL, MariaDB
@@ -425,6 +431,12 @@ func isUndefinedTableMessage(msg string) bool {
 		return true
 	}
 	return false
+}
+
+// isFromClauseEntryMessage matches the "missing FROM-clause entry" and "invalid reference to FROM-clause entry"
+// errors, which PostgreSQL and CockroachDB report as 42P01 undefined_table although no table is missing.
+func isFromClauseEntryMessage(msg string) bool {
+	return strings.Contains(msg, "FROM-clause entry")
 }
 
 // Close closes the database connection.

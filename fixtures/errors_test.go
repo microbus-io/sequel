@@ -25,7 +25,7 @@ import (
 )
 
 // TestErrors_UndefinedTableFromTheDatabase pins the classification against the error the database itself returns:
-// a missing table, alone and inside a UNION ALL, is recognized, and a missing column on a table that exists is not.
+// a missing table, alone and inside a UNION ALL, is recognized, and a missing column or a bad qualifier is not.
 func TestErrors_UndefinedTableFromTheDatabase(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)
@@ -52,4 +52,12 @@ func TestErrors_UndefinedTableFromTheDatabase(t *testing.T) {
 	err = db.QueryRowContext(ctx, "SELECT absent_column FROM present_table WHERE id=?", 1).Scan(&n)
 	assert.Error(err)
 	assert.False(sequel.IsUndefinedTableError(err), "a missing column: %v", err)
+
+	// PostgreSQL and CockroachDB report these with the undefined_table SQLSTATE, but every table they name exists.
+	err = db.QueryRowContext(ctx, "SELECT f.id FROM present_table WHERE id=?", 1).Scan(&n)
+	assert.Error(err)
+	assert.False(sequel.IsUndefinedTableError(err), "a qualifier with no FROM-clause entry: %v", err)
+	err = db.QueryRowContext(ctx, "SELECT present_table.id FROM present_table p WHERE p.id=?", 1).Scan(&n)
+	assert.Error(err)
+	assert.False(sequel.IsUndefinedTableError(err), "a table name hidden by its alias: %v", err)
 }
