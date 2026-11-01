@@ -382,6 +382,51 @@ func isLockContentionMessage(msg string) bool {
 	return false
 }
 
+// IsUndefinedTableError returns true if the error indicates that a statement named a table that does not exist.
+// Recognizes the error from SQLite, MySQL, MariaDB, PostgreSQL, SQL Server, and CockroachDB.
+//
+// As with [IsLockContentionError], the driver's native error code is preferred, and a substring match is the
+// fallback for errors whose driver type is not in the chain.
+func IsUndefinedTableError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		// 42P01 undefined_table (PostgreSQL and CockroachDB).
+		return pgErr.Code == "42P01"
+	}
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) {
+		// 1146 ER_NO_SUCH_TABLE.
+		return myErr.Number == 1146
+	}
+	var msErr mssql.Error
+	if errors.As(err, &msErr) {
+		// 208 invalid object name.
+		return msErr.Number == 208
+	}
+	// SQLite reports a missing table with the generic SQLITE_ERROR result code, so only its message tells it apart.
+	return isUndefinedTableMessage(err.Error())
+}
+
+// isUndefinedTableMessage is the substring match for missing-table errors whose native driver type is not in the
+// error chain, and for SQLite's, which carry no distinct code.
+func isUndefinedTableMessage(msg string) bool {
+	switch {
+	case strings.Contains(msg, "no such table"): // SQLite
+		return true
+	case strings.Contains(msg, "Error 1146"): // MySQL, MariaDB
+		return true
+	case strings.Contains(msg, "SQLSTATE 42P01"): // PostgreSQL, CockroachDB
+		return true
+	case strings.Contains(msg, "Invalid object name"): // SQL Server
+		return true
+	}
+	return false
+}
+
 // Close closes the database connection.
 //
 // When the underlying database name matches the testing pattern (testing_NN_...),
