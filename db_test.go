@@ -161,6 +161,7 @@ func TestDB_InferDriverName(t *testing.T) {
 	assert.Equal("mysql", inferDriverName("root:root@127.0.0.1:3306/"))
 	assert.Equal("pgx", inferDriverName("user:pw@127.0.0.1:5432/"))
 	assert.Equal("cockroachdb", inferDriverName("user:pw@127.0.0.1:26257/"))
+	assert.Equal("cockroachdb", inferDriverName("postgres://root@127.0.0.1:26257/?sslmode=disable"))
 	assert.Equal("mssql", inferDriverName("user:pw@127.0.0.1:1433"))
 
 	// Empty string
@@ -412,6 +413,11 @@ func TestDB_UnpackQuery_DateAddMillis(t *testing.T) {
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, ?)")
 	assert.NoError(err)
 	assert.Equal("SELECT (created_at + MAKE_INTERVAL(secs => ($1) / 1000.0))", q)
+
+	db = newTestDB("cockroachdb")
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, ?)")
+	assert.NoError(err)
+	assert.Equal("SELECT (created_at + CAST(($1) AS FLOAT8) * INTERVAL '1 millisecond')", q)
 
 	db = newTestDB("mssql")
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, 5000)")

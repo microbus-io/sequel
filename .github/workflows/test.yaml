@@ -115,3 +115,28 @@ jobs:
           cache-dependency-path: go.sum
       - name: Test (SQL Server)
         run: go test -race ./... -count=1 -timeout 20m
+
+  cockroachdb:
+    name: CockroachDB
+    runs-on: ubuntu-latest
+    # A service container cannot be given a command, and CockroachDB needs one, so it is started in a step
+    env:
+      SEQUEL_TESTING_DSN: postgres://root@127.0.0.1:26257/?sslmode=disable
+    steps:
+      - name: Start CockroachDB
+        run: |
+          docker run -d --name cockroachdb -p 26257:26257 cockroachdb/cockroach:latest-v26.3 start-single-node --insecure
+          for i in $(seq 1 30); do
+            docker exec cockroachdb ./cockroach sql --insecure -e 'SELECT 1' && exit 0
+            sleep 2
+          done
+          docker logs cockroachdb
+          exit 1
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Test (CockroachDB)
+        run: go test -race ./... -count=1 -timeout 20m

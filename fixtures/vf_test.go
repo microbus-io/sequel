@@ -155,9 +155,10 @@ func TestVF_DateAddMillisPastInt32InStatements(t *testing.T) {
 	_, err = db.Exec("INSERT INTO vf_sched (id, not_before, note) VALUES (?, NOW_UTC(), ?)", 2, "b")
 	assert.NoError(err)
 	res, err := db.Exec("UPDATE vf_sched SET not_before=DATE_ADD_MILLIS(NOW_UTC(), ?), note=? WHERE id=?", -month, "c", 2)
-	assert.NoError(err)
-	n, _ := res.RowsAffected()
-	assert.Equal(int64(1), n)
+	if assert.NoError(err) {
+		n, _ := res.RowsAffected()
+		assert.Equal(int64(1), n)
+	}
 
 	// Rows not due within 29 days, and rows older than 29 days
 	var id int

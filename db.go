@@ -433,10 +433,11 @@ func isUndefinedTableMessage(msg string) bool {
 	return false
 }
 
-// isFromClauseEntryMessage matches the "missing FROM-clause entry" and "invalid reference to FROM-clause entry"
-// errors, which PostgreSQL and CockroachDB report as 42P01 undefined_table although no table is missing.
+// isFromClauseEntryMessage matches PostgreSQL's "missing FROM-clause entry" and "invalid reference to FROM-clause
+// entry" errors, and CockroachDB's "no data source matches prefix", which both report as 42P01 undefined_table
+// although no table is missing.
 func isFromClauseEntryMessage(msg string) bool {
-	return strings.Contains(msg, "FROM-clause entry")
+	return strings.Contains(msg, "FROM-clause entry") || strings.Contains(msg, "no data source matches prefix")
 }
 
 // Close closes the database connection.
@@ -1115,6 +1116,10 @@ func inferDriverName(dataSourceName string) (driverName string) {
 	if dataSourceName == "" {
 		return ""
 	}
+	// CockroachDB speaks the PostgreSQL protocol and takes postgres:// URLs, so its port is checked first
+	if strings.Contains(dataSourceName, ":26257") {
+		return "cockroachdb"
+	}
 	if strings.HasPrefix(dataSourceName, "postgres://") {
 		return "pgx"
 	}
@@ -1138,9 +1143,6 @@ func inferDriverName(dataSourceName string) (driverName string) {
 	}
 	if strings.Contains(dataSourceName, ":5432") {
 		return "pgx"
-	}
-	if strings.Contains(dataSourceName, ":26257") {
-		return "cockroachdb"
 	}
 	if strings.Contains(dataSourceName, ":1433") {
 		return "mssql"

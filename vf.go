@@ -323,8 +323,11 @@ func vfDateAddMillis(driverName string, args string) (string, error) {
 	switch driverName {
 	case "mysql":
 		return "DATE_ADD(" + baseExpr + ", INTERVAL (" + millis + ") * 1000 MICROSECOND)", nil
-	case "pgx", "cockroachdb":
+	case "pgx":
 		return "(" + baseExpr + " + MAKE_INTERVAL(secs => (" + millis + ") / 1000.0))", nil
+	case "cockroachdb":
+		// CockroachDB has no MAKE_INTERVAL
+		return "(" + baseExpr + " + CAST((" + millis + ") AS FLOAT8) * INTERVAL '1 millisecond')", nil
 	case "mssql":
 		return mssqlDateAddMillis(baseExpr, millis), nil
 	case "sqlite":

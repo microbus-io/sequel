@@ -91,7 +91,7 @@ ALTER TABLE users ALTER COLUMN email NVARCHAR(384) NOT NULL;
 
 Sequel supports MySQL, PostgreSQL, CockroachDB, SQL Server, and SQLite through a unified API. Write your SQL once using MySQL-style `?` placeholders and virtual functions, and Sequel automatically adapts queries for the active driver.
 
-CockroachDB speaks the PostgreSQL wire protocol and shares the `pgx` driver, but it is exposed as a distinct driver name (`cockroachdb`) because callers may need to branch on Cockroach-specific behavior - retry semantics and async schema changes in particular. Internally, every PostgreSQL expansion (placeholders, virtual functions, DSN parsing) applies identically to `cockroachdb`.
+CockroachDB speaks the PostgreSQL wire protocol and shares the `pgx` driver, but it is exposed as a distinct driver name (`cockroachdb`) because callers may need to branch on Cockroach-specific behavior - retry semantics and async schema changes in particular. Internally, the PostgreSQL expansions (placeholders, virtual functions, DSN parsing) apply to `cockroachdb` too, except where CockroachDB lacks a function: `DATE_ADD_MILLIS` has its own expansion there. A `postgres://` DSN on port 26257 is inferred as `cockroachdb`.
 
 ### Automatic Placeholder Conversion
 
@@ -150,6 +150,7 @@ On PostgreSQL and CockroachDB, sequel opens every connection with its session ti
 |------------|-----------------------------------------------------------------------------------|
 | MySQL      | `DATE_ADD(created_at, INTERVAL (?) * 1000 MICROSECOND)`                          |
 | PostgreSQL | `created_at + MAKE_INTERVAL(secs => (?) / 1000.0)`                              |
+| CockroachDB | `created_at + CAST((?) AS FLOAT8) * INTERVAL '1 millisecond'`                  |
 | SQL Server | `DATEADD(MILLISECOND, CAST($1 AS BIGINT) % 3600000, DATEADD(HOUR, CAST($1 AS BIGINT) / 3600000, created_at))` |
 | SQLite     | `STRFTIME('%Y-%m-%d %H:%M:%f', created_at, '+' \|\| ((?) / 1000.0) \|\| ' seconds')` |
 
