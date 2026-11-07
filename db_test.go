@@ -289,16 +289,16 @@ func TestDB_NowUTC(t *testing.T) {
 	assert := testarossa.For(t)
 
 	db := &DB{driverName: "mysql"}
-	assert.Equal("UTC_TIMESTAMP(3)", db.NowUTC())
+	assert.Equal("(UTC_TIMESTAMP(3))", db.NowUTC())
 
 	db = &DB{driverName: "pgx"}
-	assert.Equal("(NOW() AT TIME ZONE 'UTC')", db.NowUTC())
+	assert.Equal("(CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '500 microseconds' AS TIMESTAMP(3)))", db.NowUTC())
 
 	db = &DB{driverName: "mssql"}
-	assert.Equal("(CONVERT(DATETIME2(3), SYSUTCDATETIME()))", db.NowUTC())
+	assert.Equal("(CONVERT(DATETIME2(3), DATEADD(NANOSECOND, -500000, SYSUTCDATETIME())))", db.NowUTC())
 
 	db = &DB{driverName: "sqlite"}
-	assert.Equal("STRFTIME('%Y-%m-%d %H:%M:%f', 'now')", db.NowUTC())
+	assert.Equal("(STRFTIME('%Y-%m-%d %H:%M:%f', 'now'))", db.NowUTC())
 
 	db = &DB{driverName: "unknown"}
 	assert.Equal("", db.NowUTC())
@@ -354,12 +354,12 @@ func TestDB_UnpackQuery_NowUTC(t *testing.T) {
 	db = newTestDB("pgx")
 	q, err = db.UnpackQuery("UPDATE t SET updated_at=NOW_UTC() WHERE id=?")
 	assert.NoError(err)
-	assert.Equal("UPDATE t SET updated_at=(NOW() AT TIME ZONE 'UTC') WHERE id=$1", q)
+	assert.Equal("UPDATE t SET updated_at=(CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '500 microseconds' AS TIMESTAMP(3))) WHERE id=$1", q)
 
 	db = newTestDB("mssql")
 	q, err = db.UnpackQuery("UPDATE t SET updated_at=NOW_UTC() WHERE id=?")
 	assert.NoError(err)
-	assert.Equal("UPDATE t SET updated_at=(CONVERT(DATETIME2(3), SYSUTCDATETIME())) WHERE id=$1", q)
+	assert.Equal("UPDATE t SET updated_at=(CONVERT(DATETIME2(3), DATEADD(NANOSECOND, -500000, SYSUTCDATETIME()))) WHERE id=$1", q)
 
 	db = newTestDB("sqlite")
 	q, err = db.UnpackQuery("UPDATE t SET updated_at=NOW_UTC() WHERE id=?")
@@ -529,7 +529,7 @@ func TestDB_UnpackQuery_Composed(t *testing.T) {
 	db = newTestDB("pgx")
 	q, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(NOW_UTC(), created_at)")
 	assert.NoError(err)
-	assert.Equal("SELECT (EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - created_at)) * 1000.0)", q)
+	assert.Equal("SELECT (EXTRACT(EPOCH FROM ((CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '500 microseconds' AS TIMESTAMP(3))) - created_at)) * 1000.0)", q)
 
 	// NOW_UTC inside DATE_DIFF_MILLIS on SQLite - the comma inside STRFTIME must not split the arguments
 	db = newTestDB("sqlite")

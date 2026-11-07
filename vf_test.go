@@ -38,11 +38,11 @@ func TestVF_BasicExpansion(t *testing.T) {
 
 	q, err = callExpand("pgx", "SELECT NOW_UTC()")
 	assert.NoError(err)
-	assert.Equal("SELECT (NOW() AT TIME ZONE 'UTC')", q)
+	assert.Equal("SELECT (CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '500 microseconds' AS TIMESTAMP(3)))", q)
 
 	q, err = callExpand("cockroachdb", "SELECT NOW_UTC()")
 	assert.NoError(err)
-	assert.Equal("SELECT (NOW() AT TIME ZONE 'UTC')", q)
+	assert.Equal("SELECT (CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '500 microseconds' AS TIMESTAMP(3)))", q)
 
 	q, err = callExpand("sqlite", "SELECT NOW_UTC()")
 	assert.NoError(err)
@@ -50,7 +50,46 @@ func TestVF_BasicExpansion(t *testing.T) {
 
 	q, err = callExpand("mssql", "SELECT NOW_UTC()")
 	assert.NoError(err)
-	assert.Equal("SELECT (CONVERT(DATETIME2(3), SYSUTCDATETIME()))", q)
+	assert.Equal("SELECT (CONVERT(DATETIME2(3), DATEADD(NANOSECOND, -500000, SYSUTCDATETIME())))", q)
+}
+
+// TestVF_NowUTCPrecisionArg pins NOW_UTC(p) on every driver, the default being 3, SQLite's cap at its
+// millisecond clock, and the arguments refused.
+func TestVF_NowUTCPrecisionArg(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	cases := []struct {
+		driver, query, want string
+	}{
+		{"mysql", "NOW_UTC(0)", "(UTC_TIMESTAMP(0))"},
+		{"mysql", "NOW_UTC( 6 )", "(UTC_TIMESTAMP(6))"},
+		{"pgx", "NOW_UTC(3)", "(CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '500 microseconds' AS TIMESTAMP(3)))"},
+		{"pgx", "NOW_UTC(6)", "(NOW() AT TIME ZONE 'UTC')"},
+		{"pgx", "NOW_UTC(5)", "(CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '5 microseconds' AS TIMESTAMP(5)))"},
+		{"pgx", "NOW_UTC(0)", "(CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '500000 microseconds' AS TIMESTAMP(0)))"},
+		{"cockroachdb", "NOW_UTC(6)", "(NOW() AT TIME ZONE 'UTC')"},
+		{"mssql", "NOW_UTC(6)", "(CONVERT(DATETIME2(6), DATEADD(NANOSECOND, -500, SYSUTCDATETIME())))"},
+		{"mssql", "NOW_UTC(0)", "(CONVERT(DATETIME2(0), DATEADD(NANOSECOND, -500000000, SYSUTCDATETIME())))"},
+		{"sqlite", "NOW_UTC(0)", "(SUBSTR(STRFTIME('%Y-%m-%d %H:%M:%f', 'now'), 1, 20) || '000')"},
+		{"sqlite", "NOW_UTC(1)", "(SUBSTR(STRFTIME('%Y-%m-%d %H:%M:%f', 'now'), 1, 21) || '00')"},
+		{"sqlite", "NOW_UTC(2)", "(SUBSTR(STRFTIME('%Y-%m-%d %H:%M:%f', 'now'), 1, 22) || '0')"},
+		{"sqlite", "NOW_UTC(3)", "(STRFTIME('%Y-%m-%d %H:%M:%f', 'now'))"},
+		{"sqlite", "NOW_UTC(6)", "(STRFTIME('%Y-%m-%d %H:%M:%f', 'now'))"},
+		// Nested, the argument still reaches NOW_UTC
+		{"mysql", "DATE_ADD_MILLIS(NOW_UTC(6), 5)", "DATE_ADD((UTC_TIMESTAMP(6)), INTERVAL (5) * 1000 MICROSECOND)"},
+	}
+	for _, tc := range cases {
+		q, err := callExpand(tc.driver, "SELECT "+tc.query)
+		if assert.NoError(err, "%s %s", tc.driver, tc.query) {
+			assert.Equal("SELECT "+tc.want, q, "%s %s", tc.driver, tc.query)
+		}
+	}
+
+	for _, arg := range []string{"7", "-1", "x", "?", "3, 4", "1.5"} {
+		_, err := callExpand("pgx", "SELECT NOW_UTC("+arg+")")
+		assert.Error(err, "NOW_UTC(%s) should be refused", arg)
+	}
 }
 
 func TestVF_CaseInsensitive(t *testing.T) {
@@ -111,7 +150,7 @@ func TestVF_NestedVirtualFuncs(t *testing.T) {
 
 	q, err = callExpand("pgx", "SELECT DATE_DIFF_MILLIS(NOW_UTC(), created_at)")
 	assert.NoError(err)
-	assert.Equal("SELECT (EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - created_at)) * 1000.0)", q)
+	assert.Equal("SELECT (EXTRACT(EPOCH FROM ((CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '500 microseconds' AS TIMESTAMP(3))) - created_at)) * 1000.0)", q)
 }
 
 func TestVF_QuotedParensAndCommasIgnored(t *testing.T) {
@@ -154,7 +193,7 @@ func TestVF_VFInsideNonVF(t *testing.T) {
 
 	q, err := callExpand("pgx", "SELECT GREATEST(created_at, NOW_UTC())")
 	assert.NoError(err)
-	assert.Equal("SELECT GREATEST(created_at, (NOW() AT TIME ZONE 'UTC'))", q)
+	assert.Equal("SELECT GREATEST(created_at, (CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '500 microseconds' AS TIMESTAMP(3))))", q)
 }
 
 func TestVF_HandlerErrorPropagated(t *testing.T) {

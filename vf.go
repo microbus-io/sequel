@@ -198,18 +198,40 @@ func findBalancedClose(s string, start int) int {
 	return -1
 }
 
-// vfNowUTC is the handler for the NOW_UTC() virtual function.
-// It returns the current UTC timestamp with millisecond precision.
+// vfNowUTC is the handler for the NOW_UTC() virtual function. The syntax is NOW_UTC() or NOW_UTC(p), the
+// current UTC timestamp at p fractional digits of a second, 0 to 6; NOW_UTC() is NOW_UTC(3). SQLite's clock is
+// milliseconds, so p above 3 yields 3 there.
 func vfNowUTC(driverName string, args string) (string, error) {
+	p := 3
+	if a := strings.TrimSpace(args); a != "" {
+		n, err := strconv.Atoi(a)
+		if err != nil || n < 0 || n > 6 {
+			return "", errors.New("NOW_UTC requires syntax: NOW_UTC() or NOW_UTC(p), p a literal from 0 to 6")
+		}
+		p = n
+	}
+	ps := strconv.Itoa(p)
 	switch driverName {
 	case "mysql":
-		return "(UTC_TIMESTAMP(3))", nil
+		return "(UTC_TIMESTAMP(" + ps + "))", nil
 	case "pgx", "cockroachdb":
-		return "(NOW() AT TIME ZONE 'UTC')", nil
+		if p == 6 {
+			return "(NOW() AT TIME ZONE 'UTC')", nil
+		}
+		// The cast rounds half up, so the clock is moved back half a unit first, which truncates
+		halfMicros := "5" + strings.Repeat("0", 5-p)
+		return "(CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '" + halfMicros + " microseconds' AS TIMESTAMP(" + ps + ")))", nil
 	case "mssql":
-		return "(CONVERT(DATETIME2(3), SYSUTCDATETIME()))", nil
+		// The conversion rounds half up, so the clock is moved back half a unit first, which truncates
+		halfNanos := "5" + strings.Repeat("0", 8-p)
+		return "(CONVERT(DATETIME2(" + ps + "), DATEADD(NANOSECOND, -" + halfNanos + ", SYSUTCDATETIME())))", nil
 	case "sqlite":
-		return "(STRFTIME('%Y-%m-%d %H:%M:%f', 'now'))", nil
+		if p >= 3 {
+			return "(STRFTIME('%Y-%m-%d %H:%M:%f', 'now'))", nil
+		}
+		// Always three digits, as DATE_ADD_MILLIS prints, or the values do not compare as text.
+		// "YYYY-MM-DD HH:MM:SS." is 20 characters; keep p digits after it and zero the rest
+		return "(SUBSTR(STRFTIME('%Y-%m-%d %H:%M:%f', 'now'), 1, " + strconv.Itoa(20+p) + ") || '" + "000"[:3-p] + "')", nil
 	default:
 		return "", errors.New("unsupported driver name: %s", driverName)
 	}

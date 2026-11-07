@@ -1752,18 +1752,8 @@ func (db *DB) ConformArgPlaceholders(stmt string) string {
 
 // Deprecated: Use the NOW_UTC() virtual function directly in queries instead.
 func (db *DB) NowUTC() string {
-	switch db.driverName {
-	case "mysql":
-		return "UTC_TIMESTAMP(3)"
-	case "pgx", "cockroachdb":
-		return "(NOW() AT TIME ZONE 'UTC')"
-	case "mssql":
-		return "(CONVERT(DATETIME2(3), SYSUTCDATETIME()))"
-	case "sqlite":
-		return "STRFTIME('%Y-%m-%d %H:%M:%f', 'now')"
-	default:
-		return ""
-	}
+	s, _ := vfNowUTC(db.driverName, "")
+	return s
 }
 
 // Deprecated: Use the REGEXP_TEXT_SEARCH() virtual function directly in queries instead.

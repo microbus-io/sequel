@@ -69,7 +69,7 @@ func TestQueryCache_CachesConformedText(t *testing.T) {
 	cache := newQueryCache(64)
 	pq := cache.lookup("pgx", "UPDATE t SET at=NOW_UTC(), note='?' WHERE a=? AND b=?")
 	assert.NoError(pq.err)
-	assert.Equal("UPDATE t SET at=(NOW() AT TIME ZONE 'UTC'), note='?' WHERE a=$1 AND b=$2", pq.text)
+	assert.Equal("UPDATE t SET at=(CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '500 microseconds' AS TIMESTAMP(3))), note='?' WHERE a=$1 AND b=$2", pq.text)
 }
 
 func TestQueryCache_TelemetryLabels(t *testing.T) {
@@ -215,7 +215,7 @@ func TestQueryCache_Concurrent(t *testing.T) {
 			for i := range iters {
 				n := (w + i) % 16
 				pq := cache.lookup("pgx", fmt.Sprintf("SELECT NOW_UTC(), ? /* %d */", n))
-				want := fmt.Sprintf("SELECT (NOW() AT TIME ZONE 'UTC'), $1 /* %d */", n)
+				want := fmt.Sprintf("SELECT (CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '500 microseconds' AS TIMESTAMP(3))), $1 /* %d */", n)
 				if pq.err != nil || pq.text != want {
 					t.Errorf("got %q, %v; want %q", pq.text, pq.err, want)
 					return

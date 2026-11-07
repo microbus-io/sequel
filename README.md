@@ -109,24 +109,27 @@ Virtual functions are driver-agnostic function calls in your SQL that Sequel exp
 
 #### Built-in Virtual Functions
 
-**`NOW_UTC()`** returns the current UTC timestamp with millisecond precision.
+**`NOW_UTC()`** returns the current UTC timestamp with millisecond precision. **`NOW_UTC(p)`** returns it with `p` fractional digits of a second, from 0 (whole seconds) to 6 (microseconds); `NOW_UTC()` is `NOW_UTC(3)`.
 
-| Driver     | `NOW_UTC()` expands to                       |
-|------------|----------------------------------------------|
-| MySQL      | `(UTC_TIMESTAMP(3))`                         |
-| PostgreSQL | `(NOW() AT TIME ZONE 'UTC')`                 |
-| SQL Server | `(CONVERT(DATETIME2(3), SYSUTCDATETIME()))` |
-| SQLite     | `STRFTIME('%Y-%m-%d %H:%M:%f', 'now')`       |
+| Driver     | `NOW_UTC()` expands to                                  | `NOW_UTC(6)` expands to                       |
+|------------|---------------------------------------------------------|-----------------------------------------------|
+| MySQL      | `(UTC_TIMESTAMP(3))`                                    | `(UTC_TIMESTAMP(6))`                          |
+| PostgreSQL | `(CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '500 microseconds' AS TIMESTAMP(3)))` | `(NOW() AT TIME ZONE 'UTC')` |
+| SQL Server | `(CONVERT(DATETIME2(3), DATEADD(NANOSECOND, -500000, SYSUTCDATETIME())))` | `(CONVERT(DATETIME2(6), DATEADD(NANOSECOND, -500, SYSUTCDATETIME())))` |
+| SQLite     | `(STRFTIME('%Y-%m-%d %H:%M:%f', 'now'))`                | the same: SQLite's clock is milliseconds      |
 
-On SQL Server the value is rounded to millisecond precision so it matches the other drivers and the precision of a `DATETIME2(3)` column. `SYSUTCDATETIME()` alone is 100-nanosecond precision, which rounds *up* when stored into a millisecond column and can leave a just-written "now" timestamp slightly in the future relative to a later `NOW_UTC()` comparison.
+The value is truncated to `p` digits, never rounded, so it is never after the current instant on any driver. `p` must be a literal. On SQLite a `p` above 3 yields milliseconds, the finest its clock gives, and every `p` prints three fractional digits, the ones past `p` zero, so that its values compare correctly as text.
 
-The value is the UTC wall-clock time **without a time zone**. Store it in a column type that has no zone either:
+The value is the UTC wall-clock time **without a time zone**. Store it in a column type that has no zone either, **with the same precision** as the `NOW_UTC` you write into it:
 
-| Driver     | Column type    |
-|------------|----------------|
-| MySQL      | `DATETIME(3)`  |
-| PostgreSQL | `TIMESTAMP`    |
-| SQL Server | `DATETIME2(3)` |
+| Driver     | Column for `NOW_UTC()` | Column for `NOW_UTC(6)` |
+|------------|------------------------|-------------------------|
+| MySQL      | `DATETIME(3)`          | `DATETIME(6)`           |
+| PostgreSQL | `TIMESTAMP(3)`         | `TIMESTAMP`             |
+| SQL Server | `DATETIME2(3)`         | `DATETIME2(6)`          |
+| SQLite     | `TEXT`                 | `TEXT`                  |
+
+A column coarser than the value written into it rounds it, and rounding can land a value up to half a unit *after* the instant it was taken. A row written with `NOW_UTC()` and checked at once with `col <= NOW_UTC()` then reads as not yet due. A column finer than the value stores it exactly, so it is safe. Watch out for the defaults: a plain `DATETIME` on MySQL has no fractional digits at all, so declare the precision explicitly. Because `NOW_UTC(p)` truncates, comparing it with a finer value is safe: `NOW_UTC(3)` is never after `NOW_UTC(6)` taken at the same instant.
 
 These types store the value as written and read it back unchanged, whatever the session's time zone. Zoned types (`TIMESTAMPTZ` on PostgreSQL, `TIMESTAMP` on MySQL) convert a zone-less value through the session's time zone, so on a session that is not in UTC they store a different instant.
 
@@ -152,6 +155,9 @@ On PostgreSQL and CockroachDB, sequel opens every connection with its session ti
 
 On SQL Server, `DATEADD` takes an `int`, so the milliseconds are split into hours plus a remainder to reach
 intervals past ~24.8 days.
+
+The result is as precise as `baseExpr`, so `DATE_ADD_MILLIS(NOW_UTC(), ?)` belongs in a millisecond column and
+`DATE_ADD_MILLIS(NOW_UTC(6), ?)` in a microsecond one. On SQLite it is milliseconds.
 
 **`DATE_DIFF_MILLIS(a, b)`** returns the difference `(a - b)` in milliseconds.
 

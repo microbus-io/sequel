@@ -50,29 +50,52 @@ thing, or it says nothing and this file says the thing.
 
 ## Cross-driver timestamp precision (`NOW_UTC()`)
 
-`NOW_UTC()` is contracted to return the current UTC timestamp **at millisecond precision** on every
-driver. The non-obvious case is SQL Server. The other drivers already generate at a precision their
-natural timestamp column stores exactly - MySQL `UTC_TIMESTAMP(3)` and SQLite `%f` are milliseconds,
-PostgreSQL `NOW()` is microseconds into a microsecond `TIMESTAMP`. SQL Server's `SYSUTCDATETIME()`,
-however, is `DATETIME2(7)` (100-nanosecond) precision, finer than the `DATETIME2(3)` columns it is
-typically stored in.
+`NOW_UTC(p)` is contracted to return the current UTC timestamp **at exactly `p` fractional digits** on every
+driver, `p` from 0 to 6, and `NOW_UTC()` is `NOW_UTC(3)`. Each expansion names the precision explicitly -
+`UTC_TIMESTAMP(p)`, `CAST(... AS TIMESTAMP(p))`, `CONVERT(DATETIME2(p), ...)` - because no driver's native
+clock is milliseconds: MySQL's `UTC_TIMESTAMP()` is whole seconds, PostgreSQL's `NOW()` microseconds, SQL
+Server's `SYSUTCDATETIME()` 100 nanoseconds. SQLite's clock is milliseconds, so a `p` above 3 yields 3 there.
 
-That mismatch is a correctness trap, not just cosmetics. Storing a 100ns value into a millisecond column
-**rounds to the nearest millisecond - upward roughly half the time** - so a value written as "now" can
-land up to ~0.5ms in the *future* of the instant it was generated. Code that writes `not_before = NOW_UTC()`
-and later checks `not_before <= NOW_UTC()` (or `DATE_DIFF_MILLIS(not_before, NOW_UTC())`) then sees the
-row as "not yet due" for a sub-millisecond window. The store rounded; the comparison did not.
+**The rule: a column must be at least as fine as the clock written into it.** Storing a finer value into a
+coarser column **rounds it - upward roughly half the time** - so a value written as "now" can land up to half
+a unit in the *future* of the instant it was generated. Code that writes `not_before = NOW_UTC()` and checks
+`not_before <= NOW_UTC()` at once then sees the row as "not yet due". The store rounded; the comparison did not.
+Generating at the column's precision makes the generated value, the stored value and every later comparison
+round the same way; rounding is monotonic, so ordering is preserved and the phantom disappears.
+`TestVF_NowUTCNeverAheadOfItsColumn` (fixtures) pins it for every precision: on PostgreSQL a microsecond
+`NOW_UTC()` into `TIMESTAMP(3)` read ahead in 83 of its 200 writes.
 
-The fix is to make `NOW_UTC()` itself millisecond precision on SQL Server -
-`CONVERT(DATETIME2(3), SYSUTCDATETIME())` - so the generated value, the stored value, and every later
-comparison are all rounded the same way. Rounding is monotonic, so consistent rounding on both sides of
-a comparison preserves ordering and the phantom disappears. The general principle: a `NOW_UTC()` value
-must never exceed the instant it represents at the precision the schema actually stores, and the only way
-to guarantee that across store-and-compare is to generate at the column's precision.
+**Why the default is 3, and do not raise it.** A coarser default is safe for every existing column (a finer
+column stores a coarser value exactly); a finer one silently breaks every schema built for the old default -
+`DATETIME(3)` and `DATETIME2(3)` columns, `sequel_migrations` among them. Milliseconds are also the finest
+precision every driver can deliver, SQLite's clock included. A caller wanting microseconds asks with
+`NOW_UTC(6)`, visibly, and declares `(6)` columns.
+
+**`NOW_UTC(p)` truncates, never rounds.** The column rule above keeps a stored value consistent with later
+`NOW_UTC(p)` of the same precision, but a rounded clock is still up to half a unit ahead of *every finer clock*:
+`NOW_UTC(6)`, an application's `time.Now()`, a finer column written at the same moment. A truncated one is never
+ahead of any of them, so "written now" is always "due now" whatever it is compared with; the price is being up to
+one unit early rather than half a unit either way, and early is the harmless direction for leases and expiry. It
+also makes every driver agree: MySQL's `UTC_TIMESTAMP(p)` and SQLite's `SUBSTR` already truncated, while
+PostgreSQL's `CAST(... AS TIMESTAMP(p))`, CockroachDB's, and SQL Server's `CONVERT(DATETIME2(p), ...)` round half
+up. Those three move the clock back half a unit before the cast (`- INTERVAL '500 microseconds'`,
+`DATEADD(NANOSECOND, -500000, ...)` at p=3), which turns half-up rounding into truncation, ties included; every
+half unit down to p=6's 500 ns is a whole number of `SYSUTCDATETIME()`'s 100 ns ticks. The shift must be exactly
+half a unit and the cast must stay half-up: a cast that rounded half to even would be off at ties.
+`TestVF_NowUTCNeverAheadOfTheClock` (fixtures) stores `NOW_UTC(p)` in a microsecond column and checks it against a
+`NOW_UTC(6)` read right after.
+
+`DATE_ADD_MILLIS` keeps its base's precision on the server drivers, so it needs no precision of its own.
+
+**On SQLite every `p` prints three fractional digits**, because a timestamp there is text and compares as text:
+`'...:01.000' > '...:01'`, so a `DATE_ADD_MILLIS` result (always `%f`, three digits) built from a shorter
+`NOW_UTC(0)` read as not yet due for up to a second after it was. A `p` below 3 is a `SUBSTR` of the `%f` text,
+truncated, which is never ahead of the clock, and padded back to three digits with zeros. The
+`DATE_ADD_MILLIS(NOW_UTC(p), ?)` subtests of `TestVF_NowUTCNeverAheadOfItsColumn` pin it.
 
 ## PostgreSQL sessions are pinned to UTC (`pinSessionTimeZoneUTC`)
 
-`NOW_UTC()` on PostgreSQL is `NOW() AT TIME ZONE 'UTC'`, a zone-less `timestamp` holding UTC wall time.
+`NOW_UTC()` on PostgreSQL is built on `NOW() AT TIME ZONE 'UTC'`, a zone-less `timestamp` holding UTC wall time.
 Written into or compared with a `TIMESTAMPTZ` it is converted through the session's `TimeZone`, so on a
 server, database or role whose default is not UTC every stored instant is off by the offset (and by a
 different offset across a DST change). `TIMESTAMP` columns, sequel's own `sequel_migrations` included, are
