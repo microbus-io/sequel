@@ -17,7 +17,6 @@ limitations under the License.
 package fixtures
 
 import (
-	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -68,12 +67,7 @@ func TestDSN_MariaDBTestingDSNNamesItsDriver(t *testing.T) {
 	if !strings.HasPrefix(base, "mariadb://") {
 		t.Skip("needs SEQUEL_TESTING_DSN in mariadb:// form")
 	}
-	u, err := url.Parse(base)
-	if !assert.NoError(err) {
-		return
-	}
-	password, _ := u.User.Password()
-	driverFormat := u.User.Username() + ":" + password + "@tcp(" + u.Host + ")/"
+	driverFormat := strings.TrimPrefix(base, "mariadb://")
 
 	first, err := sequel.CreateTestingDatabase("mariadb", driverFormat, t.Name())
 	if !assert.NoError(err) {
@@ -98,7 +92,7 @@ func TestDSN_MariaDBTestingDSNNamesItsDriver(t *testing.T) {
 
 	asMySQL, err := sequel.CreateTestingDatabase("mysql", base, t.Name()+"_mysql")
 	if assert.NoError(err) {
-		assert.True(strings.HasPrefix(asMySQL, "mysql://"), "%q gave %q", base, asMySQL)
+		assert.False(strings.HasPrefix(asMySQL, "mariadb://"), "%q gave %q", base, asMySQL)
 		db, err := sequel.Open("", asMySQL)
 		if assert.NoError(err) {
 			assert.Equal("mysql", db.DriverName())

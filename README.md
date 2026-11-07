@@ -93,18 +93,31 @@ Sequel supports MySQL, MariaDB, PostgreSQL, CockroachDB, SQL Server, and SQLite 
 
 Each engine has its own driver name - `mysql`, `mariadb`, `pgx`, `cockroachdb`, `mssql` and `sqlite` - which `DriverName()` returns and `-- DRIVER:` directives in migrations match exactly. A statement that suits two engines lists both, as in `-- DRIVER: mysql mariadb` or `-- DRIVER: pgx cockroachdb`. MariaDB shares the MySQL Go driver and CockroachDB shares pgx, and their expansions are the same as MySQL's and PostgreSQL's except where an engine needs its own (`DATE_ADD_MILLIS` on CockroachDB).
 
-Without a driver name, the driver is inferred from the data source name, and a URL scheme decides it ahead of anything else:
+### Data Source Names and Pseudo-Schemes
 
-| Scheme | Driver |
-|--------|--------|
-| `mysql://user:pass@host:3306/db?params` | `mysql` |
-| `mariadb://user:pass@host:3306/db?params` | `mariadb` |
-| `postgres://...`, `postgresql://...` | `pgx` |
-| `cockroachdb://user:pass@host:26257/db?params` | `cockroachdb` |
-| `sqlserver://...` | `mssql` |
-| `file:...` | `sqlite` |
+`Open`, `OpenSingleton` and `CreateTestingDatabase` take a driver name and a data source name (DSN). Pass `""` as the driver name and sequel infers it from the DSN. Two pairs of engines share a DSN format that names neither: the MySQL Go driver's `user:pass@tcp(host:3306)/db` serves MySQL and MariaDB, and the `postgres://` URL serves PostgreSQL and CockroachDB. So sequel accepts three **pseudo-schemes** that exist only to name the driver:
 
-Sequel converts `mysql://` and `mariadb://` URLs to the MySQL driver's own `user:pass@tcp(host:port)/db?params` format, passing the query through as its parameters, and `cockroachdb://` to `postgres://`. A DSN in the MySQL driver's own format is taken for MySQL, so name MariaDB with the `mariadb://` scheme or the `mariadb` driver name. Without a scheme, a default port is the last guess.
+| Pseudo-scheme | Driver | Example | Reaches the Go driver as |
+|---------------|--------|---------|--------------------------|
+| `mysql://` | `mysql` | `mysql://root:pw@tcp(127.0.0.1:3306)/app?tls=true` | `root:pw@tcp(127.0.0.1:3306)/app?tls=true` |
+| `mariadb://` | `mariadb` | `mariadb://root:pw@tcp(127.0.0.1:3306)/app?tls=true` | `root:pw@tcp(127.0.0.1:3306)/app?tls=true` |
+| `cockroachdb://` | `cockroachdb` | `cockroachdb://root@127.0.0.1:26257/app?sslmode=disable` | `postgres://root@127.0.0.1:26257/app?sslmode=disable` |
+
+`mysql://` and `mariadb://` are prefixes, not URLs. What follows them is the MySQL driver's own DSN format, unchanged: sequel strips the prefix and the driver parses the rest as it always has, so nothing needs percent-encoding and a socket works too (`mariadb://root@unix(/tmp/mysql.sock)/app`). `cockroachdb://` is followed by a PostgreSQL URL, and sequel replaces it with `postgres://`.
+
+```go
+db, err := sequel.Open("", "mariadb://root:pw@tcp(127.0.0.1:3306)/app") // db.DriverName() == "mariadb"
+```
+
+The pseudo-schemes matter most where only a DSN can be given, such as `SEQUEL_TESTING_DSN`. A testing DSN from `CreateTestingDatabase` keeps its pseudo-scheme, so it opens as the same driver.
+
+The driver is inferred in this order, and the first match wins:
+
+1. **A scheme**, in any letter case and on any port: `mysql://`, `mariadb://`, `cockroachdb://`, `postgres://` or `postgresql://` (`pgx`), `sqlserver://` (`mssql`), `file:` (`sqlite`).
+2. **A format**: `:memory:` or a `.db`, `.sqlite` or `.sqlite3` file (`sqlite`), or `tcp(` (`mysql`).
+3. **A default port**, as a last guess: `:3306` (`mysql`), `:5432` (`pgx`), `:26257` (`cockroachdb`), `:1433` (`mssql`).
+
+So a DSN in the MySQL driver's own format is taken for MySQL, and a `postgres://` URL for PostgreSQL even on port 26257. Use the pseudo-scheme, or pass the driver name, for MariaDB and CockroachDB.
 
 ### Automatic Placeholder Conversion
 
@@ -423,7 +436,7 @@ func TestUserService(t *testing.T) {
 go test ./...                                                          # SQLite (default)
 SEQUEL_TESTING_DSN='postgres://user:pw@127.0.0.1:5432/' go test ./...  # PostgreSQL
 SEQUEL_TESTING_DSN='root:pw@tcp(127.0.0.1:3306)/'       go test ./...  # MySQL
-SEQUEL_TESTING_DSN='mariadb://root:pw@127.0.0.1:3306/'  go test ./...  # MariaDB
+SEQUEL_TESTING_DSN='mariadb://root:pw@tcp(127.0.0.1:3306)/' go test ./...  # MariaDB
 SEQUEL_TESTING_DSN='cockroachdb://root@127.0.0.1:26257/?sslmode=disable' go test ./...  # CockroachDB
 ```
 

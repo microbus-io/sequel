@@ -137,57 +137,29 @@ func TestDB_DatabaseNameFromDataSourceName(t *testing.T) {
 	assert.Error(err)
 }
 
-// TestDB_MySQLURLs pins the conversion between the mysql:// and mariadb:// URLs and the driver's own DSN format, both
-// ways.
-func TestDB_MySQLURLs(t *testing.T) {
+// TestDB_MySQLSchemes pins that mysql:// and mariadb:// are prefixes in front of the MySQL driver's own DSN format,
+// stripped and not parsed as URLs: whatever follows reaches the driver as written.
+func TestDB_MySQLSchemes(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)
 
-	for _, c := range []struct{ in, want string }{
-		{"mysql://root:pw@127.0.0.1:3306/app", "root:pw@tcp(127.0.0.1:3306)/app"},
-		{"mariadb://root@db.example.com/app?tls=skip-verify&loc=UTC", "root@tcp(db.example.com)/app?tls=skip-verify&loc=UTC"},
-		{"mysql://u:p%40ss%2Fx@[::1]:3307/", "u:p@ss/x@tcp([::1]:3307)/"},
-		{"mysql://127.0.0.1:3306", "tcp(127.0.0.1:3306)/"},
-		{"root:pw@tcp(127.0.0.1:3306)/app", "root:pw@tcp(127.0.0.1:3306)/app"}, // Not a URL: unchanged
-	} {
-		got, err := mySQLURLToDSN(c.in)
-		assert.Expect(got, c.want, err, nil)
-	}
-	_, err := mySQLURLToDSN("mysql://root@127.0.0.1/app?timeout=forever")
-	assert.Error(err) // The driver's own parameter validation applies
+	assert.Equal("root:pw@tcp(127.0.0.1:3306)/app", trimMySQLScheme("mysql://root:pw@tcp(127.0.0.1:3306)/app"))
+	assert.Equal("root:pw@tcp(127.0.0.1:3306)/app", trimMySQLScheme("mariadb://root:pw@tcp(127.0.0.1:3306)/app"))
+	assert.Equal("root:pw@tcp(127.0.0.1:3306)/app", trimMySQLScheme("root:pw@tcp(127.0.0.1:3306)/app"))
 
-	// A URL that does not parse is reported without the URL, which url.Parse quotes password and all
-	for _, bad := range []string{"mysql://root:Pa%ss@127.0.0.1:3306/app", "mariadb://root:pa/ss@127.0.0.1/app"} {
-		_, err := mySQLURLToDSN(bad)
-		if assert.Error(err) {
-			assert.NotContains(err.Error(), "ss@")
-			assert.NotContains(err.Error(), "Pa%")
-		}
-		_, _, err = normalizeDriverAndDSN("", bad)
-		if assert.Error(err) {
-			assert.NotContains(err.Error(), "ss@")
-		}
-	}
-	// The driver's format cannot express a ':' in a user name, which would move the rest into the password
-	_, err = mySQLURLToDSN("mysql://us%3Aer:pw@127.0.0.1/app")
-	assert.Error(err)
-
-	assert.Equal("mariadb://root:pw@127.0.0.1:3306/app?tls=false", mySQLDSNToURL(mariaDBScheme, "root:pw@tcp(127.0.0.1:3306)/app?tls=false"))
-	assert.Equal("mariadb://u:p%40ss%2Fx@127.0.0.1:3306/", mySQLDSNToURL(mariaDBScheme, "u:p@ss/x@tcp(127.0.0.1:3306)/"))
-	assert.Equal("mariadb://root@127.0.0.1:3306/app", mySQLDSNToURL(mariaDBScheme, "mysql://root@127.0.0.1:3306/app"))
-	assert.Equal("root@unix(/tmp/mysql.sock)/app", mySQLDSNToURL(mariaDBScheme, "root@unix(/tmp/mysql.sock)/app")) // Socket: kept
-
-	// Round trip through Open's normalization
-	driver, dsn, err := normalizeDriverAndDSN("", "mariadb://root:pw@127.0.0.1:3306/app")
+	// Characters a URL would need escaped pass through raw, as the driver's own format takes them
+	driver, dsn, err := normalizeDriverAndDSN("", "mariadb://root:p@ss/w%rd@tcp(127.0.0.1:3306)/app?tls=false")
 	assert.Expect(driver, "mariadb", err, nil)
 	cfg, err := mysql.ParseDSN(dsn)
 	if assert.NoError(err) {
 		assert.Equal("root", cfg.User)
-		assert.Equal("pw", cfg.Passwd)
+		assert.Equal("p@ss/w%rd", cfg.Passwd)
 		assert.Equal("127.0.0.1:3306", cfg.Addr)
 		assert.Equal("app", cfg.DBName)
 		assert.True(cfg.ParseTime)
 	}
+	driver, _, err = normalizeDriverAndDSN("", "MySQL://root@unix(/tmp/mysql.sock)/app")
+	assert.Expect(driver, "mysql", err, nil)
 	assert.Equal("mysql", physicalDriverName("mariadb"))
 }
 
@@ -205,12 +177,12 @@ func TestDB_InferDriverName(t *testing.T) {
 	assert.Equal("cockroachdb", inferDriverName("cockroachdb://root@db.example.com:9999/mydb"))
 
 	// MySQL and MariaDB schemes
-	assert.Equal("mysql", inferDriverName("mysql://root@127.0.0.1:3306/"))
-	assert.Equal("mariadb", inferDriverName("mariadb://root@127.0.0.1:3306/"))
-	assert.Equal("mariadb", inferDriverName("mariadb://root@db.example.com:5432/"))
+	assert.Equal("mysql", inferDriverName("mysql://root@tcp(127.0.0.1:3306)/"))
+	assert.Equal("mariadb", inferDriverName("mariadb://root@tcp(127.0.0.1:3306)/"))
+	assert.Equal("mariadb", inferDriverName("mariadb://root@tcp(db.example.com:5432)/"))
 
 	// Schemes are case-insensitive
-	assert.Equal("mariadb", inferDriverName("MariaDB://root@127.0.0.1:3306/"))
+	assert.Equal("mariadb", inferDriverName("MariaDB://root@tcp(127.0.0.1:3306)/"))
 	assert.Equal("pgx", inferDriverName("POSTGRES://root@127.0.0.1/"))
 
 	// A MySQL user named "file" does not make a SQLite URI
@@ -269,13 +241,13 @@ func TestDB_SetDatabaseInDataSourceName(t *testing.T) {
 	name, _ = databaseNameFromDataSourceName("mysql", dsn)
 	assert.Equal("", name)
 
-	// mariadb - a URL stays a URL, so its scheme still names the driver
-	dsn, err = setDatabaseInDataSourceName("mariadb", "mariadb://root:pw@127.0.0.1:3306/?tls=false", "mydb")
-	assert.Expect(dsn, "mariadb://root:pw@127.0.0.1:3306/mydb?tls=false", err, nil)
+	// mariadb - the prefix is stripped; CreateTestingDatabase puts it back
+	name, _ = databaseNameFromDataSourceName("mariadb", "mariadb://root:pw@tcp(127.0.0.1:3306)/mydb?tls=false")
+	assert.Equal("mydb", name)
+	dsn, err = setDatabaseInDataSourceName("mariadb", "mariadb://root:pw@tcp(127.0.0.1:3306)/?tls=false", "mydb")
+	assert.NoError(err)
 	name, _ = databaseNameFromDataSourceName("mariadb", dsn)
 	assert.Equal("mydb", name)
-	dsn, err = setDatabaseInDataSourceName("mysql", "mysql://root@127.0.0.1/mydb", "")
-	assert.Expect(dsn, "mysql://root@127.0.0.1/", err, nil)
 
 	// pgx - set database
 	dsn, err = setDatabaseInDataSourceName("pgx", "postgres://user:pw@127.0.0.1:5432/", "mydb")
@@ -1170,9 +1142,9 @@ func TestDB_RedactDataSourceName(t *testing.T) {
 		{"root:p@ss@w0rd@tcp(127.0.0.1:3306)/db", "root:***@tcp(127.0.0.1:3306)/db"}, // greedy: '@' in the password cannot leak a suffix
 		{"server=localhost;user id=sa;password=s3cret;port=1433", "server=localhost;user id=sa;password=***;port=1433"},
 		{"Server=localhost;PWD=s3cret", "Server=localhost;PWD=***"},
-		{"mariadb://root:p@ss@h:3306/db?tls=false", "mariadb://root:***@h:3306/db?tls=false"}, // url.Parse splits at the last '@'
-		{"mysql://:s3cret@h/app", "mysql://:***@h/app"},                                       // No user name
-		{"mariadb://root:pa/ss@h/app", "mariadb://root:***@h/app"},                            // A raw '/' cannot end the match
+		{"mariadb://root:p@ss@tcp(h:3306)/db?tls=false", "mariadb://root:***@tcp(h:3306)/db?tls=false"}, // Greedy to the last '@'
+		{"mysql://:s3cret@tcp(h)/app", "mysql://:***@tcp(h)/app"},                                       // No user name
+		{"mariadb://root:pa/ss@tcp(h)/app", "mariadb://root:***@tcp(h)/app"},                            // A raw '/' cannot end the match
 		// No credentials: unchanged.
 		{"postgres://127.0.0.1:5432/db", "postgres://127.0.0.1:5432/db"},
 		{"tcp(127.0.0.1:3306)/db", "tcp(127.0.0.1:3306)/db"},
@@ -1316,7 +1288,7 @@ func TestDB_PinSessionTimeZoneUTC(t *testing.T) {
 		driver, dsn, err := normalizeDriverAndDSN(driver, "cockroachdb://u:p@h:9999/db?sslmode=disable")
 		assert.Expect(driver, "cockroachdb", dsn, "postgres://u:p@h:9999/db?sslmode=disable&timezone=UTC", err, nil)
 	}
-	driver, dsn, err := normalizeDriverAndDSN("", "MariaDB://root@h:3306/app")
+	driver, dsn, err := normalizeDriverAndDSN("", "MariaDB://root@tcp(h:3306)/app")
 	assert.Expect(driver, "mariadb", err, nil)
 	assert.True(strings.HasPrefix(dsn, "root@tcp(h:3306)/app?"), "got %q", dsn)
 	driver, dsn, err = normalizeDriverAndDSN("", "postgresql://u:p@h/db")

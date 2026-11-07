@@ -110,8 +110,8 @@ best-effort basis. Drivers currently supported: "mysql" (MySQL), "mariadb" (Mari
 "pgx" (Postgres), "cockroachdb" (CockroachDB), "mssql" (SQL Server) or "sqlite" (SQLite).
 
 Example data source name for each of the supported drivers:
-  - mysql: mysql://username:password@hostname:3306/ or username:password@tcp(hostname:3306)/
-  - mariadb: mariadb://username:password@hostname:3306/
+  - mysql: username:password@tcp(hostname:3306)/ or mysql://username:password@tcp(hostname:3306)/
+  - mariadb: mariadb://username:password@tcp(hostname:3306)/
   - pgx: postgres://username:password@hostname:5432/
   - cockroachdb: cockroachdb://username:password@hostname:26257/
   - mssql: sqlserver://username:password@hostname:1433
@@ -119,10 +119,10 @@ Example data source name for each of the supported drivers:
 
 A URL scheme decides the driver ahead of anything else in the data source name, a port
 included: mysql://, mariadb://, postgres:// or postgresql:// (pgx), cockroachdb://, sqlserver://
-(mssql) and file: (sqlite). Sequel converts mysql:// and mariadb:// URLs to the MySQL driver's
-own format, the query passing through as its parameters, and cockroachdb:// to postgres://. A
-DSN in the MySQL driver's own format is taken for MySQL; name MariaDB with mariadb://. A
-default port is the last guess, for a data source name with no scheme.
+(mssql) and file: (sqlite). The mysql:// and mariadb:// prefixes go in front of a DSN in the
+MySQL driver's own format, which names neither engine, and are stripped before the driver sees
+it; without one, that format is taken for MySQL. A cockroachdb:// URL reaches the driver as
+postgres://. A default port is the last guess, for a data source name with no scheme.
 
 On "pgx" and "cockroachdb", every connection starts its session in the UTC time zone,
 whatever the server, database or role default, so that NOW_UTC() stores the right instant
@@ -231,11 +231,7 @@ func normalizeDriverAndDSN(driverName, dataSourceName string) (string, string, e
 	}
 	switch driverName {
 	case "mysql", "mariadb":
-		dsn, err := mySQLURLToDSN(dataSourceName)
-		if err != nil {
-			return "", "", errors.Trace(err)
-		}
-		cfg, err := mysql.ParseDSN(dsn)
+		cfg, err := mysql.ParseDSN(trimMySQLScheme(dataSourceName))
 		if err != nil {
 			return "", "", errors.Trace(err)
 		}
@@ -1022,11 +1018,7 @@ func databaseNameFromDataSourceName(driverName string, dsn string) (databaseName
 	}
 	switch driverName {
 	case "mysql", "mariadb":
-		converted, err := mySQLURLToDSN(dsn)
-		if err != nil {
-			return "", errors.Trace(err)
-		}
-		cfg, err := mysql.ParseDSN(converted)
+		cfg, err := mysql.ParseDSN(trimMySQLScheme(dsn))
 		if err != nil {
 			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
 		}
@@ -1072,19 +1064,7 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 	}
 	switch driverName {
 	case "mysql", "mariadb":
-		if _, ok := cutMySQLScheme(dsn); ok {
-			// Kept a URL, so that its scheme still names the driver
-			if _, err := mySQLURLToDSN(dsn); err != nil {
-				return "", errors.Trace(err)
-			}
-			u, err := url.Parse(dsn)
-			if err != nil {
-				return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
-			}
-			u.Path = "/" + databaseName
-			return u.String(), nil
-		}
-		cfg, err := mysql.ParseDSN(dsn)
+		cfg, err := mysql.ParseDSN(trimMySQLScheme(dsn))
 		if err != nil {
 			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
 		}
@@ -1164,77 +1144,20 @@ func toPostgresScheme(dsn string) string {
 	return dsn
 }
 
-// mySQLScheme and mariaDBScheme are sequel's URL schemes for MySQL and MariaDB, which share a driver whose DSN
-// format names neither.
+// mySQLScheme and mariaDBScheme name the MySQL and MariaDB drivers in front of a DSN in the MySQL driver's own format
+// (mysql://user:pass@tcp(host:3306)/db), which names neither engine. They are prefixes, not URL schemes: sequel strips
+// them and the driver parses the rest as it always has.
 const (
 	mySQLScheme   = "mysql://"
 	mariaDBScheme = "mariadb://"
 )
 
-// cutMySQLScheme returns what follows a mysql:// or mariadb:// scheme.
-func cutMySQLScheme(dsn string) (rest string, ok bool) {
-	if rest, ok = strings.CutPrefix(dsn, mySQLScheme); ok {
-		return rest, true
+// trimMySQLScheme strips a mysql:// or mariadb:// prefix, and returns any other DSN unchanged.
+func trimMySQLScheme(dsn string) string {
+	if rest, ok := strings.CutPrefix(dsn, mySQLScheme); ok {
+		return rest
 	}
-	return strings.CutPrefix(dsn, mariaDBScheme)
-}
-
-// mySQLURLToDSN converts a mysql:// or mariadb:// URL into the driver's user:password@tcp(host:port)/dbname?params
-// format, and returns any other DSN unchanged. The query passes through as the driver's parameters.
-func mySQLURLToDSN(dsn string) (string, error) {
-	rest, ok := cutMySQLScheme(dsn)
-	if !ok {
-		return dsn, nil
-	}
-	u, err := url.Parse("mysql://" + rest)
-	if err != nil {
-		// Not wrapped: url.Parse quotes the whole URL, password included
-		return "", errors.New("error parsing data source name %s: not a valid URL; percent-encode reserved characters in the user name and password", redactDataSourceName(dsn))
-	}
-	if strings.Contains(u.User.Username(), ":") {
-		return "", errors.New("error parsing data source name %s: the MySQL driver cannot take a ':' in a user name", redactDataSourceName(dsn))
-	}
-	cfg := mysql.NewConfig()
-	cfg.User = u.User.Username()
-	cfg.Passwd, _ = u.User.Password()
-	cfg.Net = "tcp"
-	cfg.Addr = u.Host
-	cfg.DBName = strings.TrimPrefix(u.Path, "/")
-	converted := cfg.FormatDSN()
-	if u.RawQuery != "" {
-		sep := "?"
-		if strings.Contains(converted, "?") {
-			sep = "&"
-		}
-		converted += sep + u.RawQuery
-	}
-	if _, err := mysql.ParseDSN(converted); err != nil {
-		return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
-	}
-	return converted, nil
-}
-
-// mySQLDSNToURL converts a driver-format MySQL DSN over tcp into a URL of the given scheme, and rewrites a MySQL URL's
-// scheme to it. Any other network (a socket, tcp4 or tcp6) is returned unchanged, since a URL cannot express it.
-func mySQLDSNToURL(scheme, dsn string) string {
-	if rest, ok := cutMySQLScheme(dsn); ok {
-		return scheme + rest
-	}
-	cfg, err := mysql.ParseDSN(dsn)
-	if err != nil || cfg.Net != "tcp" {
-		return dsn
-	}
-	u := url.URL{Scheme: strings.TrimSuffix(scheme, "://"), Host: cfg.Addr, Path: "/" + cfg.DBName}
-	if cfg.Passwd != "" {
-		u.User = url.UserPassword(cfg.User, cfg.Passwd)
-	} else if cfg.User != "" {
-		u.User = url.User(cfg.User)
-	}
-	// The driver splits the database from the parameters at the last '/'
-	if _, query, ok := strings.Cut(dsn[strings.LastIndex(dsn, "/")+1:], "?"); ok {
-		u.RawQuery = query
-	}
-	return u.String()
+	return strings.TrimPrefix(dsn, mariaDBScheme)
 }
 
 // cutPostgresScheme returns what follows a postgres:// or postgresql:// scheme.
@@ -1340,8 +1263,7 @@ If a driver name is not provided, it is inferred from the data source name on a
 best-effort basis, as in [Open]. Drivers currently supported: "mysql" (MySQL), "mariadb" (MariaDB),
 "pgx" (Postgres), "cockroachdb" (CockroachDB), "mssql" (SQL Server) or "sqlite" (SQLite). The
 testing data source name names its driver when opened without one: a CockroachDB one is a
-cockroachdb:// URL and a MariaDB one a mariadb:// URL, unless its base connects over a network
-other than tcp, such as a socket, which a URL cannot express.
+cockroachdb:// URL, and a MariaDB one carries the mariadb:// prefix.
 
 If neither a driver name nor a base data source name is provided, it falls back to the SEQUEL_TESTING_DSN
 environment variable. This lets any consumer that builds ephemeral test databases through sequel redirect
@@ -1355,7 +1277,7 @@ based on the driver name:
   - (empty): SQLite in-memory database
   - sqlite: SQLite in-memory database
   - mysql: root:root@tcp(127.0.0.1:3306)/
-  - mariadb: mariadb://root:root@127.0.0.1:3306/
+  - mariadb: mariadb://root:root@tcp(127.0.0.1:3306)/
   - pgx: postgres://postgres:postgres@127.0.0.1:5432/
   - cockroachdb: cockroachdb://root@127.0.0.1:26257/?sslmode=disable
   - mssql: sqlserver://sa:Password123@127.0.0.1:1433
@@ -1374,7 +1296,7 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 		case "mysql":
 			baseDataSourceName = "root:root@tcp(127.0.0.1:3306)/"
 		case "mariadb":
-			baseDataSourceName = "mariadb://root:root@127.0.0.1:3306/"
+			baseDataSourceName = "mariadb://root:root@tcp(127.0.0.1:3306)/"
 		case "pgx":
 			baseDataSourceName = "postgres://postgres:postgres@127.0.0.1:5432/"
 		case "cockroachdb":
@@ -1389,7 +1311,7 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 	if driverName == "" {
 		driverName = inferDriverName(baseDataSourceName)
 	}
-	baseDataSourceName = toPostgresScheme(baseDataSourceName)
+	baseDataSourceName = trimMySQLScheme(toPostgresScheme(baseDataSourceName))
 	if driverName == "sqlite" && !strings.Contains(baseDataSourceName, "mode=memory") && !strings.Contains(baseDataSourceName, "cache=shared") {
 		if strings.Contains(baseDataSourceName, "?") {
 			baseDataSourceName += "&mode=memory&cache=shared"
@@ -1398,16 +1320,7 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 		}
 	}
 
-	// Keyed on the driver's own form, so that both spellings of one base share a database; the helpers below keep a
-	// MySQL URL a URL
-	keyDataSourceName := baseDataSourceName
-	if driverName == "mysql" || driverName == "mariadb" {
-		keyDataSourceName, err = mySQLURLToDSN(baseDataSourceName)
-		if err != nil {
-			return "", errors.Trace(err)
-		}
-	}
-	cacheKey := hashStr(driverName + "|" + keyDataSourceName + "|" + uniqueTestID)
+	cacheKey := hashStr(driverName + "|" + baseDataSourceName + "|" + uniqueTestID)
 
 	testingGlobalMutex.Lock()
 	testingMux, ok := testingMutexes[cacheKey]
@@ -1515,11 +1428,7 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 			testingDSN = cockroachDBScheme + rest
 		}
 	case "mariadb":
-		testingDSN = mySQLDSNToURL(mariaDBScheme, testingDSN)
-	case "mysql":
-		if rest, ok := cutMySQLScheme(testingDSN); ok {
-			testingDSN = mySQLScheme + rest
-		}
+		testingDSN = mariaDBScheme + testingDSN
 	}
 
 	// Cache for other openers in the same test

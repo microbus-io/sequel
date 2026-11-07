@@ -1017,26 +1017,27 @@ it in `physicalDriverName`; nothing else should need to know.
 `Open("", ...)` and `OpenSingleton("", ...)` get, and two pairs of engines share a DSN format that names neither:
 pgx takes only `postgres://` and `postgresql://`, which CockroachDB uses too, and the MySQL driver's
 `user:pass@tcp(host)/db` names no engine. So sequel accepts `cockroachdb://` (the scheme SQLAlchemy's CockroachDB
-dialect uses), `mysql://` and `mariadb://`, and rewrites them into what the driver accepts (`toPostgresScheme`,
-`mySQLURLToDSN`) after inference reads the scheme and before anything parses the DSN. A `postgres://` URL is `pgx` on
-any port: a port that overrode a scheme once took a MySQL DSN whose password began with `26257` for CockroachDB.
-Default ports remain only as the last guess for a DSN with neither a scheme nor a recognizable format.
+dialect uses), `mysql://` and `mariadb://`. Inference reads the scheme, and it is then swapped for what the driver
+takes before anything parses the DSN. A `postgres://` URL is `pgx` on any port: a port that overrode a scheme once took
+a MySQL DSN whose password began with `26257` for CockroachDB. Default ports remain only as the last guess for a DSN
+with neither a scheme nor a recognizable format. Schemes are case-insensitive, so `lowerScheme` folds one before
+anything compares it.
 
-The MySQL rewrite builds a `mysql.Config` from the URL's credentials, host and database, appends the URL's query
-untouched, and parses the result with `mysql.ParseDSN`, so the query means exactly what it would in the driver's own
-format: known keys are parsed and validated, and unknown ones become session variables, as they always have. A URL
-that does not parse is reported without wrapping `url.Parse`'s error, which quotes the whole URL, password included;
-a `:` in the user name is refused, since the driver's format would move the rest of it into the password. The
-reverse, `mySQLDSNToURL`, takes the query from the text after the last `/`, where the driver itself splits the
-database from the parameters, and leaves any network but `tcp` alone (a socket, `tcp4`, `tcp6`), since a URL cannot
-express it. Schemes are case-insensitive, so `lowerScheme` folds one before anything compares it.
+**`mysql://` and `mariadb://` are prefixes, not URLs.** They go in front of a DSN in the MySQL driver's own format
+(`mariadb://root:pw@tcp(host:3306)/db?params`) and `trimMySQLScheme` strips them; the driver parses the rest as it
+always has. An earlier version took them as URLs (`mariadb://root:pw@host:3306/db`) and converted to and from the
+driver's format, which needed percent-encoding in credentials, leaked the password through `url.Parse`'s error,
+could not express a `:` in a user name or a network other than `tcp`, and keyed the testing-database cache on two
+spellings of one base. A prefix has none of that: it names the driver and carries nothing else. `cockroachdb://` is
+the same idea in a URL format, swapped for `postgres://` (`toPostgresScheme`).
 
 **A testing DSN must name its own driver.** It is opened without a driver name, so `CreateTestingDatabase` hands back
-a CockroachDB testing DSN as `cockroachdb://`, a MariaDB one as `mariadb://`, and a MySQL one given a `mariadb://`
-base as `mysql://`, whatever the base's spelling: a named driver wins over a scheme. The DSN cache is keyed on the
-driver's own form of the base, so both spellings of one base share one testing database. Keying on the raw text
-once made the second spelling miss the cache and drop and recreate the database under the first one's open handle. `setDatabaseInDataSourceName` keeps a `mysql://`/`mariadb://` URL a URL for the same reason. CI runs
-CockroachDB on port 26300 and MariaDB through `mariadb://`, so only the schemes can identify them there.
+a CockroachDB testing DSN as `cockroachdb://` and puts the `mariadb://` prefix on a MariaDB one, whatever the base's
+spelling; a MySQL one needs no prefix, and a named driver wins over the base's scheme. The base is stripped of its
+scheme before anything else, so both spellings of one base share one cache entry and one testing database. Keyed on
+the raw text, the second spelling once missed the cache and dropped and recreated the database under the first one's
+open handle. CI runs CockroachDB on port 26300 and MariaDB through `mariadb://`, so only the schemes can identify them
+there.
 
 ## `CreateTestingDatabase` and the `SEQUEL_TESTING_DSN` fallback
 
