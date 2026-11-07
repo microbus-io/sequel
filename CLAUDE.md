@@ -467,7 +467,10 @@ before it, which succeeded. Once a `Transact` transaction is doomed - by a scan 
 `Close` report it, on either path (`doomed`, checked by `advance` and `Close`). Misuse is the easy one to leave out,
 and each case is work that would otherwise silently not happen in a transaction that commits: a second `Send`, a
 statement queued after `Send`, a batch never sent (`Tx.unsentBatches`), and results never closed (`Tx.openBatch`
-still set) - `transactOnce`, and `Tx.Commit` itself, refuse to commit while either is outstanding. A batch on an
+still set) - `transactOnce`, and `Tx.Commit` itself, refuse to commit while either is outstanding. A statement queued
+after `Send` also sets `Tx.batchMisuse`, which `Tx.Commit` refuses on in a `BeginTx` transaction too, where nothing is
+recorded: otherwise the dropped statement committed silently. For the same reason a scan error fails the batch's
+results in either mode (`BatchRows.Scan` calls `fail`), so `Close` reports it as its godoc says. A batch on an
 already-doomed transaction short-circuits like any statement: `Send` touches nothing, and its reads and `Close`
 return the recorded error verbatim, which is why `fail` keeps an error the transaction already recorded as recorded
 and traces any other once, when it is stored. `sql.ErrNoRows` from a `QueryRow` is the one outcome that is not a
@@ -543,6 +546,13 @@ touching the database. Three reasons, in priority order:
 Recording is opt-in via an internal `autoErr` flag set only by `Transact`; a `Tx` from `BeginTx` records
 nothing and short-circuits nothing, so existing direct-transaction callers see identical behavior.
 `Tx.Err()` exposes the recorded error for callers that want to inspect it.
+
+The recorded error and the batch bookkeeping (`unsentBatches`, `batchMisuse`, `openBatch`, `batchExecuting`) sit
+behind `Tx.mu`. `sql.Tx` may be used from several goroutines, and this file's own `Tx.done` reasoning promises the
+shadow is as safe; a plain `err` field raced under `-race` as soon as two statements of one closure ran concurrently,
+and could lose the first error. Nothing is called with `mu` held - `Rollback` takes the open batch under it and
+abandons it after - so a statement issued by the batch itself cannot deadlock on it.
+`TestTx_ConcurrentUseIsRaceFree` pins it.
 
 ### The "no partial commit" guarantee extends to row reads (`Rows`)
 
@@ -791,6 +801,16 @@ Setters build a new `telemetry` value under `db.mutex` (copy-on-write via `clone
 reads never lock and never see a torn value. A `*Tx` captures the pointer at begin time. For an
 `OpenSingleton`-shared `*DB` the pointer is process-wide for that pool - last writer wins - so callers are
 told to configure once from the owning caller rather than each opener racing to set its own.
+
+**The pool-stats callback takes no lock of sequel's.** The OTel SDK holds its own lock while it runs the callback,
+and `SetMeterProvider` holds `db.mutex` while it unregisters and registers - which takes that SDK lock. A callback
+that took `db.mutex` (it once did, to read `db.DB`) therefore deadlocked against a concurrent `SetMeterProvider`, and
+against an `OpenSingleton` re-open. It reads `db.pool`, an atomic mirror of the `*sql.DB` set and cleared alongside it.
+`TestTelemetry_SetMeterProviderDuringCollection` hangs without it. The last `Close` unregisters the callback, so a
+closed pool is not kept alive by the meter, and a re-opened singleton does not stack callbacks.
+
+A `Transact` closure that panics leaves `err` nil, so the deferred finish recovers, reports the panic as the
+transaction's error - not as a commit - and re-panics.
 
 ### `db.operation.name` is learned at runtime and capped, not enumerated
 

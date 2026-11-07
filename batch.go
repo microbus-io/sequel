@@ -88,11 +88,20 @@ type batchItem struct {
 // Query or QueryRow according to what the statement returns.
 func (b *Batch) Queue(query string, args ...any) {
 	if b.sent {
-		b.tx.recordErr(errors.New("statement queued after the batch was sent"))
+		// Refused by Commit whether or not the transaction records errors: the statement will never run
+		err := errors.New("statement queued after the batch was sent")
+		b.tx.mu.Lock()
+		if b.tx.batchMisuse == nil {
+			b.tx.batchMisuse = err
+		}
+		b.tx.mu.Unlock()
+		b.tx.recordErr(err)
 		return
 	}
 	if len(b.items) == 0 {
+		b.tx.mu.Lock()
 		b.tx.unsentBatches++
+		b.tx.mu.Unlock()
 	}
 	b.items = append(b.items, &batchItem{query: query, args: args})
 }
@@ -125,7 +134,9 @@ func (b *Batch) Send(ctx context.Context) *BatchResults {
 	}
 	b.sent = true
 	if len(b.items) > 0 {
+		b.tx.mu.Lock()
 		b.tx.unsentBatches--
+		b.tx.mu.Unlock()
 	}
 	if err := b.tx.shortCircuit(); err != nil {
 		// Returned as recorded, as a short-circuited statement returns it.
@@ -143,7 +154,9 @@ func (b *Batch) Send(ctx context.Context) *BatchResults {
 	if len(b.items) == 0 {
 		return r
 	}
+	b.tx.mu.Lock()
 	b.tx.openBatch = r
+	b.tx.mu.Unlock()
 	if b.tx.conn != nil {
 		r.pipelined = true
 		// A failure is recorded into the transaction when a read or Close reaches it, in queue order, as when the

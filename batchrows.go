@@ -66,9 +66,10 @@ func (r *BatchRows) Next() bool {
 func (r *BatchRows) Scan(dest ...any) error {
 	err := r.src.Scan(dest...)
 	if err != nil {
-		r.results.batch.tx.recordErr(err)
+		// Failed into the results, so Close reports it whether or not the transaction records errors
+		return r.results.fail(err)
 	}
-	return traceErr(err)
+	return nil
 }
 
 // Err returns the error that ended iteration early, if any, including the rows having been superseded by a later

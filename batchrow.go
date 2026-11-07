@@ -47,7 +47,7 @@ func (r *BatchRow) Scan(dest ...any) error {
 	}
 	for _, d := range dest {
 		if _, raw := d.(*sql.RawBytes); raw {
-			return r.rows.results.batch.tx.recordErr(errors.New("sql.RawBytes is not a valid QueryRow destination"))
+			return r.rows.results.fail(errors.New("sql.RawBytes is not a valid QueryRow destination"))
 		}
 	}
 	if err := r.rows.Scan(dest...); err != nil {

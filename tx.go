@@ -19,6 +19,7 @@ package sequel
 import (
 	"context"
 	"database/sql"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -38,8 +39,11 @@ type Tx struct {
 	*sql.Tx
 	driverName string
 	autoErr    bool          // set by Transact: record first statement error and short-circuit thereafter
-	err        error         // first recorded statement error (autoErr mode only)
 	rtt        time.Duration // simulated round-trip delay, captured when the transaction began
+	// mu guards err and the batch bookkeeping below. sql.Tx may be used from several goroutines - a watchdog
+	// rolling back while the main path issues statements - and this shadow must be as safe.
+	mu  sync.Mutex
+	err error // first recorded statement error (autoErr mode only)
 	// done is set only by a Commit/Rollback that returned nil; see finalize. Atomic to match sql.Tx, whose
 	// own finalization is a CAS on an atomic.Bool so that concurrent Commit/Rollback is race-free.
 	done atomic.Bool
@@ -53,6 +57,9 @@ type Tx struct {
 	// unsentBatches counts batches queued on this transaction and not yet sent; Transact refuses to commit
 	// while it is nonzero, since their statements would silently never run.
 	unsentBatches int
+	// batchMisuse is the first misuse of a batch that would silently drop a statement - one queued after Send -
+	// which Commit refuses on whether or not the transaction records errors.
+	batchMisuse error
 	// openBatch is the batch whose results are being read, during which the transaction refuses every statement
 	// but the batch's own (batchExecuting).
 	openBatch      *BatchResults
@@ -62,20 +69,31 @@ type Tx struct {
 // recordErr remembers the first statement error in Transact (autoErr) mode and returns err unchanged,
 // so callers that do check the error see identical behavior.
 func (tx *Tx) recordErr(err error) error {
-	if err != nil && tx.autoErr && tx.err == nil {
-		tx.err = err
+	if err != nil && tx.autoErr {
+		tx.mu.Lock()
+		if tx.err == nil {
+			tx.err = err
+		}
+		tx.mu.Unlock()
 	}
 	return err
+}
+
+// batchRefuses reports whether an open batch's results bar a statement that is not the batch's own.
+func (tx *Tx) batchRefuses() bool {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	return tx.openBatch != nil && !tx.batchExecuting
 }
 
 // shortCircuit reports the recorded error when the transaction has already failed in autoErr mode, and refuses
 // any statement while a batch's results are open.
 func (tx *Tx) shortCircuit() error {
-	if tx.openBatch != nil && !tx.batchExecuting {
+	if tx.batchRefuses() {
 		return tx.recordErr(errors.New("a statement cannot be issued while a batch's results are open"))
 	}
 	if tx.autoErr {
-		return tx.err
+		return tx.Err()
 	}
 	return nil
 }
@@ -83,6 +101,8 @@ func (tx *Tx) shortCircuit() error {
 // Err returns the first statement error recorded in Transact mode, or nil. Always nil for a Tx obtained
 // from BeginTx.
 func (tx *Tx) Err() error {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
 	return tx.err
 }
 
@@ -207,7 +227,7 @@ func (tx *Tx) StmtContext(ctx context.Context, stmt *Stmt) *Stmt {
 	if stmt.err != nil {
 		return &Stmt{pq: stmt.pq, driverName: tx.driverName, tx: tx, err: stmt.err}
 	}
-	if tx.openBatch != nil && !tx.batchExecuting {
+	if tx.batchRefuses() {
 		// Binding may prepare on the connection, which an open batch's result set may still be using.
 		return &Stmt{pq: stmt.pq, driverName: tx.driverName, tx: tx, err: tx.shortCircuit()}
 	}
@@ -241,6 +261,11 @@ func (tx *Tx) Commit() error {
 // batchPending reports a batch of this transaction that would be lost by committing now: one queued and never
 // sent, or one whose results were never closed, whose unread statements would never run.
 func (tx *Tx) batchPending() error {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+	if tx.batchMisuse != nil {
+		return tx.batchMisuse
+	}
 	if tx.unsentBatches > 0 {
 		return errors.New("a batch was queued but never sent")
 	}
@@ -254,10 +279,13 @@ func (tx *Tx) batchPending() error {
 // transaction the same way. A rollback is a round trip whether or not anything went right, so it is
 // instrumented while the transaction unwinds after a failure too.
 func (tx *Tx) Rollback() error {
-	if tx.openBatch != nil {
+	tx.mu.Lock()
+	open := tx.openBatch
+	tx.mu.Unlock()
+	if open != nil {
 		// The transaction is ending, so its batch's results can no longer be read: rows scanned later would use
 		// the type map of a connection back in the pool.
-		tx.openBatch.abandon()
+		open.abandon()
 	}
 	return tx.finalize("ROLLBACK", tx.Tx.Rollback)
 }

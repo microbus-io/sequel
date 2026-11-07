@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/microbus-io/errors"
 	"github.com/microbus-io/sequel/testdata"
@@ -493,4 +494,65 @@ func TestTelemetry_SetMeterProviderNilRevertsToGlobal(t *testing.T) {
 			assert.False(strings.HasPrefix(m.Name, "sequel_"), "unexpected metric %s after revert", m.Name)
 		}
 	}
+}
+
+// SetMeterProvider while the SDK collects must not deadlock: the collection holds the SDK's lock while it runs the
+// pool callback, and SetMeterProvider takes that lock to re-register. The callback once took the *DB's mutex, which
+// SetMeterProvider holds throughout.
+func TestTelemetry_SetMeterProviderDuringCollection(t *testing.T) {
+	t.Parallel()
+
+	reader := sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	db := newSQLiteDB(t)
+	db.SetMeterProvider(mp)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			for range 300 {
+				var rm metricdata.ResourceMetrics
+				_ = reader.Collect(context.Background(), &rm)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			for range 300 {
+				db.SetMeterProvider(mp)
+			}
+		}()
+		wg.Wait()
+	}()
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("SetMeterProvider deadlocked with a collection")
+	}
+}
+
+// A Transact closure that panics is recorded as an error, not as a commit, and the panic propagates.
+func TestTelemetry_TransactPanicIsNotACommit(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	recorder := tracetest.NewSpanRecorder()
+	db := newSQLiteDB(t)
+	db.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder)))
+
+	func() {
+		defer func() { assert.Equal("boom", recover()) }()
+		_ = db.Transact(context.Background(), func(tx *Tx) error { panic("boom") })
+	}()
+	found := false
+	for _, span := range recorder.Ended() {
+		if span.Name() == "transact" {
+			found = true
+			assert.Equal(codes.Error, span.Status().Code)
+		}
+	}
+	assert.True(found, "no transact span")
 }

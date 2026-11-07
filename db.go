@@ -86,7 +86,10 @@ type DB struct {
 	singletonKey   string
 	refCount       int
 	mutex          sync.Mutex
-	telemetry      atomic.Pointer[telemetry]
+	// pool mirrors the embedded *sql.DB for the pool-stats callback, which must not take mutex: OTel holds its
+	// own lock while it runs the callback, and SetMeterProvider holds mutex while it takes that lock.
+	pool      atomic.Pointer[sql.DB]
+	telemetry atomic.Pointer[telemetry]
 	// simulatedRTT is the artificial per-round-trip delay set by [DB.SimulateRTT], in nanoseconds. It is
 	// read on every operation and may be changed while the pool is in use, so it is atomic rather than
 	// guarded by mutex.
@@ -152,6 +155,7 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 		dataSourceName: dataSourceName,
 		refCount:       1,
 	}
+	db.pool.Store(sqlDB)
 	db.telemetry.Store(newDefaultTelemetry(db))
 	return db, nil
 }
@@ -206,6 +210,7 @@ func OpenSingleton(driverName string, dataSourceName string) (db *DB, err error)
 		return nil, errors.Trace(err)
 	}
 	singletonDB.DB = sqlDB
+	singletonDB.pool.Store(sqlDB)
 	singletonDB.refCount = 1
 	singletonDB.telemetry.Store(newDefaultTelemetry(singletonDB))
 	singletonDB.adjustConnectionLimits()
@@ -473,6 +478,11 @@ func (db *DB) Close() (err error) {
 	}
 	db.refCount--
 	if db.refCount == 0 {
+		// Unregistered, or every Open would add a callback that keeps this *DB alive and reports a closed pool
+		if reg := db.telemetry.Load().poolRegistration; reg != nil {
+			_ = reg.Unregister()
+		}
+		db.pool.Store(nil)
 		err = db.DB.Close()
 		db.DB = nil
 		db.maybeDropTestingDatabase()
@@ -638,12 +648,11 @@ func (db *DB) updateTelemetry(mutate func(*telemetry)) {
 // snapshotStats returns a connection-pool stats snapshot, or ok=false if the pool has been closed. Used by
 // the pool-gauge callback, which must tolerate a singleton *DB whose underlying pool was closed.
 func (db *DB) snapshotStats() (sql.DBStats, bool) {
-	db.mutex.Lock()
-	defer db.mutex.Unlock()
-	if db.DB == nil {
+	pool := db.pool.Load()
+	if pool == nil {
 		return sql.DBStats{}, false
 	}
-	return db.DB.Stats(), true
+	return pool.Stats(), true
 }
 
 // Exec shadows sql.DB.Exec and conforms arg placeholders for the driver.
@@ -848,7 +857,14 @@ func (db *DB) Transact(ctx context.Context, fn func(tx *Tx) error) (err error) {
 	op := db.telemetry.Load().beginTransact(ctx, db.driverName)
 	ctx = op.ctx
 	attempts := 0
-	defer func() { op.finish(attempts, err) }()
+	defer func() {
+		// A panic leaves err nil, and would otherwise be reported as a commit
+		if r := recover(); r != nil {
+			op.finish(attempts, errors.New("panic in transaction: %v", r))
+			panic(r)
+		}
+		op.finish(attempts, err)
+	}()
 	for attempt := range transactMaxAttempts {
 		if attempt > 0 {
 			transactBackoff(attempt)
@@ -892,8 +908,8 @@ func (db *DB) transactOnce(ctx context.Context, fn func(tx *Tx) error) error {
 	if err := fn(tx); err != nil {
 		return errors.Trace(err)
 	}
-	if tx.err != nil {
-		return errors.Trace(tx.err)
+	if err := tx.Err(); err != nil {
+		return errors.Trace(err)
 	}
 	if err := tx.batchPending(); err != nil {
 		return err

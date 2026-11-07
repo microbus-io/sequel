@@ -56,8 +56,8 @@ func (r *BatchResults) fail(err error) error {
 	if err == nil {
 		return nil
 	}
-	if t := r.batch.tx; t.err != nil && errors.Is(err, t.err) {
-		err = t.err
+	if recorded := r.batch.tx.Err(); recorded != nil && errors.Is(err, recorded) {
+		err = recorded
 	} else {
 		err = traceErr(err)
 	}
@@ -71,8 +71,10 @@ func (r *BatchResults) fail(err error) error {
 // doomed fails the batch with the transaction's recorded error, if a Transact transaction is already doomed - by a
 // scan error, say - so that reads and Close report it whichever way the batch was sent.
 func (r *BatchResults) doomed() {
-	if t := r.batch.tx; t.autoErr && t.err != nil {
-		r.fail(t.err)
+	if t := r.batch.tx; t.autoErr {
+		if recorded := t.Err(); recorded != nil {
+			r.fail(recorded)
+		}
 	}
 }
 
@@ -115,10 +117,14 @@ func (r *BatchResults) supersedeOpen() {
 // results are open. A statement that panics - an argument Valuer, say - fails the batch on the way out.
 func (r *BatchResults) run(fn func() error) (err error) {
 	tx := r.batch.tx
+	tx.mu.Lock()
 	tx.batchExecuting = true
+	tx.mu.Unlock()
 	returned := false
 	defer func() {
+		tx.mu.Lock()
 		tx.batchExecuting = false
+		tx.mu.Unlock()
 		if !returned {
 			r.fail(errors.New("panic while running a batch statement"))
 		}
@@ -229,7 +235,10 @@ func (r *BatchResults) abandon() {
 	for _, it := range r.batch.items {
 		it.fields, it.rows = nil, nil
 	}
-	if r.batch.tx.openBatch == r {
-		r.batch.tx.openBatch = nil
+	tx := r.batch.tx
+	tx.mu.Lock()
+	if tx.openBatch == r {
+		tx.openBatch = nil
 	}
+	tx.mu.Unlock()
 }

@@ -107,3 +107,38 @@ func TestTx_DeferredRollbackAfterCommit(t *testing.T) {
 	assert.NoError(db.QueryRow("SELECT COUNT(*) FROM tx_defer").Scan(&n))
 	assert.Equal(1, n, "the commit stands; the redundant rollback must not have undone it")
 }
+
+// A Transact Tx used from several goroutines - statements failing and succeeding concurrently, and a watchdog rolling
+// back - must be race-free, and the error it records must be one of the statements' errors. Run under -race.
+func TestTx_ConcurrentUseIsRaceFree(t *testing.T) {
+	assert := testarossa.For(t)
+
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	db, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	defer db.Close()
+	_, err = db.Exec("CREATE TABLE tx_concurrent (k INT)")
+	assert.NoError(err)
+
+	err = db.Transact(context.Background(), func(tx *Tx) error {
+		var wg sync.WaitGroup
+		for i := range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if i%2 == 0 {
+					_, _ = tx.Exec("INSERT INTO tx_concurrent (k) VALUES (?)", i)
+				} else {
+					_, _ = tx.Exec("INSERT INTO no_such_table (k) VALUES (?)", i)
+				}
+				_ = tx.Err()
+			}()
+		}
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = tx.Rollback() }()
+		wg.Wait()
+		return nil
+	})
+	assert.Error(err)
+}

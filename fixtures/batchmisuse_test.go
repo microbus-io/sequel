@@ -248,6 +248,49 @@ func TestBatch_Misuse(t *testing.T) {
 	}
 }
 
+// TestBatch_MisuseOnBeginTx checks the misuse a BeginTx transaction must refuse too, though it records no statement
+// errors: a statement queued after Send would never run, so Commit refuses, and a scan error is the batch's failure,
+// so Close reports it.
+func TestBatch_MisuseOnBeginTx(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+	ctx := context.Background()
+
+	db := newTestDB(t)
+	_, err := db.Exec("CREATE TABLE batch_begintx (id INT)")
+	assert.NoError(err)
+
+	tx, err := db.BeginTx(ctx, nil)
+	if !assert.NoError(err) {
+		return
+	}
+	b := tx.Batch()
+	b.Queue("INSERT INTO batch_begintx (id) VALUES (1)")
+	assert.NoError(b.Send(ctx).Close())
+	b.Queue("INSERT INTO batch_begintx (id) VALUES (2)")
+	assert.Error(tx.Commit(), "committed with a statement dropped from the batch")
+	assert.NoError(tx.Rollback())
+	assert.Equal(0, countRows(t, db, "batch_begintx"))
+
+	tx, err = db.BeginTx(ctx, nil)
+	if !assert.NoError(err) {
+		return
+	}
+	defer tx.Rollback()
+	b = tx.Batch()
+	b.Queue("SELECT 1")
+	res := b.Send(ctx)
+	rows, err := res.Query()
+	if assert.NoError(err) {
+		for rows.Next() {
+			var x, y int
+			_ = rows.Scan(&x, &y) // one column, two destinations
+		}
+	}
+	assert.Error(res.Close(), "Close did not report the scan error")
+}
+
+
 // TestBatch_ReadsOutOfRange: reading past the last statement, or after Close, is an error; it is not a statement's
 // failure, so the transaction still commits.
 func TestBatch_ReadsOutOfRange(t *testing.T) {
