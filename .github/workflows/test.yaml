@@ -60,6 +60,33 @@ jobs:
       - name: Test (MySQL)
         run: go test -race ./... -count=1 -timeout 20m
 
+  mariadb:
+    name: MariaDB
+    runs-on: ubuntu-latest
+    services:
+      mariadb:
+        image: mariadb:11.8
+        env:
+          MARIADB_ROOT_PASSWORD: root
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="healthcheck.sh --connect --innodb_initialized"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      SEQUEL_TESTING_DSN: root:root@tcp(127.0.0.1:3306)/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+      - name: Test (MariaDB)
+        run: go test -race ./... -count=1 -timeout 20m
+
   postgres:
     name: PostgreSQL
     runs-on: ubuntu-latest
