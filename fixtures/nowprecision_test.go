@@ -181,3 +181,70 @@ func TestVF_NowUTCPrecision(t *testing.T) {
 	assert.True(whole("NOW_UTC()", 1), "NOW_UTC() is finer than milliseconds")
 	assert.True(whole("NOW_UTC(3)", 1), "NOW_UTC(3) is finer than milliseconds")
 }
+
+// TestVF_NowUTCTruncatesInOneStatement compares NOW_UTC(p) with NOW_UTC(6) in one statement, where every engine
+// reads its clock once, so the two are the same instant at two precisions. NOW_UTC(p) must not be after it, and must
+// be less than one of its units before it: truncated, neither rounded up nor cut too far. A rounding expansion fails
+// about half the samples at every precision, however fast the round trip.
+func TestVF_NowUTCTruncatesInOneStatement(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t)
+
+	// SQLite's DATE_DIFF_MILLIS is float arithmetic a fraction of a millisecond off at today's dates
+	tolerance := 0.0
+	if db.DriverName() == "sqlite" {
+		tolerance = 0.1
+	}
+	for p := range 6 {
+		now := "NOW_UTC(" + strconv.Itoa(p) + ")"
+		t.Run(now, func(t *testing.T) {
+			assert := testarossa.For(t)
+			unit := math.Pow(10, float64(3-p)) // In milliseconds
+			ahead, early := 0, 0
+			for range 200 {
+				var notAhead int
+				var diff string
+				err := db.QueryRow("SELECT CASE WHEN "+now+" <= NOW_UTC(6) THEN 1 ELSE 0 END, "+
+					"DATE_DIFF_MILLIS(NOW_UTC(6), "+now+")").Scan(&notAhead, &diff)
+				if !assert.NoError(err) {
+					return
+				}
+				ms, err := strconv.ParseFloat(strings.TrimSpace(diff), 64)
+				if !assert.NoError(err) {
+					return
+				}
+				if notAhead != 1 || ms < -tolerance {
+					ahead++
+				}
+				if ms >= unit+tolerance {
+					early++
+				}
+			}
+			assert.Equal(0, ahead, "%s was after NOW_UTC(6) in %d of 200 statements", now, ahead)
+			assert.Equal(0, early, "%s was a unit or more before NOW_UTC(6) in %d of 200 statements", now, early)
+		})
+	}
+}
+
+// TestVF_DateAddMillisToNowUTCIsExact adds milliseconds to NOW_UTC(p) at every precision and measures the result
+// against the same NOW_UTC(p) in one statement. On SQL Server, DATEADD rounds the interval to its base's type, so
+// without widening, 400 ms added to NOW_UTC(0) added nothing and 1500 added 2000.
+func TestVF_DateAddMillisToNowUTCIsExact(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t)
+
+	// SQLite's DATE_DIFF_MILLIS is float arithmetic a fraction of a millisecond off at today's dates
+	tolerance := 0.0005
+	if db.DriverName() == "sqlite" {
+		tolerance = 0.5
+	}
+	for _, now := range []string{"NOW_UTC(0)", "NOW_UTC(1)", "NOW_UTC(2)", "NOW_UTC()", "NOW_UTC(6)"} {
+		t.Run(now, func(t *testing.T) {
+			assert := testarossa.For(t)
+			for _, ms := range []int64{400, 1500, -250, 1, 86_400_123} {
+				diff := queryFloat(t, db, "SELECT DATE_DIFF_MILLIS(DATE_ADD_MILLIS("+now+", ?), "+now+")", ms)
+				assert.True(math.Abs(diff-float64(ms)) < tolerance, "%s plus %d ms is %v ms later", now, ms, diff)
+			}
+		})
+	}
+}

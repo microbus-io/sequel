@@ -146,13 +146,14 @@ jobs:
   cockroachdb:
     name: CockroachDB
     runs-on: ubuntu-latest
-    # A service container cannot be given a command, and CockroachDB needs one, so it is started in a step
+    # A service container cannot be given a command, and CockroachDB needs one, so it is started in a step. It
+    # listens on 26300, not its default port, so that only the cockroachdb:// scheme can identify it.
     env:
-      SEQUEL_TESTING_DSN: cockroachdb://root@127.0.0.1:26257/?sslmode=disable
+      SEQUEL_TESTING_DSN: cockroachdb://root@127.0.0.1:26300/?sslmode=disable
     steps:
       - name: Start CockroachDB
         run: |
-          docker run -d --name cockroachdb -p 26257:26257 cockroachdb/cockroach:latest-v26.3 start-single-node --insecure
+          docker run -d --name cockroachdb -p 26300:26257 cockroachdb/cockroach:latest-v26.3 start-single-node --insecure
           for i in $(seq 1 30); do
             docker exec cockroachdb ./cockroach sql --insecure -e 'SELECT 1' && exit 0
             sleep 2

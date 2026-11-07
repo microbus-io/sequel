@@ -326,8 +326,9 @@ func vfDateAddMillis(driverName string, args string) (string, error) {
 	case "pgx":
 		return "(" + baseExpr + " + MAKE_INTERVAL(secs => (" + millis + ") / 1000.0))", nil
 	case "cockroachdb":
-		// CockroachDB has no MAKE_INTERVAL
-		return "(" + baseExpr + " + CAST((" + millis + ") AS FLOAT8) * INTERVAL '1 millisecond')", nil
+		// CockroachDB has no MAKE_INTERVAL. Scaled from days, not milliseconds: a millisecond interval is held in
+		// nanoseconds and saturates past ~292 years, and a DECIMAL keeps the fraction exact.
+		return "(" + baseExpr + " + INTERVAL '1 day' * (CAST((" + millis + ") AS DECIMAL) / 86400000))", nil
 	case "mssql":
 		return mssqlDateAddMillis(baseExpr, millis), nil
 	case "sqlite":
@@ -337,10 +338,18 @@ func vfDateAddMillis(driverName string, args string) (string, error) {
 	}
 }
 
+// coarseNowUTCPattern matches a NOW_UTC call with fewer than three fractional digits.
+var coarseNowUTCPattern = regexp.MustCompile(`(?i)^NOW_UTC\(\s*[0-2]\s*\)$`)
+
 // mssqlDateAddMillis expands DATE_ADD_MILLIS for SQL Server. DATEADD takes an int, so the milliseconds are
 // split into whole hours plus a remainder under an hour, each of which fits. Placeholders arrive numbered
 // ($1, $2...), so millis can be referenced twice.
 func mssqlDateAddMillis(baseExpr, millis string) string {
+	// DATEADD returns its base's type and rounds the interval to it, so a NOW_UTC coarser than milliseconds is
+	// widened first, or DATE_ADD_MILLIS(NOW_UTC(0), 400) would add nothing
+	if coarseNowUTCPattern.MatchString(baseExpr) {
+		baseExpr = "CAST(" + baseExpr + " AS DATETIME2(7))"
+	}
 	if n, err := strconv.ParseInt(millis, 10, 64); err == nil {
 		// Not up to the int limits: DATEADD(MILLISECOND, -2147483648, ...) overflows although its argument fits
 		if n > -3600000 && n < 3600000 {

@@ -85,7 +85,14 @@ half a unit and the cast must stay half-up: a cast that rounded half to even wou
 `TestVF_NowUTCNeverAheadOfTheClock` (fixtures) stores `NOW_UTC(p)` in a microsecond column and checks it against a
 `NOW_UTC(6)` read right after.
 
-`DATE_ADD_MILLIS` keeps its base's precision on the server drivers, so it needs no precision of its own.
+**`DATE_ADD_MILLIS` adds its milliseconds exactly to a `NOW_UTC(p)` of any precision**, so it needs no precision
+of its own. PostgreSQL, CockroachDB and MySQL return a finer type than the base (`timestamp`, `DATETIME(6)`), and
+SQLite always prints three digits. SQL Server's `DATEADD` instead returns its base's type and **rounds the interval
+to it**: on a `DATETIME2(0)` base, 1500 ms added 2000 and 400 added nothing, so a lease written as `NOW_UTC(0)` plus
+400 ms expired as it was written. `mssqlDateAddMillis` therefore widens a `NOW_UTC` of fewer than three digits to
+`DATETIME2(7)` first. It does not widen every base: a cast to `DATETIME2` would drop a `DATETIMEOFFSET` column's
+offset, and a coarse column as the base keeps rounding the interval to its own precision, as storing the result back
+into it would. `TestVF_DateAddMillisToNowUTCIsExact` pins the `NOW_UTC` case.
 
 **On SQLite every `p` prints three fractional digits**, because a timestamp there is text and compares as text:
 `'...:01.000' > '...:01'`, so a `DATE_ADD_MILLIS` result (always `%f`, three digits) built from a shorter
@@ -1006,8 +1013,13 @@ driver, the session time-zone pin, and the database-name helpers all understand 
 rewrite happens after inference, which is what reads the scheme. The port rule stays, for `postgres://` DSNs that
 already rely on it.
 
-`CreateTestingDatabase` hands its testing DSN back in `cockroachdb://` form when its base was. The testing DSN is
-opened without a driver name, and in `postgres://` form it would name PostgreSQL again on any port but 26257.
+`CreateTestingDatabase` hands a CockroachDB testing DSN back in `cockroachdb://` form, whatever its base's scheme. The
+testing DSN is opened without a driver name, and in `postgres://` form it would name PostgreSQL again on any port but
+26257. Keying on the driver rather than the caller's spelling matters because the DSN cache maps both spellings of
+one base to one entry. CI runs CockroachDB on port 26300, so the port rule cannot mask a regression here.
+
+The port rule reads only the host list of a `postgres://` or `postgresql://` URL. Matching `:26257` anywhere in the
+text took a MySQL DSN whose password began with those digits for CockroachDB and opened it with pgx.
 
 ## `CreateTestingDatabase` and the `SEQUEL_TESTING_DSN` fallback
 

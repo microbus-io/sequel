@@ -149,6 +149,15 @@ func TestDB_InferDriverName(t *testing.T) {
 	assert.Equal("cockroachdb", inferDriverName("cockroachdb://root@127.0.0.1:26257/"))
 	assert.Equal("cockroachdb", inferDriverName("cockroachdb://root@db.example.com:9999/mydb"))
 
+	// The CockroachDB port counts in a postgres:// URL's host list only, never in its userinfo or elsewhere
+	assert.Equal("cockroachdb", inferDriverName("postgres://root@h1:5432,h2:26257/db"))
+	assert.Equal("cockroachdb", inferDriverName("postgresql://u:p@ss@h:26257?sslmode=disable"))
+	assert.Equal("pgx", inferDriverName("postgres://app:26257pw@db:5432/app"))
+	assert.Equal("pgx", inferDriverName("postgres://app@db:5432/app?options=x:26257"))
+	assert.Equal("mysql", inferDriverName("root:26257secret@tcp(127.0.0.1:3306)/app"))
+	assert.Equal("mssql", inferDriverName("sqlserver://sa:26257Pw@127.0.0.1:1433"))
+	assert.Equal("sqlite", inferDriverName("file:/data/snap:26257.db"))
+
 	// SQL Server prefix
 	assert.Equal("mssql", inferDriverName("sqlserver://user:pw@127.0.0.1:1433"))
 
@@ -423,7 +432,7 @@ func TestDB_UnpackQuery_DateAddMillis(t *testing.T) {
 	db = newTestDB("cockroachdb")
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, ?)")
 	assert.NoError(err)
-	assert.Equal("SELECT (created_at + CAST(($1) AS FLOAT8) * INTERVAL '1 millisecond')", q)
+	assert.Equal("SELECT (created_at + INTERVAL '1 day' * (CAST(($1) AS DECIMAL) / 86400000))", q)
 
 	db = newTestDB("mssql")
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, 5000)")
@@ -447,6 +456,16 @@ func TestDB_UnpackQuery_DateAddMillis(t *testing.T) {
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, ?) WHERE id=?")
 	assert.NoError(err)
 	assert.Equal("SELECT DATEADD(MILLISECOND, CAST($1 AS BIGINT) % 3600000, DATEADD(HOUR, CAST($1 AS BIGINT) / 3600000, created_at)) WHERE id=$2", q)
+	// DATEADD rounds the interval to its base's type, so a NOW_UTC coarser than milliseconds is widened
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(NOW_UTC(0), 400)")
+	assert.NoError(err)
+	assert.Equal("SELECT DATEADD(MILLISECOND, 400, CAST((CONVERT(DATETIME2(0), DATEADD(NANOSECOND, -500000000, SYSUTCDATETIME()))) AS DATETIME2(7)))", q)
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(now_utc( 2 ), 400)")
+	assert.NoError(err)
+	assert.Contains(q, "AS DATETIME2(7))")
+	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(NOW_UTC(), 400)")
+	assert.NoError(err)
+	assert.Equal("SELECT DATEADD(MILLISECOND, 400, (CONVERT(DATETIME2(3), DATEADD(NANOSECOND, -500000, SYSUTCDATETIME()))))", q)
 
 	db = newTestDB("sqlite")
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, 5000)")

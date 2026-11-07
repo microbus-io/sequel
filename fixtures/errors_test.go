@@ -60,4 +60,8 @@ func TestErrors_UndefinedTableFromTheDatabase(t *testing.T) {
 	err = db.QueryRowContext(ctx, "SELECT present_table.id FROM present_table p WHERE p.id=?", 1).Scan(&n)
 	assert.Error(err)
 	assert.False(sequel.IsUndefinedTableError(err), "a table name hidden by its alias: %v", err)
+	// SQLite reports this one as "no such table: f", the very text of a missing table, so it is taken for one there
+	err = db.QueryRowContext(ctx, "SELECT f.* FROM present_table WHERE id=?", 1).Scan(&n)
+	assert.Error(err)
+	assert.Equal(db.DriverName() == "sqlite", sequel.IsUndefinedTableError(err), "a qualified star with no FROM-clause entry: %v", err)
 }

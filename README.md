@@ -150,15 +150,17 @@ On PostgreSQL and CockroachDB, sequel opens every connection with its session ti
 |------------|-----------------------------------------------------------------------------------|
 | MySQL      | `DATE_ADD(created_at, INTERVAL (?) * 1000 MICROSECOND)`                          |
 | PostgreSQL | `created_at + MAKE_INTERVAL(secs => (?) / 1000.0)`                              |
-| CockroachDB | `created_at + CAST((?) AS FLOAT8) * INTERVAL '1 millisecond'`                  |
+| CockroachDB | `created_at + INTERVAL '1 day' * (CAST((?) AS DECIMAL) / 86400000)`            |
 | SQL Server | `DATEADD(MILLISECOND, CAST($1 AS BIGINT) % 3600000, DATEADD(HOUR, CAST($1 AS BIGINT) / 3600000, created_at))` |
 | SQLite     | `STRFTIME('%Y-%m-%d %H:%M:%f', created_at, '+' \|\| ((?) / 1000.0) \|\| ' seconds')` |
 
 On SQL Server, `DATEADD` takes an `int`, so the milliseconds are split into hours plus a remainder to reach
 intervals past ~24.8 days.
 
-The result is as precise as `baseExpr`, so `DATE_ADD_MILLIS(NOW_UTC(), ?)` belongs in a millisecond column and
-`DATE_ADD_MILLIS(NOW_UTC(6), ?)` in a microsecond one. On SQLite it is milliseconds.
+The milliseconds are added exactly to a `NOW_UTC(p)` of any precision: `DATE_ADD_MILLIS(NOW_UTC(0), 400)` is 400 ms
+past a whole second on every driver. With whole milliseconds, a result built on `NOW_UTC()` or a coarser one fits a
+millisecond column exactly, and one built on `NOW_UTC(6)` needs a microsecond column. On SQL Server, a column with
+fewer than three fractional digits passed as `baseExpr` rounds the milliseconds to its own precision.
 
 **`DATE_DIFF_MILLIS(a, b)`** returns the difference `(a - b)` in milliseconds.
 

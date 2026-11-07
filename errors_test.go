@@ -148,7 +148,13 @@ func TestErrors_IsUndefinedTableError(t *testing.T) {
 	assert.False(IsUndefinedTableError(&pgconn.PgError{Code: "42P01",
 		Message: `missing FROM-clause entry for table "f"`})) // No routine
 	assert.False(IsUndefinedTableError(&pgconn.PgError{Code: "42P01",
-		Message: `no data source matches prefix: f in this context`})) // CockroachDB
+		Message: `no data source matches prefix: f in this context`, Routine: "ResolveColumnItem"})) // CockroachDB
+	assert.False(IsUndefinedTableError(&pgconn.PgError{Code: "42P01",
+		Message: `no data source matches pattern: f.*`, Routine: "ResolveAllColumnsSelector"})) // CockroachDB
+	assert.False(IsUndefinedTableError(&pgconn.PgError{Code: "42P01",
+		Message: `no data source matches pattern: f.*`})) // No routine
+	assert.True(IsUndefinedTableError(&pgconn.PgError{Code: "42P01",
+		Message: `relation "nope" does not exist`, Routine: "NewUndefinedRelationError"})) // CockroachDB
 
 	// Substring fallback.
 	undefined := []string{
@@ -168,6 +174,7 @@ func TestErrors_IsUndefinedTableError(t *testing.T) {
 		`ERROR: missing FROM-clause entry for table "f" (SQLSTATE 42P01)`,                  // PostgreSQL
 		`ERROR: invalid reference to FROM-clause entry for table "users" (SQLSTATE 42P01)`, // PostgreSQL
 		`ERROR: no data source matches prefix: f in this context (SQLSTATE 42P01)`,         // CockroachDB
+		`ERROR: no data source matches pattern: f.* (SQLSTATE 42P01)`,                      // CockroachDB
 	}
 	for _, msg := range defined {
 		assert.False(IsUndefinedTableError(errors.New(msg)), "should not be undefined table: %s", msg)

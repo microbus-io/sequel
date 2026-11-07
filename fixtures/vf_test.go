@@ -131,6 +131,26 @@ func TestVF_DateAddAndDiffMillis(t *testing.T) {
 	assert.True(math.Abs(diff-(-5000)) < 1000, "expected ~-5000ms, got %v ms", diff)
 }
 
+// TestVF_DateAddMillisCenturies adds and subtracts 500 years and a few milliseconds, bound, and checks the exact
+// result. CockroachDB holds a millisecond interval in nanoseconds, which saturates past ~292 years.
+func TestVF_DateAddMillisCenturies(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB(t)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	const days = 500 * 365
+	for _, sign := range []int64{1, -1} {
+		ms := sign * (days*86_400_000 + 123)
+		want := base.AddDate(0, 0, int(sign)*days).Add(time.Duration(sign*123) * time.Millisecond)
+		var match int
+		err := db.QueryRow("SELECT CASE WHEN DATE_ADD_MILLIS("+tsLiteral(db, base)+", ?) = "+tsLiteral(db, want)+" THEN 1 ELSE 0 END", ms).Scan(&match)
+		if assert.NoError(err, "%d ms", ms) {
+			assert.Equal(1, match, "%s plus %d ms is not %s", base, ms, want)
+		}
+	}
+}
+
 // TestVF_DateAddMillisPastInt32InStatements binds a 30-day DATE_ADD_MILLIS in the places a scheduler puts one -
 // an INSERT's VALUES, an UPDATE's SET and a WHERE - with binds on both sides of it, and inside an aggregate and a
 // GROUP BY.

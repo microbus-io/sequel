@@ -389,7 +389,8 @@ func isLockContentionMessage(msg string) bool {
 // IsUndefinedTableError returns true if the error indicates that a statement named a table that does not exist.
 // Recognizes the error from SQLite, MySQL, MariaDB, PostgreSQL, SQL Server, and CockroachDB. A column qualified by
 // a name that is not in the FROM clause is not a missing table, although PostgreSQL and CockroachDB report it with
-// the same SQLSTATE 42P01.
+// the same SQLSTATE 42P01. SQLite is the exception: it reports a qualified star whose qualifier names no table
+// (SELECT f.* FROM t) as "no such table: f", and this returns true for it.
 //
 // As with [IsLockContentionError], the driver's native error code is preferred, and a substring match is the
 // fallback for errors whose driver type is not in the chain.
@@ -401,9 +402,9 @@ func IsUndefinedTableError(err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		// 42P01 undefined_table (PostgreSQL and CockroachDB), which also reports a qualifier that names no
-		// FROM-clause entry. PostgreSQL raises both of those in errorMissingRTE; the routine name is not localized,
-		// and the message covers CockroachDB, which sends no PostgreSQL routine.
-		return pgErr.Code == "42P01" && pgErr.Routine != "errorMissingRTE" && !isFromClauseEntryMessage(pgErr.Message)
+		// FROM-clause entry. The routine that raised it tells them apart, and is not localized; the message is
+		// the fallback for a server whose routine names differ.
+		return pgErr.Code == "42P01" && !columnResolutionRoutines[pgErr.Routine] && !isFromClauseEntryMessage(pgErr.Message)
 	}
 	var myErr *mysql.MySQLError
 	if errors.As(err, &myErr) {
@@ -437,11 +438,19 @@ func isUndefinedTableMessage(msg string) bool {
 	return false
 }
 
+// columnResolutionRoutines are the server routines that report a qualifier naming no FROM-clause entry as 42P01
+// undefined_table although no table is missing: PostgreSQL's, then CockroachDB's.
+var columnResolutionRoutines = map[string]bool{
+	"errorMissingRTE":           true,
+	"ResolveColumnItem":         true,
+	"ResolveAllColumnsSelector": true,
+}
+
 // isFromClauseEntryMessage matches PostgreSQL's "missing FROM-clause entry" and "invalid reference to FROM-clause
-// entry" errors, and CockroachDB's "no data source matches prefix", which both report as 42P01 undefined_table
-// although no table is missing.
+// entry" errors, and CockroachDB's "no data source matches prefix" and "no data source matches pattern", which
+// report as 42P01 undefined_table although no table is missing.
 func isFromClauseEntryMessage(msg string) bool {
-	return strings.Contains(msg, "FROM-clause entry") || strings.Contains(msg, "no data source matches prefix")
+	return strings.Contains(msg, "FROM-clause entry") || strings.Contains(msg, "no data source matches")
 }
 
 // Close closes the database connection.
@@ -1128,6 +1137,25 @@ func toPostgresScheme(dsn string) string {
 	return dsn
 }
 
+// cutPostgresScheme returns what follows a postgres:// or postgresql:// scheme.
+func cutPostgresScheme(dsn string) (rest string, ok bool) {
+	if rest, ok = strings.CutPrefix(dsn, "postgres://"); ok {
+		return rest, true
+	}
+	return strings.CutPrefix(dsn, "postgresql://")
+}
+
+// urlHosts returns the host list of a PostgreSQL URL past its scheme: what follows the userinfo, up to the path or
+// query. The userinfo ends at the last '@' before the first '/', as the driver reads it.
+func urlHosts(rest string) string {
+	authority, _, _ := strings.Cut(rest, "/")
+	if i := strings.LastIndex(authority, "@"); i >= 0 {
+		authority = authority[i+1:]
+	}
+	hosts, _, _ := strings.Cut(authority, "?")
+	return hosts
+}
+
 // inferDriverName tries to infer the driver name from the data source name.
 func inferDriverName(dataSourceName string) (driverName string) {
 	if dataSourceName == "" {
@@ -1136,11 +1164,13 @@ func inferDriverName(dataSourceName string) (driverName string) {
 	if strings.HasPrefix(dataSourceName, cockroachDBScheme) {
 		return "cockroachdb"
 	}
-	// CockroachDB speaks the PostgreSQL protocol and takes postgres:// URLs, so its port is checked first
-	if strings.Contains(dataSourceName, ":26257") {
-		return "cockroachdb"
-	}
-	if strings.HasPrefix(dataSourceName, "postgres://") || strings.HasPrefix(dataSourceName, "postgresql://") {
+	if rest, ok := cutPostgresScheme(dataSourceName); ok {
+		// CockroachDB takes postgres:// URLs too, so its default port tells them apart
+		for host := range strings.SplitSeq(urlHosts(rest), ",") {
+			if strings.HasSuffix(host, ":26257") {
+				return "cockroachdb"
+			}
+		}
 		return "pgx"
 	}
 	if strings.HasPrefix(dataSourceName, "sqlserver://") {
@@ -1163,6 +1193,9 @@ func inferDriverName(dataSourceName string) (driverName string) {
 	}
 	if strings.Contains(dataSourceName, ":5432") {
 		return "pgx"
+	}
+	if strings.Contains(dataSourceName, ":26257") {
+		return "cockroachdb"
 	}
 	if strings.Contains(dataSourceName, ":1433") {
 		return "mssql"
@@ -1243,9 +1276,6 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 	if driverName == "" {
 		driverName = inferDriverName(baseDataSourceName)
 	}
-	// The DSN helpers parse postgres:// URLs only; the testing DSN gets the caller's scheme back, so that it
-	// still names CockroachDB when opened without a driver name
-	cockroachDBURL := strings.HasPrefix(baseDataSourceName, cockroachDBScheme)
 	baseDataSourceName = toPostgresScheme(baseDataSourceName)
 	if driverName == "sqlite" && !strings.Contains(baseDataSourceName, "mode=memory") && !strings.Contains(baseDataSourceName, "cache=shared") {
 		if strings.Contains(baseDataSourceName, "?") {
@@ -1356,8 +1386,10 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 	if err != nil {
 		return "", errors.Trace(err)
 	}
-	if cockroachDBURL {
-		testingDSN = cockroachDBScheme + strings.TrimPrefix(testingDSN, "postgres://")
+	if driverName == "cockroachdb" {
+		if rest, ok := cutPostgresScheme(testingDSN); ok {
+			testingDSN = cockroachDBScheme + rest
+		}
 	}
 
 	// Cache for other openers in the same test
@@ -1542,29 +1574,25 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		case "pgx", "cockroachdb":
 			stmt = `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?) ON CONFLICT DO NOTHING`
 		case "mssql":
-			// HOLDLOCK: without it, concurrent MERGEs can all see no match and all insert
-			stmt = `
-			MERGE sequel_migrations WITH (HOLDLOCK) AS tgt
-			USING (SELECT ? AS seq_name, ? AS seq_num) AS src
-				ON tgt.seq_name = src.seq_name AND tgt.seq_num = src.seq_num
-			WHEN NOT MATCHED BY TARGET THEN
-				INSERT (seq_name, seq_num)
-				VALUES (src.seq_name, src.seq_num);`
+			// A plain INSERT whose duplicate-key error is ignored below. A MERGE WITH (HOLDLOCK) took key-range
+			// locks that deadlocked concurrent first runs, each one found only by the 5s deadlock monitor.
+			stmt = `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
 		case "sqlite":
 			stmt = `INSERT OR IGNORE INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
 		default:
 			return errors.New("unsupported driver name: %s", db.driverName)
 		}
-		_, err = db.Exec(stmt, sequenceName, seqNum)
-		if err != nil {
+		_, err = db.execRetryingContention(stmt, sequenceName, seqNum)
+		if err != nil && !isDuplicateKeyError(db.driverName, err) {
 			return errors.Trace(err)
 		}
 
 		// See if completed by another process
 		stmt = `SELECT completed FROM sequel_migrations WHERE seq_name=? AND seq_num=?`
-		row := db.QueryRow(stmt, sequenceName, seqNum)
 		var completed bool
-		err := row.Scan(&completed)
+		err := retryContention(func() error {
+			return db.QueryRow(stmt, sequenceName, seqNum).Scan(&completed)
+		})
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -1585,7 +1613,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		default:
 			return errors.New("unsupported driver name: %s", db.driverName)
 		}
-		res, err := db.Exec(stmt, sequenceName, seqNum)
+		res, err := db.execRetryingContention(stmt, sequenceName, seqNum)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -1651,7 +1679,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			case <-time.After(5 * time.Second):
 				// Extend the lock while the migration is in progress
 				stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000) WHERE seq_name=? AND seq_num=?`
-				_, err = db.Exec(stmt, sequenceName, seqNum)
+				_, err = db.execRetryingContention(stmt, sequenceName, seqNum)
 				if err != nil {
 					exit = true
 				}
@@ -1663,7 +1691,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		if err != nil {
 			// Release the lock
 			stmt = `UPDATE sequel_migrations SET locked_before=NOW_UTC() WHERE seq_name=? AND seq_num=?`
-			_, _ = db.Exec(stmt, sequenceName, seqNum)
+			_, _ = db.execRetryingContention(stmt, sequenceName, seqNum)
 			return errors.New("error running migration %s", fileNames[seqNum], err)
 		}
 
@@ -1676,13 +1704,46 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		default:
 			return errors.New("unsupported driver name: %s", db.driverName)
 		}
-		_, err = db.Exec(stmt, sequenceName, seqNum)
+		_, err = db.execRetryingContention(stmt, sequenceName, seqNum)
 		if err != nil {
 			return errors.Trace(err)
 		}
 		sequenceNumbersToRun = sequenceNumbersToRun[1:]
 	}
 	return nil
+}
+
+// isDuplicateKeyError reports whether err is SQL Server's duplicate-key error: 2627 for a primary key or unique
+// constraint, 2601 for a unique index. The other drivers ignore duplicates in the statement itself.
+func isDuplicateKeyError(driverName string, err error) bool {
+	var msErr mssql.Error
+	return driverName == "mssql" && errors.As(err, &msErr) && (msErr.Number == 2627 || msErr.Number == 2601)
+}
+
+// retryContention runs fn again, with Transact's jittered backoff, while it fails on lock contention or a
+// deadlock. fn must be safe to repeat.
+func retryContention(fn func() error) (err error) {
+	for attempt := range transactMaxAttempts {
+		if attempt > 0 {
+			transactBackoff(attempt)
+		}
+		err = fn()
+		if err == nil || !IsLockContentionError(err) {
+			return err
+		}
+	}
+	return err
+}
+
+// execRetryingContention executes a statement that is safe to repeat, retrying it on lock contention or a deadlock.
+// Migrate's bookkeeping statements are: concurrent first runs deadlock on SQL Server's key-range locks, and the
+// victim's statement was rolled back.
+func (db *DB) execRetryingContention(query string, args ...any) (res sql.Result, err error) {
+	err = retryContention(func() error {
+		res, err = db.Exec(query, args...)
+		return err
+	})
+	return res, err
 }
 
 // conformPlaceholders replaces the ? arg placeholders in a SQL statement with the ordinals $1, $2 etc. for the
