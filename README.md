@@ -165,10 +165,10 @@ On PostgreSQL and CockroachDB, sequel opens every connection with its session ti
 
 | Driver     | `REGEXP_TEXT_SEARCH(? IN name, email)` expands to             |
 |------------|---------------------------------------------------------------|
-| MySQL      | `CONCAT_WS(' ',name,email) REGEXP ?`                         |
+| MySQL      | `(CONCAT_WS(' ',name,email) REGEXP ?)`                       |
 | PostgreSQL | `REGEXP_LIKE(CONCAT_WS(' ',name,email), ?, 'i')`             |
 | SQL Server | `REGEXP_LIKE(CONCAT_WS(' ',name,email), ?, 'i')`             |
-| SQLite     | `CONCAT_WS(' ',name,email) LIKE '%' \|\| ? \|\| '%'`        |
+| SQLite     | `(CONCAT_WS(' ',name,email) LIKE ('%' \|\| ? \|\| '%'))`    |
 
 Every expansion writes the columns ahead of the search expression, so the columns must not contain a `?`: on the drivers that bind placeholders in the order they appear, the search value would go to the column.
 
@@ -180,7 +180,7 @@ Every expansion writes the columns ahead of the search expression, so the column
 | PostgreSQL | `created_at + MAKE_INTERVAL(secs => (?) / 1000.0)`                              |
 | CockroachDB | `created_at + CAST((?) AS FLOAT8) * INTERVAL '1 millisecond'`                  |
 | SQL Server | `DATEADD(MILLISECOND, CAST($1 AS BIGINT) % 3600000, DATEADD(HOUR, CAST($1 AS BIGINT) / 3600000, created_at))` |
-| SQLite     | `STRFTIME('%Y-%m-%d %H:%M:%f', created_at, '+' \|\| ((?) / 1000.0) \|\| ' seconds')` |
+| SQLite     | `STRFTIME('%Y-%m-%d %H:%M:%f', created_at, ((?) / 1000.0) \|\| ' seconds')` |
 
 On SQL Server, `DATEADD` takes an `int`, so the milliseconds are split into hours plus a remainder to reach
 intervals past ~24.8 days. On CockroachDB, an interval past about ±292 years saturates.
@@ -297,7 +297,7 @@ The ID column must be a plain identifier matching `[A-Za-z_][A-Za-z0-9_]*`. Beca
 
 ### DriverName()
 
-`DriverName()` returns the active driver name (`"mysql"`, `"pgx"`, `"mssql"`, or `"sqlite"`) for cases where you need driver-specific logic in Go code.
+`DriverName()` returns the active driver name (`"mysql"`, `"mariadb"`, `"pgx"`, `"cockroachdb"`, `"mssql"`, or `"sqlite"`) for cases where you need driver-specific logic in Go code.
 
 ## Transactions
 
