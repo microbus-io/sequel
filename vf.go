@@ -102,8 +102,9 @@ func unregisterVirtualFunc(name string) {
 
 // expandVirtualFuncs replaces virtual function calls in the query with driver-specific expressions.
 // Parentheses in arguments are balanced so that nested function calls (e.g. DATE_ADD_MILLIS(NOW_UTC(), ?)) work.
-// Multiple passes are performed until no more expansions occur, allowing inner virtual functions
-// to be expanded before outer ones that depend on them.
+// The outer function expands first: its handler receives its arguments as written, inner virtual functions
+// unexpanded, and may recognize one (mssqlDateAddMillis does). The inner functions in its result expand on the next
+// pass, and passes repeat until no more expansions occur.
 //
 // It does not cache; statements are cached unpacked, by [lookupQuery].
 func expandVirtualFuncs(driverName string, query string) (string, error) {
@@ -198,17 +199,26 @@ func findBalancedClose(s string, start int) int {
 	return -1
 }
 
+// nowUTCPrecision parses the argument of NOW_UTC: empty for the default 3, or a literal from 0 to 6.
+func nowUTCPrecision(args string) (int, error) {
+	a := strings.TrimSpace(args)
+	if a == "" {
+		return 3, nil
+	}
+	p, err := strconv.Atoi(a)
+	if err != nil || p < 0 || p > 6 {
+		return 0, errors.New("NOW_UTC requires syntax: NOW_UTC() or NOW_UTC(p), p a literal from 0 to 6")
+	}
+	return p, nil
+}
+
 // vfNowUTC is the handler for the NOW_UTC() virtual function. The syntax is NOW_UTC() or NOW_UTC(p), the
 // current UTC timestamp at p fractional digits of a second, 0 to 6; NOW_UTC() is NOW_UTC(3). SQLite's clock is
 // milliseconds, so p above 3 yields 3 there.
 func vfNowUTC(driverName string, args string) (string, error) {
-	p := 3
-	if a := strings.TrimSpace(args); a != "" {
-		n, err := strconv.Atoi(a)
-		if err != nil || n < 0 || n > 6 {
-			return "", errors.New("NOW_UTC requires syntax: NOW_UTC() or NOW_UTC(p), p a literal from 0 to 6")
-		}
-		p = n
+	p, err := nowUTCPrecision(args)
+	if err != nil {
+		return "", errors.Trace(err)
 	}
 	ps := strconv.Itoa(p)
 	switch driverName {
@@ -326,9 +336,9 @@ func vfDateAddMillis(driverName string, args string) (string, error) {
 	case "pgx":
 		return "(" + baseExpr + " + MAKE_INTERVAL(secs => (" + millis + ") / 1000.0))", nil
 	case "cockroachdb":
-		// CockroachDB has no MAKE_INTERVAL. Scaled from days, not milliseconds: a millisecond interval is held in
-		// nanoseconds and saturates past ~292 years, and a DECIMAL keeps the fraction exact.
-		return "(" + baseExpr + " + INTERVAL '1 day' * (CAST((" + millis + ") AS DECIMAL) / 86400000))", nil
+		// CockroachDB has no MAKE_INTERVAL. Milliseconds, not days: an interval's days follow daylight saving time
+		// on a TIMESTAMPTZ in a session that is not in UTC
+		return "(" + baseExpr + " + CAST((" + millis + ") AS FLOAT8) * INTERVAL '1 millisecond')", nil
 	case "mssql":
 		return mssqlDateAddMillis(baseExpr, millis), nil
 	case "sqlite":
@@ -338,8 +348,17 @@ func vfDateAddMillis(driverName string, args string) (string, error) {
 	}
 }
 
-// coarseNowUTCPattern matches a NOW_UTC call with fewer than three fractional digits.
-var coarseNowUTCPattern = regexp.MustCompile(`(?i)^NOW_UTC\(\s*[0-2]\s*\)$`)
+// isCoarseNowUTC reports whether expr is exactly one NOW_UTC call with fewer than three fractional digits. It parses
+// the argument as NOW_UTC itself does, so every spelling of a precision is recognized.
+func isCoarseNowUTC(expr string) bool {
+	const name = "NOW_UTC("
+	expr = strings.TrimSpace(expr)
+	if len(expr) < len(name) || !strings.EqualFold(expr[:len(name)], name) || findBalancedClose(expr, len(name)) != len(expr)-1 {
+		return false
+	}
+	p, err := nowUTCPrecision(expr[len(name) : len(expr)-1])
+	return err == nil && p < 3
+}
 
 // mssqlDateAddMillis expands DATE_ADD_MILLIS for SQL Server. DATEADD takes an int, so the milliseconds are
 // split into whole hours plus a remainder under an hour, each of which fits. Placeholders arrive numbered
@@ -347,7 +366,7 @@ var coarseNowUTCPattern = regexp.MustCompile(`(?i)^NOW_UTC\(\s*[0-2]\s*\)$`)
 func mssqlDateAddMillis(baseExpr, millis string) string {
 	// DATEADD returns its base's type and rounds the interval to it, so a NOW_UTC coarser than milliseconds is
 	// widened first, or DATE_ADD_MILLIS(NOW_UTC(0), 400) would add nothing
-	if coarseNowUTCPattern.MatchString(baseExpr) {
+	if isCoarseNowUTC(baseExpr) {
 		baseExpr = "CAST(" + baseExpr + " AS DATETIME2(7))"
 	}
 	if n, err := strconv.ParseInt(millis, 10, 64); err == nil {

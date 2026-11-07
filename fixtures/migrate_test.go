@@ -19,10 +19,14 @@ package fixtures
 import (
 	"sync"
 	"testing"
+	"testing/fstest"
 
 	"github.com/microbus-io/sequel"
 	"github.com/microbus-io/sequel/testdata"
 	"github.com/microbus-io/testarossa"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 )
 
 // TestMigrate_AutoCreate runs the full migration set against the configured provider and verifies the
@@ -114,4 +118,33 @@ func TestMigrate_ConcurrentFirstRun(t *testing.T) {
 	var count int
 	assert.NoError(dbs[0].QueryRow("SELECT COUNT(id) FROM foo").Scan(&count))
 	assert.Equal(4, count)
+}
+
+// TestMigrate_ExistingRowIsNotAnError runs a migration whose row is already registered, as every replica but the first
+// finds it on a rolling deploy, and checks that no statement reports an error. SQL Server once registered rows with a
+// plain INSERT and ignored the duplicate-key error, which put an error span on every such run.
+func TestMigrate_ExistingRowIsNotAnError(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB(t)
+	// Makes the migrations table
+	if !assert.NoError(db.Migrate(t.Name(), fstest.MapFS{})) {
+		return
+	}
+	_, err := db.Exec("INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)", t.Name(), 1)
+	if !assert.NoError(err) {
+		return
+	}
+	recorder := tracetest.NewSpanRecorder()
+	db.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(recorder)))
+	defer db.SetTracerProvider(nil)
+
+	fs := fstest.MapFS{"1.create.sql": {Data: []byte("CREATE TABLE registered (id INT)")}}
+	if !assert.NoError(db.Migrate(t.Name(), fs)) {
+		return
+	}
+	for _, span := range recorder.Ended() {
+		assert.NotEqual(codes.Error, span.Status().Code, "%s reported an error: %s", span.Name(), span.Status().Description)
+	}
 }

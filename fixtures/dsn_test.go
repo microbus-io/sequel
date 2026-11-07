@@ -25,78 +25,75 @@ import (
 	"github.com/microbus-io/testarossa"
 )
 
+// sharesTestingDatabase checks that every call returns a testing DSN that opens as the driver it names, all of them on
+// one database: a table the first creates must survive the calls after it, which would otherwise drop and recreate
+// the database under its open handle.
+func sharesTestingDatabase(t *testing.T, id string, calls []testingDSNCall) {
+	assert := testarossa.For(t)
+	var first *sequel.DB
+	for i, c := range calls {
+		dsn, err := sequel.CreateTestingDatabase(c.driver, c.base, id)
+		if !assert.NoError(err) {
+			return
+		}
+		assert.True(strings.HasPrefix(dsn, c.prefix), "%s %q gave %q", c.driver, c.base, dsn)
+		db, err := sequel.Open("", dsn)
+		if !assert.NoError(err) {
+			return
+		}
+		defer db.Close()
+		assert.Equal(c.opensAs, db.DriverName(), "%s %q gave %q", c.driver, c.base, dsn)
+		if i == 0 {
+			first = db
+			_, err = db.Exec("CREATE TABLE kept (id INT)")
+			assert.NoError(err)
+			continue
+		}
+		_, err = first.Exec("INSERT INTO kept (id) VALUES (?)", i)
+		assert.NoError(err, "%s %q dropped the database", c.driver, c.base)
+	}
+}
+
+type testingDSNCall struct {
+	driver, base    string
+	prefix, opensAs string
+}
+
 // TestDSN_CockroachDBTestingDSNNamesItsDriver checks that a CockroachDB testing DSN says it is CockroachDB, so that
-// opening it without a driver name does not take it for PostgreSQL off the default port. It asks for the same
-// testing database with a postgres:// base and an explicit driver, then with a cockroachdb:// base, which share a
-// cached DSN.
+// opening it without a driver name does not take it for PostgreSQL. A base spelled either way, asked for as
+// CockroachDB or as PostgreSQL, reaches one testing database.
 func TestDSN_CockroachDBTestingDSNNamesItsDriver(t *testing.T) {
 	t.Parallel()
-	assert := testarossa.For(t)
 
 	base := os.Getenv("SEQUEL_TESTING_DSN")
 	rest, ok := strings.CutPrefix(base, "cockroachdb://")
 	if !ok {
 		t.Skip("needs SEQUEL_TESTING_DSN in cockroachdb:// form")
 	}
-	for _, c := range []struct{ driver, base string }{
-		{"cockroachdb", "postgres://" + rest},
-		{"", "cockroachdb://" + rest},
-	} {
-		dsn, err := sequel.CreateTestingDatabase(c.driver, c.base, t.Name())
-		if !assert.NoError(err) {
-			return
-		}
-		assert.True(strings.HasPrefix(dsn, "cockroachdb://"), "%q gave %q", c.base, dsn)
-		db, err := sequel.Open("", dsn)
-		if assert.NoError(err) {
-			assert.Equal("cockroachdb", db.DriverName())
-			db.Close()
-		}
-	}
+	sharesTestingDatabase(t, t.Name(), []testingDSNCall{
+		{"cockroachdb", "postgres://" + rest, "cockroachdb://", "cockroachdb"},
+		{"", "cockroachdb://" + rest, "cockroachdb://", "cockroachdb"},
+		{"pgx", "postgres://" + rest, "postgres://", "pgx"},
+	})
 }
 
 // TestDSN_MariaDBTestingDSNNamesItsDriver checks that a MariaDB testing DSN says it is MariaDB: the driver's own DSN
-// format names no engine, and would be taken for MySQL when opened without a driver name. It asks for one testing
-// database with a driver-format base and an explicit driver, then with a mariadb:// base, which must share it rather
-// than drop and recreate it under the first one's open handle. A named driver wins over the base's scheme.
+// format names no engine, and would be taken for MySQL when opened without a driver name. A named driver wins over the
+// base's pseudo-scheme, a mysql:// base keeps its prefix, and every spelling of one base, asked for as MariaDB or as
+// MySQL, reaches one testing database.
 func TestDSN_MariaDBTestingDSNNamesItsDriver(t *testing.T) {
 	t.Parallel()
-	assert := testarossa.For(t)
 
 	base := os.Getenv("SEQUEL_TESTING_DSN")
-	if !strings.HasPrefix(base, "mariadb://") {
+	native, ok := strings.CutPrefix(base, "mariadb://")
+	if !ok {
 		t.Skip("needs SEQUEL_TESTING_DSN in mariadb:// form")
 	}
-	driverFormat := strings.TrimPrefix(base, "mariadb://")
-
-	first, err := sequel.CreateTestingDatabase("mariadb", driverFormat, t.Name())
-	if !assert.NoError(err) {
-		return
-	}
-	assert.True(strings.HasPrefix(first, "mariadb://"), "%q gave %q", driverFormat, first)
-	db, err := sequel.Open("", first)
-	if !assert.NoError(err) {
-		return
-	}
-	defer db.Close()
-	assert.Equal("mariadb", db.DriverName())
-	_, err = db.Exec("CREATE TABLE kept (id INT)")
-	assert.NoError(err)
-
-	second, err := sequel.CreateTestingDatabase("", base, t.Name())
-	if assert.NoError(err) {
-		assert.Equal(first, second)
-	}
-	_, err = db.Exec("INSERT INTO kept (id) VALUES (1)")
-	assert.NoError(err, "the second spelling dropped the database")
-
-	asMySQL, err := sequel.CreateTestingDatabase("mysql", base, t.Name()+"_mysql")
-	if assert.NoError(err) {
-		assert.False(strings.HasPrefix(asMySQL, "mariadb://"), "%q gave %q", base, asMySQL)
-		db, err := sequel.Open("", asMySQL)
-		if assert.NoError(err) {
-			assert.Equal("mysql", db.DriverName())
-			db.Close()
-		}
-	}
+	sharesTestingDatabase(t, t.Name(), []testingDSNCall{
+		{"mariadb", native, "mariadb://", "mariadb"},
+		{"", base, "mariadb://", "mariadb"},
+		{"mysql", native, native[:4], "mysql"},
+		{"mysql", base, "mysql://", "mysql"},
+		{"", "mysql://" + native, "mysql://", "mysql"},
+	})
 }

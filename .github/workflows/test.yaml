@@ -34,8 +34,16 @@ jobs:
         run: go test -race ./... -count=1 -timeout 20m
 
   mysql:
-    name: MySQL
+    name: MySQL (${{ matrix.dsn-form }})
     runs-on: ubuntu-latest
+    # Both spellings: the driver's own format, which every MySQL user has, and the mysql:// pseudo-scheme
+    strategy:
+      matrix:
+        include:
+          - dsn-form: driver format
+            dsn: root:root@tcp(127.0.0.1:3306)/
+          - dsn-form: mysql://
+            dsn: mysql://root:root@tcp(127.0.0.1:3306)/
     services:
       mysql:
         image: mysql:9.6
@@ -49,7 +57,7 @@ jobs:
           --health-timeout=5s
           --health-retries=10
     env:
-      SEQUEL_TESTING_DSN: mysql://root:root@tcp(127.0.0.1:3306)/
+      SEQUEL_TESTING_DSN: ${{ matrix.dsn }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

@@ -160,6 +160,15 @@ func TestDB_MySQLSchemes(t *testing.T) {
 	}
 	driver, _, err = normalizeDriverAndDSN("", "MySQL://root@unix(/tmp/mysql.sock)/app")
 	assert.Expect(driver, "mysql", err, nil)
+
+	// Only a known scheme is folded: this is user Admin with a password that starts with "//"
+	_, dsn, err = normalizeDriverAndDSN("mysql", "Admin://secret@tcp(127.0.0.1:3306)/app")
+	assert.NoError(err)
+	cfg, err = mysql.ParseDSN(dsn)
+	if assert.NoError(err) {
+		assert.Equal("Admin", cfg.User)
+		assert.Equal("//secret", cfg.Passwd)
+	}
 	assert.Equal("mysql", physicalDriverName("mariadb"))
 }
 
@@ -479,7 +488,7 @@ func TestDB_UnpackQuery_DateAddMillis(t *testing.T) {
 	db = newTestDB("cockroachdb")
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, ?)")
 	assert.NoError(err)
-	assert.Equal("SELECT (created_at + INTERVAL '1 day' * (CAST(($1) AS DECIMAL) / 86400000))", q)
+	assert.Equal("SELECT (created_at + CAST(($1) AS FLOAT8) * INTERVAL '1 millisecond')", q)
 
 	db = newTestDB("mssql")
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(created_at, 5000)")
@@ -507,9 +516,14 @@ func TestDB_UnpackQuery_DateAddMillis(t *testing.T) {
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(NOW_UTC(0), 400)")
 	assert.NoError(err)
 	assert.Equal("SELECT DATEADD(MILLISECOND, 400, CAST((CONVERT(DATETIME2(0), DATEADD(NANOSECOND, -500000000, SYSUTCDATETIME()))) AS DATETIME2(7)))", q)
-	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(now_utc( 2 ), 400)")
-	assert.NoError(err)
-	assert.Contains(q, "AS DATETIME2(7))")
+	for _, coarse := range []string{"now_utc( 2 )", "NOW_UTC(00)", "NOW_UTC(+1)"} {
+		q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(" + coarse + ", 400)")
+		assert.NoError(err)
+		assert.Contains(q, "AS DATETIME2(7))", "for %s", coarse)
+	}
+	assert.False(isCoarseNowUTC("NOW_UTC(3)"))
+	assert.False(isCoarseNowUTC("NOW_UTC(0) + 1"))
+	assert.False(isCoarseNowUTC("NOW_UTC(0)) - (NOW_UTC(1)"))
 	q, err = db.UnpackQuery("SELECT DATE_ADD_MILLIS(NOW_UTC(), 400)")
 	assert.NoError(err)
 	assert.Equal("SELECT DATEADD(MILLISECOND, 400, (CONVERT(DATETIME2(3), DATEADD(NANOSECOND, -500000, SYSUTCDATETIME()))))", q)

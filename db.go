@@ -989,7 +989,6 @@ var leftoverTestingDatabasePattern = regexp.MustCompile(`^testing_[0-2][0-9]_[a-
 // dsnURLCredentialsPattern matches the userinfo of a URL-form DSN (postgres://user:pass@host). The password match is
 // greedy to the last '@', so a raw '@' or '/' in a password is fully redacted rather than partially leaked, at the
 // cost of masking more than the password when the query holds an '@'. The user name may be empty.
-// The password segment is [^@]* because a literal '@' must be percent-encoded in a valid URL.
 var dsnURLCredentialsPattern = regexp.MustCompile(`://([^:/@?]*):(.*)@`)
 
 // dsnMySQLCredentialsPattern matches the credentials of a mysql-form DSN (user:pass@tcp(host)/db).
@@ -1172,14 +1171,17 @@ func cutPostgresScheme(dsn string) (rest string, ok bool) {
 // user:password@tcp(.
 var mySQLNetworkPattern = regexp.MustCompile(`^[^/]*@(tcp[46]?|unix)\(`)
 
-// schemePattern matches a URL scheme.
-var schemePattern = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9+.-]*://`)
+// knownSchemes are the URL schemes sequel recognizes, in lower case.
+var knownSchemes = []string{cockroachDBScheme, mariaDBScheme, mySQLScheme, "postgres://", "postgresql://", "sqlserver://"}
 
-// lowerScheme lower-cases a URL scheme, which is case-insensitive, so that the scheme checks and rewrites see one
-// spelling.
+// lowerScheme lower-cases a known URL scheme, which is case-insensitive, so that the scheme checks and rewrites see
+// one spelling.
 func lowerScheme(dsn string) string {
-	if loc := schemePattern.FindStringIndex(dsn); loc != nil {
-		return strings.ToLower(dsn[:loc[1]]) + dsn[loc[1]:]
+	for _, scheme := range knownSchemes {
+		// Only a known scheme: a MySQL user named Admin with a password starting with "//" is not a scheme
+		if len(dsn) >= len(scheme) && strings.EqualFold(dsn[:len(scheme)], scheme) {
+			return scheme + dsn[len(scheme):]
+		}
 	}
 	return dsn
 }
@@ -1311,7 +1313,27 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 	if driverName == "" {
 		driverName = inferDriverName(baseDataSourceName)
 	}
+	// Parsed without its pseudo-scheme; the testing DSN gets one back below
+	pseudoScheme := strings.HasPrefix(baseDataSourceName, mySQLScheme) || strings.HasPrefix(baseDataSourceName, mariaDBScheme) ||
+		strings.HasPrefix(baseDataSourceName, cockroachDBScheme)
 	baseDataSourceName = trimMySQLScheme(toPostgresScheme(baseDataSourceName))
+	// A testing DSN is opened without a driver name, so it must name its driver: by the pseudo-scheme of the driver
+	// asked for, where the driver's own format cannot, or where the base had one
+	named := func(native string) string {
+		switch driverName {
+		case "cockroachdb":
+			if rest, ok := cutPostgresScheme(native); ok {
+				return cockroachDBScheme + rest
+			}
+		case "mariadb":
+			return mariaDBScheme + native
+		case "mysql":
+			if pseudoScheme {
+				return mySQLScheme + native
+			}
+		}
+		return native
+	}
 	if driverName == "sqlite" && !strings.Contains(baseDataSourceName, "mode=memory") && !strings.Contains(baseDataSourceName, "cache=shared") {
 		if strings.Contains(baseDataSourceName, "?") {
 			baseDataSourceName += "&mode=memory&cache=shared"
@@ -1320,7 +1342,9 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 		}
 	}
 
-	cacheKey := hashStr(driverName + "|" + baseDataSourceName + "|" + uniqueTestID)
+	// Keyed on the physical target, not the driver name: MySQL and MariaDB, or PostgreSQL and CockroachDB, asked for
+	// the same server and test share one database rather than drop each other's
+	cacheKey := hashStr(physicalDriverName(driverName) + "|" + baseDataSourceName + "|" + uniqueTestID)
 
 	testingGlobalMutex.Lock()
 	testingMux, ok := testingMutexes[cacheKey]
@@ -1331,7 +1355,7 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 	cachedDSN, hasCached := testingDSNs[cacheKey]
 	testingGlobalMutex.Unlock()
 	if hasCached {
-		return cachedDSN, nil
+		return named(cachedDSN), nil
 	}
 
 	testingMux.Lock()
@@ -1342,7 +1366,7 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 	cachedDSN, hasCached = testingDSNs[cacheKey]
 	testingGlobalMutex.Unlock()
 	if hasCached {
-		return cachedDSN, nil
+		return named(cachedDSN), nil
 	}
 
 	// Generate a database name. The testing_NN_ prefix is the contract that
@@ -1421,15 +1445,6 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 	if err != nil {
 		return "", errors.Trace(err)
 	}
-	// A testing DSN is opened without a driver name, so it must name its driver by its scheme
-	switch driverName {
-	case "cockroachdb":
-		if rest, ok := cutPostgresScheme(testingDSN); ok {
-			testingDSN = cockroachDBScheme + rest
-		}
-	case "mariadb":
-		testingDSN = mariaDBScheme + testingDSN
-	}
 
 	// Cache for other openers in the same test
 	testingGlobalMutex.Lock()
@@ -1437,7 +1452,7 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 	testingDBKeys[testingDatabaseName] = cacheKey
 	testingGlobalMutex.Unlock()
 
-	return testingDSN, nil
+	return named(testingDSN), nil
 }
 
 // adjustConnectionLimits adjusts the size of the connection pool based on the ref count.
@@ -1613,15 +1628,22 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		case "pgx", "cockroachdb":
 			stmt = `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?) ON CONFLICT DO NOTHING`
 		case "mssql":
-			// A plain INSERT whose duplicate-key error is ignored below. A MERGE WITH (HOLDLOCK) took key-range
-			// locks that deadlocked concurrent first runs, each one found only by the 5s deadlock monitor.
-			stmt = `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
+			// The existence check spares the duplicate-key error, and its error span, in the common case of a row
+			// already there; two runners that both pass it race to the INSERT, and the loser's duplicate is ignored
+			// below. A MERGE WITH (HOLDLOCK) took key-range locks that deadlocked concurrent first runs, each one
+			// found only by the 5s deadlock monitor.
+			stmt = `IF NOT EXISTS (SELECT 1 FROM sequel_migrations WHERE seq_name=? AND seq_num=?)
+				INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
 		case "sqlite":
 			stmt = `INSERT OR IGNORE INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
 		default:
 			return errors.New("unsupported driver name: %s", db.driverName)
 		}
-		_, err = db.execRetryingContention(stmt, sequenceName, seqNum)
+		args := []any{sequenceName, seqNum}
+		if db.driverName == "mssql" {
+			args = append(args, sequenceName, seqNum)
+		}
+		_, err = db.execRetryingContention(stmt, args...)
 		if err != nil && !isDuplicateKeyError(db.driverName, err) {
 			return errors.Trace(err)
 		}

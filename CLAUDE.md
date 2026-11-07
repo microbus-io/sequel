@@ -190,6 +190,16 @@ An integer literal is split in Go, and is left as a single `DATEADD` only under 
 range, because SQL Server's `DATEADD(MILLISECOND, -2147483648, ...)` overflows `DATETIME2` although its argument fits
 in an `int` - found by `TestVF_DateMillisExact`, which checks exact results at both `int` limits.
 
+## CockroachDB adds milliseconds, not days (`DATE_ADD_MILLIS()`)
+
+CockroachDB has no `MAKE_INTERVAL`, so its `DATE_ADD_MILLIS` multiplies `INTERVAL '1 millisecond'`. That interval is
+held in nanoseconds and **saturates silently past about ±292 years**. Scaling a `DECIMAL` number of days instead was
+tried and is exact at any range, but an interval's days are calendar days: added to a `TIMESTAMPTZ` in a session whose
+time zone the caller chose (sequel keeps it, see the UTC pin), they follow daylight saving time, so 24 hours across the
+change landed an hour off. A sentinel centuries away is rarer than a lease across a daylight-saving change, so
+milliseconds won. `TestVF_DateAddMillisIgnoresDaylightSaving` and `TestVF_DateAddMillisCenturies` (250 years) pin
+both sides. SQL Server splits into hours, not days, for the same reason.
+
 ## Virtual functions are tested for accuracy, with binds
 
 Every virtual function has a fixture that checks *results*, not just that the expansion runs, and passes its
@@ -1031,13 +1041,18 @@ could not express a `:` in a user name or a network other than `tcp`, and keyed 
 spellings of one base. A prefix has none of that: it names the driver and carries nothing else. `cockroachdb://` is
 the same idea in a URL format, swapped for `postgres://` (`toPostgresScheme`).
 
-**A testing DSN must name its own driver.** It is opened without a driver name, so `CreateTestingDatabase` hands back
-a CockroachDB testing DSN as `cockroachdb://` and puts the `mariadb://` prefix on a MariaDB one, whatever the base's
-spelling; a MySQL one needs no prefix, and a named driver wins over the base's scheme. The base is stripped of its
-scheme before anything else, so both spellings of one base share one cache entry and one testing database. Keyed on
-the raw text, the second spelling once missed the cache and dropped and recreated the database under the first one's
-open handle. CI runs CockroachDB on port 26300 and MariaDB through `mariadb://`, so only the schemes can identify them
-there.
+**A testing DSN must name its own driver.** It is opened without a driver name. `CreateTestingDatabase` parses a copy
+of the base stripped of its pseudo-scheme, and hands the testing DSN back named for the driver asked for: a CockroachDB
+one as `cockroachdb://` and a MariaDB one with the `mariadb://` prefix, whatever the base's spelling, since their
+native formats cannot name them; a MySQL one with `mysql://` if the base had a pseudo-scheme, and in the driver's own
+format otherwise. A named driver wins over the base's pseudo-scheme.
+
+**The testing-database cache is keyed on the physical target**: the Go driver (`physicalDriverName`), the base stripped
+of its pseudo-scheme, and the test ID. The database name carries neither the driver nor the spelling, so MySQL and
+MariaDB, or PostgreSQL and CockroachDB, asked for on one server under one test ID are one database. Keyed on the
+driver name or the raw text, the second caller missed the cache and dropped and recreated that database under the
+first one's open handles. The cache holds the native testing DSN and each caller gets it named for its own driver. CI
+runs CockroachDB on port 26300 and MariaDB through `mariadb://`, so only the schemes can identify them there.
 
 ## `CreateTestingDatabase` and the `SEQUEL_TESTING_DSN` fallback
 

@@ -131,15 +131,16 @@ func TestVF_DateAddAndDiffMillis(t *testing.T) {
 	assert.True(math.Abs(diff-(-5000)) < 1000, "expected ~-5000ms, got %v ms", diff)
 }
 
-// TestVF_DateAddMillisCenturies adds and subtracts 500 years and a few milliseconds, bound, and checks the exact
-// result. CockroachDB holds a millisecond interval in nanoseconds, which saturates past ~292 years.
+// TestVF_DateAddMillisCenturies adds and subtracts 250 years and a few milliseconds, bound, and checks the exact
+// result. That is near CockroachDB's limit: it holds a millisecond interval in nanoseconds, which saturates past ~292
+// years.
 func TestVF_DateAddMillisCenturies(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)
 
 	db := newTestDB(t)
 	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	const days = 500 * 365
+	const days = 250 * 365
 	for _, sign := range []int64{1, -1} {
 		ms := sign * (days*86_400_000 + 123)
 		want := base.AddDate(0, 0, int(sign)*days).Add(time.Duration(sign*123) * time.Millisecond)
@@ -148,6 +149,38 @@ func TestVF_DateAddMillisCenturies(t *testing.T) {
 		if assert.NoError(err, "%d ms", ms) {
 			assert.Equal(1, match, "%s plus %d ms is not %s", base, ms, want)
 		}
+	}
+}
+
+// TestVF_DateAddMillisIgnoresDaylightSaving adds 24 hours, as milliseconds, to a TIMESTAMPTZ across a daylight-saving
+// change, in a session whose time zone the caller chose. The result must be 24 elapsed hours later; an interval held as
+// a day lands an hour off. Only PostgreSQL and CockroachDB have a session time zone that moves a TIMESTAMPTZ.
+func TestVF_DateAddMillisIgnoresDaylightSaving(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB(t)
+	if db.DriverName() != "pgx" && db.DriverName() != "cockroachdb" {
+		t.Skip("no session time zone")
+	}
+	dsn, err := sequel.CreateTestingDatabase("", "", t.Name())
+	if !assert.NoError(err) {
+		return
+	}
+	sep := "?"
+	if strings.Contains(dsn, "?") {
+		sep = "&"
+	}
+	local, err := sequel.Open("", dsn+sep+"timezone=America/Los_Angeles")
+	if !assert.NoError(err) {
+		return
+	}
+	defer local.Close()
+	var exact int
+	err = local.QueryRow("SELECT CASE WHEN DATE_ADD_MILLIS(CAST('2026-03-07 12:00:00-08' AS TIMESTAMPTZ), ?) = "+
+		"CAST('2026-03-08 20:00:00+00' AS TIMESTAMPTZ) THEN 1 ELSE 0 END", 86_400_000).Scan(&exact)
+	if assert.NoError(err) {
+		assert.Equal(1, exact, "24 hours across the change to daylight saving time are not 24 elapsed hours")
 	}
 }
 

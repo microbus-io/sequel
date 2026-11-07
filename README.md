@@ -176,12 +176,12 @@ On PostgreSQL and CockroachDB, sequel opens every connection with its session ti
 |------------|-----------------------------------------------------------------------------------|
 | MySQL      | `DATE_ADD(created_at, INTERVAL (?) * 1000 MICROSECOND)`                          |
 | PostgreSQL | `created_at + MAKE_INTERVAL(secs => (?) / 1000.0)`                              |
-| CockroachDB | `created_at + INTERVAL '1 day' * (CAST((?) AS DECIMAL) / 86400000)`            |
+| CockroachDB | `created_at + CAST((?) AS FLOAT8) * INTERVAL '1 millisecond'`                  |
 | SQL Server | `DATEADD(MILLISECOND, CAST($1 AS BIGINT) % 3600000, DATEADD(HOUR, CAST($1 AS BIGINT) / 3600000, created_at))` |
 | SQLite     | `STRFTIME('%Y-%m-%d %H:%M:%f', created_at, '+' \|\| ((?) / 1000.0) \|\| ' seconds')` |
 
 On SQL Server, `DATEADD` takes an `int`, so the milliseconds are split into hours plus a remainder to reach
-intervals past ~24.8 days.
+intervals past ~24.8 days. On CockroachDB, an interval past about ±292 years saturates.
 
 The milliseconds are added exactly to a `NOW_UTC(p)` of any precision: `DATE_ADD_MILLIS(NOW_UTC(0), 400)` is 400 ms
 past a whole second on every driver. With whole milliseconds, a result built on `NOW_UTC()` or a coarser one fits a
@@ -238,12 +238,12 @@ The path must be a **literal**, not a `?` placeholder - PostgreSQL needs it as a
 
 #### Nesting
 
-Virtual functions can be nested. Inner functions are expanded first across multiple passes:
+Virtual functions can be nested. The outer function expands first and receives the inner one as written; the inner one expands on the next pass:
 
 ```go
 db.Exec("UPDATE t SET expires_at = DATE_ADD_MILLIS(NOW_UTC(), ?) WHERE id = ?", ttlMs, id)
-// MySQL:      UPDATE t SET expires_at = DATE_ADD(UTC_TIMESTAMP(3), INTERVAL (?) * 1000 MICROSECOND) WHERE id = ?
-// PostgreSQL: UPDATE t SET expires_at = (NOW() AT TIME ZONE 'UTC') + MAKE_INTERVAL(secs => ($1) / 1000.0) WHERE id = $2
+// MySQL:      UPDATE t SET expires_at = DATE_ADD((UTC_TIMESTAMP(3)), INTERVAL (?) * 1000 MICROSECOND) WHERE id = ?
+// PostgreSQL: UPDATE t SET expires_at = ((CAST((NOW() AT TIME ZONE 'UTC') - INTERVAL '500 microseconds' AS TIMESTAMP(3))) + MAKE_INTERVAL(secs => ($1) / 1000.0)) WHERE id = $2
 ```
 
 #### Custom Virtual Functions
@@ -253,7 +253,7 @@ Register your own virtual functions with `RegisterVirtualFunc`:
 ```go
 sequel.RegisterVirtualFunc("BOOL", func(driverName string, args string) (string, error) {
     switch driverName {
-    case "mysql", "pgx", "sqlite":
+    case "mysql", "mariadb", "pgx", "cockroachdb", "sqlite":
         return args, nil
     case "mssql":
         // SQL Server uses BIT, not BOOL
