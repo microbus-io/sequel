@@ -34,16 +34,10 @@ jobs:
         run: go test -race ./... -count=1 -timeout 20m
 
   mysql:
-    name: MySQL (${{ matrix.dsn-form }})
+    name: MySQL
     runs-on: ubuntu-latest
-    # Both spellings: the driver's own format, which every MySQL user has, and the mysql:// pseudo-scheme
-    strategy:
-      matrix:
-        include:
-          - dsn-form: driver format
-            dsn: root:root@tcp(127.0.0.1:3306)/
-          - dsn-form: mysql://
-            dsn: mysql://root:root@tcp(127.0.0.1:3306)/
+    # The driver's own DSN format, which every MySQL user has. The mysql:// prefix only adds a strip before the same
+    # path, which the unit tests and the MariaDB job's mariadb:// run cover.
     services:
       mysql:
         image: mysql:9.6
@@ -57,7 +51,7 @@ jobs:
           --health-timeout=5s
           --health-retries=10
     env:
-      SEQUEL_TESTING_DSN: ${{ matrix.dsn }}
+      SEQUEL_TESTING_DSN: root:root@tcp(127.0.0.1:3306)/
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
