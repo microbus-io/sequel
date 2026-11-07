@@ -936,17 +936,17 @@ func TestDB_CreateTestingDatabase_DistinctPools(t *testing.T) {
 	assert.Equal(7, x)
 }
 
-// testingRefsOf reads the live-handle count sequel keeps for a testing database.
+// testingRefsOf reads the live-handle count sequel keeps for a SQLite testing database.
 func testingRefsOf(databaseName string) int {
 	testingGlobalMutex.Lock()
 	defer testingGlobalMutex.Unlock()
-	return testingDBRefs[databaseName]
+	return testingDBRefs[testingDatabaseKey("sqlite", "", databaseName)]
 }
 
 func testingDSNIsCached(databaseName string) bool {
 	testingGlobalMutex.Lock()
 	defer testingGlobalMutex.Unlock()
-	cacheKey, ok := testingDBKeys[databaseName]
+	cacheKey, ok := testingDBKeys[testingDatabaseKey("sqlite", "", databaseName)]
 	if !ok {
 		return false
 	}
@@ -1457,4 +1457,43 @@ func TestMigrate_StripsCommentsOutsideQuotes(t *testing.T) {
 	assert.Equal("SELECT 'a--b', \"c--d\" \nFROM t", stripLineComments("SELECT 'a--b', \"c--d\" -- trailing\nFROM t"))
 	assert.Equal("SELECT 'it''s--fine' ", stripLineComments("SELECT 'it''s--fine' -- note"))
 	assert.Equal("\nSELECT 1", stripLineComments("-- DRIVER: sqlite\nSELECT 1"))
+}
+
+// A testing database name carries this process's token, so that two test processes never mint the same one; and only
+// a name CreateTestingDatabase could have minted counts as a testing database, which Close drops.
+func TestDB_TestingDatabaseNames(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	name, ok := testingDatabaseNameOf("sqlite", dsn)
+	assert.True(ok)
+	assert.Contains(name, "_"+testingProcessToken+"_")
+	assert.Len(testingProcessToken, 6)
+
+	long, err := CreateTestingDatabase("sqlite", "", strings.Repeat("LongTestName/", 10))
+	assert.NoError(err)
+	longName, ok := testingDatabaseNameOf("sqlite", long)
+	assert.True(ok)
+	assert.Len(longName, maxTestingDatabaseName)
+
+	_, ok = testingDatabaseNameOf("mysql", "root@tcp(127.0.0.1:3306)/testing_14_Upper")
+	assert.False(ok, "a name with an upper-case letter was taken for a testing database")
+	_, ok = testingDatabaseNameOf("mysql", "root@tcp(127.0.0.1:3306)/testing_14_x-y")
+	assert.False(ok)
+	_, ok = testingDatabaseNameOf("mysql", "root@tcp(127.0.0.1:3306)/testing_14_abc123_x")
+	assert.True(ok)
+
+	// Two servers with a database of one name are two testing databases
+	assert.NotEqual(
+		testingDatabaseKey("mysql", "root@tcp(h1:3306)/testing_14_x", "testing_14_x"),
+		testingDatabaseKey("mysql", "root@tcp(h2:3306)/testing_14_x", "testing_14_x"))
+	assert.NotEqual(
+		testingDatabaseKey("pgx", "postgres://h:5432/testing_14_x", "testing_14_x"),
+		testingDatabaseKey("pgx", "postgres://h:5433/testing_14_x", "testing_14_x"))
+	// And one server reached by two spellings is one
+	assert.Equal(
+		testingDatabaseKey("mariadb", "mariadb://root@tcp(h:3306)/testing_14_x", "testing_14_x"),
+		testingDatabaseKey("mysql", "root:pw@tcp(h:3306)/testing_14_x?parseTime=true", "testing_14_x"))
 }

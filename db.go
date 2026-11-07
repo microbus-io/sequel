@@ -55,11 +55,14 @@ var (
 	testingGlobalMutex sync.Mutex
 	testingMutexes     = map[string]*sync.Mutex{}
 	testingStartedAt   = time.Now().UTC()
-	// testingDBRefs counts the live *DB handles on each testing database, so the auto-drop
-	// happens on the last close rather than on every one.
+	// testingProcessToken is part of every testing database name this process mints, so that two test processes -
+	// go test ./... runs packages in parallel - never mint, and drop, each other's database.
+	testingProcessToken = newTestingProcessToken()
+	// testingDBRefs counts the live *DB handles on each testing database, keyed by testingDatabaseKey, so the
+	// auto-drop happens on the last close rather than on every one.
 	testingDBRefs = map[string]int{}
-	// testingDBKeys maps a testing database name to its testingDSNs cache key, so dropping
-	// the database can evict the DSN that named it.
+	// testingDBKeys maps a testing database, by testingDatabaseKey, to its testingDSNs cache key, so dropping the
+	// database can evict the DSN that named it.
 	testingDBKeys = map[string]string{}
 	// testingAnchors holds one connection, outside every handle's pool, to each live SQLite testing
 	// database. An in-memory database is dropped with its last connection, and a pool may close all of
@@ -69,9 +72,46 @@ var (
 	// insertSourceClausePattern matches the start of an INSERT statement's source clause - either
 	// VALUES (INSERT ... VALUES (...)) or SELECT (INSERT ... SELECT ...). MSSQL's OUTPUT INSERTED
 	// clause is injected immediately before whichever appears, so InsertReturnID works for both forms.
-	insertSourceClausePattern  = regexp.MustCompile(`(?i)\s+(VALUES|SELECT)\b`)
-	testingDatabaseNamePattern = regexp.MustCompile(`^testing_\d{2}_`)
+	insertSourceClausePattern = regexp.MustCompile(`(?i)\s+(VALUES|SELECT)\b`)
 )
+
+// maxTestingDatabaseName is the longest testing database name minted: PostgreSQL's identifier limit, one under MySQL's.
+const maxTestingDatabaseName = 63
+
+// newTestingProcessToken returns six random lower-case letters and digits.
+func newTestingProcessToken() string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, 6)
+	for i := range b {
+		b[i] = alphabet[rand.IntN(len(alphabet))]
+	}
+	return string(b)
+}
+
+// testingDatabaseKey identifies a testing database across handles. Its name alone is not enough: one process may
+// reach two servers under one test ID, and each has a database of that name.
+func testingDatabaseKey(driverName, dsn, databaseName string) string {
+	return physicalDriverName(driverName) + "|" + serverAddress(driverName, dsn) + "|" + databaseName
+}
+
+// serverAddress returns the address of the server a DSN connects to, or "" for SQLite or a DSN that does not parse.
+func serverAddress(driverName, dsn string) string {
+	switch driverName {
+	case "mysql", "mariadb":
+		if cfg, err := mysql.ParseDSN(trimMySQLScheme(dsn)); err == nil {
+			return cfg.Net + "(" + cfg.Addr + ")"
+		}
+	case "pgx", "cockroachdb":
+		if cfg, err := pgx.ParseConfig(toPostgresScheme(dsn)); err == nil {
+			return cfg.Host + ":" + strconv.Itoa(int(cfg.Port))
+		}
+	case "mssql":
+		if u, err := url.Parse(dsn); err == nil {
+			return u.Host
+		}
+	}
+	return ""
+}
 
 /*
 DB is an enhanced database connection that
@@ -489,15 +529,17 @@ func (db *DB) Close() (err error) {
 	return errors.Trace(err)
 }
 
-// testingDatabaseNameOf reports the testing database a DSN names, if any. The testing_NN_
-// prefix minted by CreateTestingDatabase is the only signal.
+// testingDatabaseNameOf reports the testing database a DSN names, if any: a name CreateTestingDatabase could
+// have minted, matched in full, is the only signal.
 func testingDatabaseNameOf(driverName string, dsn string) (string, bool) {
 	// Cheap reject before parsing: this runs on every Open, production ones included.
 	if !strings.Contains(dsn, "testing_") {
 		return "", false
 	}
 	databaseName, err := databaseNameFromDataSourceName(driverName, dsn)
-	if err != nil || !testingDatabaseNamePattern.MatchString(databaseName) {
+	// The full pattern, not just the prefix: the name is spliced into a DROP, and anything CreateTestingDatabase
+	// could not have minted is not sequel's to drop
+	if err != nil || !leftoverTestingDatabasePattern.MatchString(databaseName) {
 		return "", false
 	}
 	return databaseName, true
@@ -511,9 +553,10 @@ func retainTestingDatabase(driverName string, dsn string) error {
 	if !ok {
 		return nil
 	}
+	key := testingDatabaseKey(driverName, dsn, databaseName)
 	testingGlobalMutex.Lock()
 	defer testingGlobalMutex.Unlock()
-	if testingDBRefs[databaseName] == 0 && driverName == "sqlite" {
+	if testingDBRefs[key] == 0 && driverName == "sqlite" {
 		anchor, err := sql.Open(physicalDriverName(driverName), dsn)
 		if err != nil {
 			return errors.Trace(err)
@@ -525,9 +568,9 @@ func retainTestingDatabase(driverName string, dsn string) error {
 			anchor.Close()
 			return errors.Trace(err)
 		}
-		testingAnchors[databaseName] = anchor
+		testingAnchors[key] = anchor
 	}
-	testingDBRefs[databaseName]++
+	testingDBRefs[key]++
 	return nil
 }
 
@@ -540,21 +583,22 @@ func (db *DB) maybeDropTestingDatabase() {
 	if !ok {
 		return
 	}
+	key := testingDatabaseKey(db.driverName, db.dataSourceName, dbName)
 	testingGlobalMutex.Lock()
-	testingDBRefs[dbName]--
-	last := testingDBRefs[dbName] <= 0
+	testingDBRefs[key]--
+	last := testingDBRefs[key] <= 0
 	if last {
-		delete(testingDBRefs, dbName)
+		delete(testingDBRefs, key)
 		// Close under the mutex: a retainTestingDatabase that ran before the close would anchor
 		// this database instead of minting a fresh one.
-		if anchor, ok := testingAnchors[dbName]; ok {
+		if anchor, ok := testingAnchors[key]; ok {
 			anchor.Close()
-			delete(testingAnchors, dbName)
+			delete(testingAnchors, key)
 		}
 		// The cached DSN names a database that is about to stop existing, so evict it and let
 		// the next CreateTestingDatabase caller mint it afresh.
-		if cacheKey, ok := testingDBKeys[dbName]; ok {
-			delete(testingDBKeys, dbName)
+		if cacheKey, ok := testingDBKeys[key]; ok {
+			delete(testingDBKeys, key)
 			delete(testingDSNs, cacheKey)
 		}
 	}
@@ -1259,7 +1303,9 @@ no separate cleanup call is required.
 
 uniqueTestID scopes the database so that independent tests don't collide. Pass
 t.Name() from a test, or an equivalent identifier from production startup code
-that wants a per-run database:
+that wants a per-run database. The name also carries a token of the calling process,
+so tests of the same name in two processes (go test ./... runs packages in parallel)
+get two databases; a name too long for the server is shortened with a hash:
 
 	dsn := cfg.DSN
 	if cfg.Testing {
@@ -1392,8 +1438,12 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 		baseDatabaseName = strings.ToLower(baseDatabaseName) + "_"
 	}
 	now := testingStartedAt // Avoid hour change mid-run
-	testingDatabaseName := "testing_" + now.Format("15") + "_" + baseDatabaseName + strings.ToLower(uniqueTestID)
+	testingDatabaseName := "testing_" + now.Format("15") + "_" + testingProcessToken + "_" + baseDatabaseName + strings.ToLower(uniqueTestID)
 	testingDatabaseName = regexp.MustCompile(`[^a-z0-9_]`).ReplaceAllString(testingDatabaseName, "_")
+	if len(testingDatabaseName) > maxTestingDatabaseName {
+		// MySQL refuses a longer name and PostgreSQL truncates it, so the tail is replaced by a hash of the whole
+		testingDatabaseName = testingDatabaseName[:maxTestingDatabaseName-9] + "_" + hashStr(testingDatabaseName)[:8]
+	}
 
 	// For server-based drivers, open the master database and CREATE/DROP DATABASE.
 	// SQLite uses in-memory databases for testing, so this step is skipped.
@@ -1462,7 +1512,7 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 	// Cache for other openers in the same test
 	testingGlobalMutex.Lock()
 	testingDSNs[cacheKey] = testingDSN
-	testingDBKeys[testingDatabaseName] = cacheKey
+	testingDBKeys[testingDatabaseKey(driverName, testingDSN, testingDatabaseName)] = cacheKey
 	testingGlobalMutex.Unlock()
 
 	return named(testingDSN), nil

@@ -752,7 +752,8 @@ Four places carry input sequel does not control:
   suite's credentials. `leftoverTestingDatabasePattern` therefore full-matches `^testing_[0-2][0-9]_[a-z0-9_]*$` -
   exactly the set of names `CreateTestingDatabase` can mint (it sanitizes to `[a-z0-9_]`) - and anything
   else is left alone. A name that fails the match is by definition not sequel's leftover, so refusing to
-  drop it costs nothing.
+  drop it costs nothing. The auto-drop on `Close` (`testingDatabaseNameOf`) applies the same full match: it
+  once checked only the `testing_NN_` prefix before splicing the name into its `DROP`.
 - **DSNs quoted in error messages** are redacted first (`redactDataSourceName`): a DSN carries a password,
   and parse errors end up in the caller's logs. Both credential spellings are masked - URL userinfo
   (`://user:pass@`) and the mysql form (`user:pass@tcp(...)`), plus ADO-style `password=`/`pwd=` params.
@@ -1134,7 +1135,17 @@ testing database - and every one of those handles reaches `maybeDropTestingDatab
 Dropping per handle meant each close but the last issued a `DROP` the server could not grant while its
 siblings still held connections, so it **blocked until the server gave up** - measured at 20s per attempt on
 SQL Server, 5s on PostgreSQL - and then swallowed the error, leaving nothing to explain why the suite was
-slow. So `testingDBRefs` counts live handles per database name and only the last one out drops.
+slow. So `testingDBRefs` counts live handles per testing database and only the last one out drops. It, the
+SQLite anchors and `testingDBKeys` are keyed by `testingDatabaseKey` - the Go driver, the server's address and the
+name - because one process may reach two servers under one test ID, each with a database of that name, and a
+count shared between them dropped one while it was in use.
+
+**Names are unique per process.** A testing database is `testing_HH_<token>_<base>_<test>`, where the token is six
+random characters drawn once per process (`testingProcessToken`). Without it, `go test ./...` - which runs packages
+as parallel processes - minted the same name for two packages' tests of the same name, and the second's
+`DROP DATABASE IF EXISTS` dropped the first's database mid-run. A name longer than 63 characters (PostgreSQL's
+identifier limit; MySQL refuses one over 64) keeps its first 54 and ends with `_` and eight hex digits of a hash of
+the whole, so it stays unique and within the leftover pattern.
 
 Only handles that will actually attempt the drop are counted. `OpenSingleton` coalesces by DSN, so its extra
 callers share one `*DB` and ride `DB.refCount`; their `Close` never reaches the drop path. Counting them
