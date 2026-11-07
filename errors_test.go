@@ -76,9 +76,9 @@ func TestErrors_IsLockContentionError(t *testing.T) {
 	assert := testarossa.For(t)
 
 	// Driver-native typed errors classified by code (the primary path).
-	assert.True(IsLockContentionError(&pgconn.PgError{Code: "40P01"}))   // PG deadlock
-	assert.True(IsLockContentionError(&pgconn.PgError{Code: "40001"}))   // PG/CRDB serialization
-	assert.False(IsLockContentionError(&pgconn.PgError{Code: "23505"}))  // PG unique violation
+	assert.True(IsLockContentionError(&pgconn.PgError{Code: "40P01"}))  // PG deadlock
+	assert.True(IsLockContentionError(&pgconn.PgError{Code: "40001"}))  // PG/CRDB serialization
+	assert.False(IsLockContentionError(&pgconn.PgError{Code: "23505"})) // PG unique violation
 	// A typed error is classified by its code alone, whatever its message says
 	assert.False(IsLockContentionError(&mysql.MySQLError{Number: 1062, Message: "Duplicate entry 'restart transaction' for key 'PRIMARY'"}))
 	assert.False(IsLockContentionError(&pgconn.PgError{Code: "23505", Message: `duplicate key value: (note)=(deadlock detected)`}))
