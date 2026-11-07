@@ -346,7 +346,7 @@ func TestVF_JSONFieldRootOptional(t *testing.T) {
 		{"'$.a.b[2].c'", "'a.b[2].c'"},
 		{"'$[0]'", "'[0]'"},
 	} {
-		for _, driver := range []string{"sqlite", "mysql", "pgx", "cockroachdb", "mssql"} {
+		for _, driver := range []string{"sqlite", "mysql", "mariadb", "pgx", "cockroachdb", "mssql"} {
 			withRoot, err := callExpand(driver, "SELECT JSON_FIELD(state, "+pair[0]+")")
 			assert.NoError(err)
 			without, err := callExpand(driver, "SELECT JSON_FIELD(state, "+pair[1]+")")

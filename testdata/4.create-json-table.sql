@@ -2,7 +2,7 @@
 -- where it has one, and its widest text type where it does not, so JSON_FIELD is exercised against both
 -- shapes it meets in the wild.
 
--- DRIVER: mysql
+-- DRIVER: mysql mariadb
 CREATE TABLE jsonbag (
     id  INT NOT NULL,
     doc JSON NOT NULL

@@ -3,7 +3,7 @@
 This document captures the *why* behind sequel's less-obvious design decisions - the rationale that godoc
 does not record. Sequel enhances `database/sql` with cross-driver SQL (virtual functions), schema
 migration, ephemeral test databases, adaptive connection pooling, and retrying transactions across
-MySQL, PostgreSQL, CockroachDB, SQL Server, and SQLite.
+MySQL, MariaDB, PostgreSQL, CockroachDB, SQL Server, and SQLite.
 
 ## Commit conventions
 
@@ -1001,25 +1001,42 @@ The zero value is off, and a negative duration is clamped to zero rather than wr
 pause. `simulateRTT` returns immediately on a zero delay, so a production pool pays one comparison per
 operation.
 
-## The `cockroachdb://` scheme
+## One driver name per engine, and schemes that name it
 
-CockroachDB takes `postgres://` and `postgresql://` URLs, the only schemes pgx accepts, so such a URL names no
-driver. Inference fell back on the default port, which misses a CockroachDB on any other port and has no way to
-say so through a bare DSN - and a bare DSN is all `SEQUEL_TESTING_DSN`, `Open("", ...)` and `OpenSingleton("", ...)`
-get. Taking CockroachDB for PostgreSQL is not harmless: `DATE_ADD_MILLIS` (and so `Migrate`) expands to
-`MAKE_INTERVAL`, which CockroachDB lacks. So sequel accepts its own `cockroachdb://` scheme, the one SQLAlchemy's
-CockroachDB dialect uses, and rewrites it to `postgres://` (`toPostgresScheme`) before anything parses the DSN: the
-driver, the session time-zone pin, and the database-name helpers all understand only the PostgreSQL schemes. The
-rewrite happens after inference, which is what reads the scheme. The port rule stays, for `postgres://` DSNs that
-already rely on it.
+**Every engine is its own driver name**: `mysql`, `mariadb`, `pgx`, `cockroachdb`, `mssql`, `sqlite`. There are no
+families. MariaDB was once an alias that `Open` turned into `mysql`, which threw away the one fact a caller needed to
+branch on it (`INSERT ... RETURNING`, regular-expression flavor, JSON storage); CockroachDB was already separate.
+Families were rejected because a family name cannot target one member: if `-- DRIVER: pgx` also ran on CockroachDB, a
+PostgreSQL-only statement (`CREATE EXTENSION`, `ALTER COLUMN ... TYPE ... USING`) would have no way to say so. So
+`DriverName()`, `-- DRIVER:` directives and every `case` inside sequel match exact names, and a statement for both
+engines lists both (`-- DRIVER: mysql mariadb`). Splitting MariaDB out broke `-- DRIVER: mysql` sections on MariaDB;
+that was accepted while the library has few users, and is the release note. Two engines that share a Go driver map to
+it in `physicalDriverName`; nothing else should need to know.
 
-`CreateTestingDatabase` hands a CockroachDB testing DSN back in `cockroachdb://` form, whatever its base's scheme. The
-testing DSN is opened without a driver name, and in `postgres://` form it would name PostgreSQL again on any port but
-26257. Keying on the driver rather than the caller's spelling matters because the DSN cache maps both spellings of
-one base to one entry. CI runs CockroachDB on port 26300, so the port rule cannot mask a regression here.
+**A scheme names the driver, ahead of anything else in the DSN.** A bare DSN is all `SEQUEL_TESTING_DSN`,
+`Open("", ...)` and `OpenSingleton("", ...)` get, and two pairs of engines share a DSN format that names neither:
+pgx takes only `postgres://` and `postgresql://`, which CockroachDB uses too, and the MySQL driver's
+`user:pass@tcp(host)/db` names no engine. So sequel accepts `cockroachdb://` (the scheme SQLAlchemy's CockroachDB
+dialect uses), `mysql://` and `mariadb://`, and rewrites them into what the driver accepts (`toPostgresScheme`,
+`mySQLURLToDSN`) after inference reads the scheme and before anything parses the DSN. A `postgres://` URL is `pgx` on
+any port: a port that overrode a scheme once took a MySQL DSN whose password began with `26257` for CockroachDB.
+Default ports remain only as the last guess for a DSN with neither a scheme nor a recognizable format.
 
-The port rule reads only the host list of a `postgres://` or `postgresql://` URL. Matching `:26257` anywhere in the
-text took a MySQL DSN whose password began with those digits for CockroachDB and opened it with pgx.
+The MySQL rewrite builds a `mysql.Config` from the URL's credentials, host and database, appends the URL's query
+untouched, and parses the result with `mysql.ParseDSN`, so the query means exactly what it would in the driver's own
+format: known keys are parsed and validated, and unknown ones become session variables, as they always have. A URL
+that does not parse is reported without wrapping `url.Parse`'s error, which quotes the whole URL, password included;
+a `:` in the user name is refused, since the driver's format would move the rest of it into the password. The
+reverse, `mySQLDSNToURL`, takes the query from the text after the last `/`, where the driver itself splits the
+database from the parameters, and leaves any network but `tcp` alone (a socket, `tcp4`, `tcp6`), since a URL cannot
+express it. Schemes are case-insensitive, so `lowerScheme` folds one before anything compares it.
+
+**A testing DSN must name its own driver.** It is opened without a driver name, so `CreateTestingDatabase` hands back
+a CockroachDB testing DSN as `cockroachdb://`, a MariaDB one as `mariadb://`, and a MySQL one given a `mariadb://`
+base as `mysql://`, whatever the base's spelling: a named driver wins over a scheme. The DSN cache is keyed on the
+driver's own form of the base, so both spellings of one base share one testing database. Keying on the raw text
+once made the second spelling miss the cache and drop and recreate the database under the first one's open handle. `setDatabaseInDataSourceName` keeps a `mysql://`/`mariadb://` URL a URL for the same reason. CI runs
+CockroachDB on port 26300 and MariaDB through `mariadb://`, so only the schemes can identify them there.
 
 ## `CreateTestingDatabase` and the `SEQUEL_TESTING_DSN` fallback
 

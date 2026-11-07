@@ -42,19 +42,19 @@ func TestVF_NowUTCNeverAheadOfItsColumn(t *testing.T) {
 		column map[string]string
 	}{
 		{"default", "NOW_UTC()", map[string]string{
-			"mysql": "DATETIME(3)", "pgx": "TIMESTAMP(3)", "cockroachdb": "TIMESTAMP(3)", "mssql": "DATETIME2(3)", "sqlite": "TEXT",
+			"mysql": "DATETIME(3)", "mariadb": "DATETIME(3)", "pgx": "TIMESTAMP(3)", "cockroachdb": "TIMESTAMP(3)", "mssql": "DATETIME2(3)", "sqlite": "TEXT",
 		}},
 		{"millis", "NOW_UTC(3)", map[string]string{
-			"mysql": "DATETIME(3)", "pgx": "TIMESTAMP(3)", "cockroachdb": "TIMESTAMP(3)", "mssql": "DATETIME2(3)", "sqlite": "TEXT",
+			"mysql": "DATETIME(3)", "mariadb": "DATETIME(3)", "pgx": "TIMESTAMP(3)", "cockroachdb": "TIMESTAMP(3)", "mssql": "DATETIME2(3)", "sqlite": "TEXT",
 		}},
 		{"micros", "NOW_UTC(6)", map[string]string{
-			"mysql": "DATETIME(6)", "pgx": "TIMESTAMP(6)", "cockroachdb": "TIMESTAMP(6)", "mssql": "DATETIME2(6)", "sqlite": "TEXT",
+			"mysql": "DATETIME(6)", "mariadb": "DATETIME(6)", "pgx": "TIMESTAMP(6)", "cockroachdb": "TIMESTAMP(6)", "mssql": "DATETIME2(6)", "sqlite": "TEXT",
 		}},
 		{"tenths", "NOW_UTC(1)", map[string]string{
-			"mysql": "DATETIME(1)", "pgx": "TIMESTAMP(1)", "cockroachdb": "TIMESTAMP(1)", "mssql": "DATETIME2(1)", "sqlite": "TEXT",
+			"mysql": "DATETIME(1)", "mariadb": "DATETIME(1)", "pgx": "TIMESTAMP(1)", "cockroachdb": "TIMESTAMP(1)", "mssql": "DATETIME2(1)", "sqlite": "TEXT",
 		}},
 		{"seconds", "NOW_UTC(0)", map[string]string{
-			"mysql": "DATETIME", "pgx": "TIMESTAMP(0)", "cockroachdb": "TIMESTAMP(0)", "mssql": "DATETIME2(0)", "sqlite": "TEXT",
+			"mysql": "DATETIME", "mariadb": "DATETIME", "pgx": "TIMESTAMP(0)", "cockroachdb": "TIMESTAMP(0)", "mssql": "DATETIME2(0)", "sqlite": "TEXT",
 		}},
 	}
 	for _, tc := range cases {
@@ -104,7 +104,7 @@ func TestVF_NowUTCNeverAheadOfTheClock(t *testing.T) {
 	db := newTestDB(t)
 
 	column := map[string]string{
-		"mysql": "DATETIME(6)", "pgx": "TIMESTAMP(6)", "cockroachdb": "TIMESTAMP(6)", "mssql": "DATETIME2(6)", "sqlite": "TEXT",
+		"mysql": "DATETIME(6)", "mariadb": "DATETIME(6)", "pgx": "TIMESTAMP(6)", "cockroachdb": "TIMESTAMP(6)", "mssql": "DATETIME2(6)", "sqlite": "TEXT",
 	}[db.DriverName()]
 	for i, now := range []string{"NOW_UTC(0)", "NOW_UTC(1)", "NOW_UTC(2)", "NOW_UTC()", "NOW_UTC(5)"} {
 		t.Run(now, func(t *testing.T) {

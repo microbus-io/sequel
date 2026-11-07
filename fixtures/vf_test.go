@@ -53,7 +53,7 @@ func TestVF_NowUTC(t *testing.T) {
 func tsLiteral(db *sequel.DB, t time.Time) string {
 	s := "'" + t.UTC().Format("2006-01-02 15:04:05.000") + "'"
 	switch db.DriverName() {
-	case "mysql":
+	case "mysql", "mariadb":
 		return "CAST(" + s + " AS DATETIME(3))"
 	case "pgx", "cockroachdb":
 		return "CAST(" + s + " AS TIMESTAMP(3))"
@@ -161,6 +161,7 @@ func TestVF_DateAddMillisPastInt32InStatements(t *testing.T) {
 	db := newTestDB(t)
 	tsType := map[string]string{
 		"mysql":       "DATETIME(3)",
+		"mariadb":     "DATETIME(3)",
 		"pgx":         "TIMESTAMP(3)",
 		"cockroachdb": "TIMESTAMP(3)",
 		"mssql":       "DATETIME2(3)",

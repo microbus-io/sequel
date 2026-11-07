@@ -212,7 +212,7 @@ func vfNowUTC(driverName string, args string) (string, error) {
 	}
 	ps := strconv.Itoa(p)
 	switch driverName {
-	case "mysql":
+	case "mysql", "mariadb":
 		return "(UTC_TIMESTAMP(" + ps + "))", nil
 	case "pgx", "cockroachdb":
 		if p == 6 {
@@ -265,7 +265,7 @@ func vfRegexpTextSearch(driverName string, args string) (string, error) {
 		concatenated = "CONCAT_WS(' '," + strings.Join(columns, ",") + ")"
 	}
 	switch driverName {
-	case "mysql":
+	case "mysql", "mariadb":
 		return "(" + concatenated + " REGEXP " + searchExpr + ")", nil
 	case "pgx", "cockroachdb":
 		return "REGEXP_LIKE(" + concatenated + ", " + searchExpr + ", 'i')", nil
@@ -321,7 +321,7 @@ func vfDateAddMillis(driverName string, args string) (string, error) {
 		return "", errors.New("DATE_ADD_MILLIS requires syntax: DATE_ADD_MILLIS(baseExpr, milliseconds)")
 	}
 	switch driverName {
-	case "mysql":
+	case "mysql", "mariadb":
 		return "DATE_ADD(" + baseExpr + ", INTERVAL (" + millis + ") * 1000 MICROSECOND)", nil
 	case "pgx":
 		return "(" + baseExpr + " + MAKE_INTERVAL(secs => (" + millis + ") / 1000.0))", nil
@@ -380,7 +380,7 @@ func vfDateDiffMillis(driverName string, args string) (string, error) {
 		return "", errors.New("DATE_DIFF_MILLIS requires syntax: DATE_DIFF_MILLIS(a, b)")
 	}
 	switch driverName {
-	case "mysql":
+	case "mysql", "mariadb":
 		return "(TIMESTAMPDIFF(MICROSECOND, " + b + ", " + a + ") / 1000.0)", nil
 	case "pgx", "cockroachdb":
 		return "(EXTRACT(EPOCH FROM (" + a + " - " + b + ")) * 1000.0)", nil
@@ -517,7 +517,7 @@ func vfJSONField(driverName string, args string) (string, error) {
 	p := "'" + path.String() + "'"
 
 	switch driverName {
-	case "mysql":
+	case "mysql", "mariadb":
 		// JSON_UNQUOTE maps a JSON null to the *string* 'null', not SQL NULL - the one place MySQL breaks the
 		// contract the other three keep. The JSON_TYPE guard restores it.
 		extract := "JSON_EXTRACT(" + col + ", " + p + ")"
@@ -567,7 +567,7 @@ func vfLimitOffset(driverName string, args string) (string, error) {
 		return "", errors.New("LIMIT_OFFSET requires syntax: LIMIT_OFFSET(limit, offset)")
 	}
 	switch driverName {
-	case "mysql", "pgx", "cockroachdb", "sqlite":
+	case "mysql", "mariadb", "pgx", "cockroachdb", "sqlite":
 		return "LIMIT " + limit + " OFFSET " + offset, nil
 	case "mssql":
 		return "OFFSET " + offset + " ROWS FETCH NEXT " + limit + " ROWS ONLY", nil

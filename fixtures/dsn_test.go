@@ -17,6 +17,7 @@ limitations under the License.
 package fixtures
 
 import (
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -50,6 +51,57 @@ func TestDSN_CockroachDBTestingDSNNamesItsDriver(t *testing.T) {
 		db, err := sequel.Open("", dsn)
 		if assert.NoError(err) {
 			assert.Equal("cockroachdb", db.DriverName())
+			db.Close()
+		}
+	}
+}
+
+// TestDSN_MariaDBTestingDSNNamesItsDriver checks that a MariaDB testing DSN says it is MariaDB: the driver's own DSN
+// format names no engine, and would be taken for MySQL when opened without a driver name. It asks for one testing
+// database with a driver-format base and an explicit driver, then with a mariadb:// base, which must share it rather
+// than drop and recreate it under the first one's open handle. A named driver wins over the base's scheme.
+func TestDSN_MariaDBTestingDSNNamesItsDriver(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	base := os.Getenv("SEQUEL_TESTING_DSN")
+	if !strings.HasPrefix(base, "mariadb://") {
+		t.Skip("needs SEQUEL_TESTING_DSN in mariadb:// form")
+	}
+	u, err := url.Parse(base)
+	if !assert.NoError(err) {
+		return
+	}
+	password, _ := u.User.Password()
+	driverFormat := u.User.Username() + ":" + password + "@tcp(" + u.Host + ")/"
+
+	first, err := sequel.CreateTestingDatabase("mariadb", driverFormat, t.Name())
+	if !assert.NoError(err) {
+		return
+	}
+	assert.True(strings.HasPrefix(first, "mariadb://"), "%q gave %q", driverFormat, first)
+	db, err := sequel.Open("", first)
+	if !assert.NoError(err) {
+		return
+	}
+	defer db.Close()
+	assert.Equal("mariadb", db.DriverName())
+	_, err = db.Exec("CREATE TABLE kept (id INT)")
+	assert.NoError(err)
+
+	second, err := sequel.CreateTestingDatabase("", base, t.Name())
+	if assert.NoError(err) {
+		assert.Equal(first, second)
+	}
+	_, err = db.Exec("INSERT INTO kept (id) VALUES (1)")
+	assert.NoError(err, "the second spelling dropped the database")
+
+	asMySQL, err := sequel.CreateTestingDatabase("mysql", base, t.Name()+"_mysql")
+	if assert.NoError(err) {
+		assert.True(strings.HasPrefix(asMySQL, "mysql://"), "%q gave %q", base, asMySQL)
+		db, err := sequel.Open("", asMySQL)
+		if assert.NoError(err) {
+			assert.Equal("mysql", db.DriverName())
 			db.Close()
 		}
 	}

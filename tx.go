@@ -302,7 +302,7 @@ func (tx *Tx) InsertReturnID(ctx context.Context, idColumn string, stmt string, 
 	return id, tx.recordErr(err)
 }
 
-// DriverName is the name of the driver: "mysql", "pgx", "cockroachdb", "mssql" or "sqlite".
+// DriverName is the name of the driver: "mysql", "mariadb", "pgx", "cockroachdb", "mssql" or "sqlite".
 func (tx *Tx) DriverName() string {
 	return tx.driverName
 }

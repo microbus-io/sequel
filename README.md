@@ -12,7 +12,7 @@ A Go library that enhances `database/sql` with cross-driver SQL, schema migratio
 
 - **Connection pool management** - Prevents database exhaustion when many consumers in one process share a DSN
 - **Schema migration** - Concurrency-safe, incremental database migrations
-- **Cross-driver support** - MySQL, PostgreSQL, CockroachDB, SQL Server, and SQLite with unified API
+- **Cross-driver support** - MySQL, MariaDB, PostgreSQL, CockroachDB, SQL Server, and SQLite with unified API
 - **Retrying transactions** - `Transact` runs a closure in a transaction, retries on deadlock/lock contention, and never commits partial work
 - **Statement batches** - `tx.Batch` sends a transaction's independent statements together and reads their results in order: one round trip on PostgreSQL and CockroachDB, statement by statement elsewhere, same code either way
 - **Ephemeral test databases** - Isolated databases per test with automatic cleanup, with optional simulated network latency
@@ -74,7 +74,7 @@ err := db.Migrate("unique-sequence-name", migrationFS)
 Example migration file with driver-specific syntax:
 
 ```sql
--- DRIVER: mysql
+-- DRIVER: mysql mariadb
 ALTER TABLE users MODIFY COLUMN email VARCHAR(384) NOT NULL;
 
 -- DRIVER: pgx cockroachdb
@@ -89,9 +89,22 @@ ALTER TABLE users ALTER COLUMN email NVARCHAR(384) NOT NULL;
 
 ## Cross-Driver Support
 
-Sequel supports MySQL, PostgreSQL, CockroachDB, SQL Server, and SQLite through a unified API. Write your SQL once using MySQL-style `?` placeholders and virtual functions, and Sequel automatically adapts queries for the active driver.
+Sequel supports MySQL, MariaDB, PostgreSQL, CockroachDB, SQL Server, and SQLite through a unified API. Write your SQL once using MySQL-style `?` placeholders and virtual functions, and Sequel automatically adapts queries for the active driver.
 
-CockroachDB speaks the PostgreSQL wire protocol and shares the `pgx` driver, but it is exposed as a distinct driver name (`cockroachdb`) because callers may need to branch on Cockroach-specific behavior - retry semantics and async schema changes in particular. Internally, the PostgreSQL expansions (placeholders, virtual functions, DSN parsing) apply to `cockroachdb` too, except where CockroachDB lacks a function: `DATE_ADD_MILLIS` has its own expansion there. Without a driver name, a `cockroachdb://` DSN selects CockroachDB on any port - sequel hands the driver the `postgres://` form - while a `postgres://` or `postgresql://` DSN selects it only on its default port, 26257.
+Each engine has its own driver name - `mysql`, `mariadb`, `pgx`, `cockroachdb`, `mssql` and `sqlite` - which `DriverName()` returns and `-- DRIVER:` directives in migrations match exactly. A statement that suits two engines lists both, as in `-- DRIVER: mysql mariadb` or `-- DRIVER: pgx cockroachdb`. MariaDB shares the MySQL Go driver and CockroachDB shares pgx, and their expansions are the same as MySQL's and PostgreSQL's except where an engine needs its own (`DATE_ADD_MILLIS` on CockroachDB).
+
+Without a driver name, the driver is inferred from the data source name, and a URL scheme decides it ahead of anything else:
+
+| Scheme | Driver |
+|--------|--------|
+| `mysql://user:pass@host:3306/db?params` | `mysql` |
+| `mariadb://user:pass@host:3306/db?params` | `mariadb` |
+| `postgres://...`, `postgresql://...` | `pgx` |
+| `cockroachdb://user:pass@host:26257/db?params` | `cockroachdb` |
+| `sqlserver://...` | `mssql` |
+| `file:...` | `sqlite` |
+
+Sequel converts `mysql://` and `mariadb://` URLs to the MySQL driver's own `user:pass@tcp(host:port)/db?params` format, passing the query through as its parameters, and `cockroachdb://` to `postgres://`. A DSN in the MySQL driver's own format is taken for MySQL, so name MariaDB with the `mariadb://` scheme or the `mariadb` driver name. Without a scheme, a default port is the last guess.
 
 ### Automatic Placeholder Conversion
 
@@ -410,6 +423,7 @@ func TestUserService(t *testing.T) {
 go test ./...                                                          # SQLite (default)
 SEQUEL_TESTING_DSN='postgres://user:pw@127.0.0.1:5432/' go test ./...  # PostgreSQL
 SEQUEL_TESTING_DSN='root:pw@tcp(127.0.0.1:3306)/'       go test ./...  # MySQL
+SEQUEL_TESTING_DSN='mariadb://root:pw@127.0.0.1:3306/'  go test ./...  # MariaDB
 SEQUEL_TESTING_DSN='cockroachdb://root@127.0.0.1:26257/?sslmode=disable' go test ./...  # CockroachDB
 ```
 
@@ -463,7 +477,7 @@ Configure once, before the `*DB` is used concurrently. For an `OpenSingleton`-sh
 
 Each query, `Transact`, and `Migrate` gets a client span following OpenTelemetry database semantic conventions:
 
-- `db.system.name` - the driver (`mysql`, `pgx`, `cockroachdb`, `mssql`, `sqlite`)
+- `db.system.name` - the driver (`mysql`, `mariadb`, `pgx`, `cockroachdb`, `mssql`, `sqlite`)
 - `db.operation.name` - the SQL verb (`SELECT`, `INSERT`, ...), whatever the dialect: common verbs are reported immediately and rarer ones are picked up on first use, so nothing needs to be on a list. The number of distinct verbs a process reports is capped (at 128) and only verb-shaped tokens count toward it, so the attribute stays low-cardinality even if an application interpolates uncontrolled input into its SQL; past the cap, further unrecognized verbs report as `OTHER` and sequel logs that once at Info
 - `db.collection.name` - the table, **only when it can be determined unambiguously** (omitted for joins, multi-table `FROM` lists, and subqueries, so a present value is trustworthy)
 
