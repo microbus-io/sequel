@@ -112,9 +112,13 @@ best-effort basis. Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres
 Example data source name for each of the supported drivers:
   - mysql: username:password@tcp(hostname:3306)/
   - pgx: postgres://username:password@hostname:5432/
-  - cockroachdb: postgres://username:password@hostname:26257/
+  - cockroachdb: cockroachdb://username:password@hostname:26257/
   - mssql: sqlserver://username:password@hostname:1433
   - sqlite: file:path/to/database.sqlite
+
+A cockroachdb:// URL is a postgres:// URL that names CockroachDB as its driver; sequel hands
+the driver the postgres:// form. A postgres:// or postgresql:// URL is taken for CockroachDB
+only on its default port, 26257, and for PostgreSQL otherwise.
 
 On "pgx" and "cockroachdb", every connection starts its session in the UTC time zone,
 whatever the server, database or role default, so that NOW_UTC() stores the right instant
@@ -239,7 +243,7 @@ func normalizeDriverAndDSN(driverName, dataSourceName string) (string, string, e
 		cfg.Params["writeTimeout"] = "8s"
 		dataSourceName = cfg.FormatDSN()
 	case "pgx", "cockroachdb":
-		dataSourceName = pinSessionTimeZoneUTC(dataSourceName)
+		dataSourceName = pinSessionTimeZoneUTC(toPostgresScheme(dataSourceName))
 	case "sqlite":
 		if !strings.Contains(dataSourceName, "busy_timeout") {
 			// Set a busy_timeout so that concurrent writers retry on lock contention
@@ -1111,16 +1115,32 @@ func physicalDriverName(driverName string) string {
 	return driverName
 }
 
+// cockroachDBScheme is sequel's URL scheme for CockroachDB. A postgres:// URL names no driver, so it lets a
+// bare DSN say it is CockroachDB on any port.
+const cockroachDBScheme = "cockroachdb://"
+
+// toPostgresScheme rewrites a cockroachdb:// URL to the postgres:// URL the driver accepts, and returns any
+// other DSN unchanged.
+func toPostgresScheme(dsn string) string {
+	if rest, ok := strings.CutPrefix(dsn, cockroachDBScheme); ok {
+		return "postgres://" + rest
+	}
+	return dsn
+}
+
 // inferDriverName tries to infer the driver name from the data source name.
 func inferDriverName(dataSourceName string) (driverName string) {
 	if dataSourceName == "" {
 		return ""
 	}
+	if strings.HasPrefix(dataSourceName, cockroachDBScheme) {
+		return "cockroachdb"
+	}
 	// CockroachDB speaks the PostgreSQL protocol and takes postgres:// URLs, so its port is checked first
 	if strings.Contains(dataSourceName, ":26257") {
 		return "cockroachdb"
 	}
-	if strings.HasPrefix(dataSourceName, "postgres://") {
+	if strings.HasPrefix(dataSourceName, "postgres://") || strings.HasPrefix(dataSourceName, "postgresql://") {
 		return "pgx"
 	}
 	if strings.HasPrefix(dataSourceName, "sqlserver://") {
@@ -1177,8 +1197,9 @@ database has been closed it is dropped, and a later call with the same triple
 provisions it again.
 
 If a driver name is not provided, it is inferred from the data source name on a
-best-effort basis. Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres),
-"cockroachdb" (CockroachDB), "mssql" (SQL Server) or "sqlite" (SQLite).
+best-effort basis, as in [Open]. Drivers currently supported: "mysql" (MySQL), "pgx" (Postgres),
+"cockroachdb" (CockroachDB), "mssql" (SQL Server) or "sqlite" (SQLite). A cockroachdb:// base
+data source name yields a cockroachdb:// testing data source name.
 
 If neither a driver name nor a base data source name is provided, it falls back to the SEQUEL_TESTING_DSN
 environment variable. This lets any consumer that builds ephemeral test databases through sequel redirect
@@ -1193,7 +1214,7 @@ based on the driver name:
   - sqlite: SQLite in-memory database
   - mysql: root:root@tcp(127.0.0.1:3306)/
   - pgx: postgres://postgres:postgres@127.0.0.1:5432/
-  - cockroachdb: postgres://root@127.0.0.1:26257/?sslmode=disable
+  - cockroachdb: cockroachdb://root@127.0.0.1:26257/?sslmode=disable
   - mssql: sqlserver://sa:Password123@127.0.0.1:1433
 */
 func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueTestID string) (dsn string, err error) {
@@ -1212,7 +1233,7 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 		case "pgx":
 			baseDataSourceName = "postgres://postgres:postgres@127.0.0.1:5432/"
 		case "cockroachdb":
-			baseDataSourceName = "postgres://root@127.0.0.1:26257/?sslmode=disable"
+			baseDataSourceName = "cockroachdb://root@127.0.0.1:26257/?sslmode=disable"
 		case "mssql":
 			baseDataSourceName = "sqlserver://sa:Password123@127.0.0.1:1433"
 		default:
@@ -1222,6 +1243,10 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 	if driverName == "" {
 		driverName = inferDriverName(baseDataSourceName)
 	}
+	// The DSN helpers parse postgres:// URLs only; the testing DSN gets the caller's scheme back, so that it
+	// still names CockroachDB when opened without a driver name
+	cockroachDBURL := strings.HasPrefix(baseDataSourceName, cockroachDBScheme)
+	baseDataSourceName = toPostgresScheme(baseDataSourceName)
 	if driverName == "sqlite" && !strings.Contains(baseDataSourceName, "mode=memory") && !strings.Contains(baseDataSourceName, "cache=shared") {
 		if strings.Contains(baseDataSourceName, "?") {
 			baseDataSourceName += "&mode=memory&cache=shared"
@@ -1330,6 +1355,9 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 	testingDSN, err := setDatabaseInDataSourceName(driverName, baseDataSourceName, testingDatabaseName)
 	if err != nil {
 		return "", errors.Trace(err)
+	}
+	if cockroachDBURL {
+		testingDSN = cockroachDBScheme + strings.TrimPrefix(testingDSN, "postgres://")
 	}
 
 	// Cache for other openers in the same test

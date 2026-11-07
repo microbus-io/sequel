@@ -91,7 +91,7 @@ ALTER TABLE users ALTER COLUMN email NVARCHAR(384) NOT NULL;
 
 Sequel supports MySQL, PostgreSQL, CockroachDB, SQL Server, and SQLite through a unified API. Write your SQL once using MySQL-style `?` placeholders and virtual functions, and Sequel automatically adapts queries for the active driver.
 
-CockroachDB speaks the PostgreSQL wire protocol and shares the `pgx` driver, but it is exposed as a distinct driver name (`cockroachdb`) because callers may need to branch on Cockroach-specific behavior - retry semantics and async schema changes in particular. Internally, the PostgreSQL expansions (placeholders, virtual functions, DSN parsing) apply to `cockroachdb` too, except where CockroachDB lacks a function: `DATE_ADD_MILLIS` has its own expansion there. A `postgres://` DSN on port 26257 is inferred as `cockroachdb`.
+CockroachDB speaks the PostgreSQL wire protocol and shares the `pgx` driver, but it is exposed as a distinct driver name (`cockroachdb`) because callers may need to branch on Cockroach-specific behavior - retry semantics and async schema changes in particular. Internally, the PostgreSQL expansions (placeholders, virtual functions, DSN parsing) apply to `cockroachdb` too, except where CockroachDB lacks a function: `DATE_ADD_MILLIS` has its own expansion there. Without a driver name, a `cockroachdb://` DSN selects CockroachDB on any port - sequel hands the driver the `postgres://` form - while a `postgres://` or `postgresql://` DSN selects it only on its default port, 26257.
 
 ### Automatic Placeholder Conversion
 
@@ -408,6 +408,7 @@ func TestUserService(t *testing.T) {
 go test ./...                                                          # SQLite (default)
 SEQUEL_TESTING_DSN='postgres://user:pw@127.0.0.1:5432/' go test ./...  # PostgreSQL
 SEQUEL_TESTING_DSN='root:pw@tcp(127.0.0.1:3306)/'       go test ./...  # MySQL
+SEQUEL_TESTING_DSN='cockroachdb://root@127.0.0.1:26257/?sslmode=disable' go test ./...  # CockroachDB
 ```
 
 Passing an explicit driver - even with an empty DSN, which just selects that driver's localhost default - opts out of the fallback, so a test that deliberately targets a specific engine keeps using it regardless of the environment. Because the variable is read inside `CreateTestingDatabase`, any project that provisions its test databases through sequel inherits this behavior with no additional wiring.

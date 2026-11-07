@@ -142,6 +142,12 @@ func TestDB_InferDriverName(t *testing.T) {
 
 	// Postgres prefix
 	assert.Equal("pgx", inferDriverName("postgres://user:pw@127.0.0.1:5432/mydb"))
+	assert.Equal("pgx", inferDriverName("postgresql://user:pw@127.0.0.1:5432/mydb"))
+	assert.Equal("pgx", inferDriverName("postgresql://user:pw@db.example.com/mydb"))
+
+	// CockroachDB scheme, on any port
+	assert.Equal("cockroachdb", inferDriverName("cockroachdb://root@127.0.0.1:26257/"))
+	assert.Equal("cockroachdb", inferDriverName("cockroachdb://root@db.example.com:9999/mydb"))
 
 	// SQL Server prefix
 	assert.Equal("mssql", inferDriverName("sqlserver://user:pw@127.0.0.1:1433"))
@@ -1203,6 +1209,15 @@ func TestDB_PinSessionTimeZoneUTC(t *testing.T) {
 	}
 	_, dsn, err := normalizeDriverAndDSN("mssql", "sqlserver://u:p@h:1433")
 	assert.Expect(dsn, "sqlserver://u:p@h:1433", err, nil)
+
+	// A cockroachdb:// URL names the driver and reaches the driver as postgres://; a postgresql:// URL is
+	// left in its own spelling, which the driver accepts.
+	for _, driver := range []string{"cockroachdb", ""} {
+		driver, dsn, err := normalizeDriverAndDSN(driver, "cockroachdb://u:p@h:9999/db?sslmode=disable")
+		assert.Expect(driver, "cockroachdb", dsn, "postgres://u:p@h:9999/db?sslmode=disable&timezone=UTC", err, nil)
+	}
+	driver, dsn, err := normalizeDriverAndDSN("", "postgresql://u:p@h/db")
+	assert.Expect(driver, "pgx", dsn, "postgresql://u:p@h/db?timezone=UTC", err, nil)
 
 	// A pinned keyword DSN still names its pool by database, never by the DSN text, which carries the
 	// password.

@@ -994,6 +994,21 @@ The zero value is off, and a negative duration is clamped to zero rather than wr
 pause. `simulateRTT` returns immediately on a zero delay, so a production pool pays one comparison per
 operation.
 
+## The `cockroachdb://` scheme
+
+CockroachDB takes `postgres://` and `postgresql://` URLs, the only schemes pgx accepts, so such a URL names no
+driver. Inference fell back on the default port, which misses a CockroachDB on any other port and has no way to
+say so through a bare DSN - and a bare DSN is all `SEQUEL_TESTING_DSN`, `Open("", ...)` and `OpenSingleton("", ...)`
+get. Taking CockroachDB for PostgreSQL is not harmless: `DATE_ADD_MILLIS` (and so `Migrate`) expands to
+`MAKE_INTERVAL`, which CockroachDB lacks. So sequel accepts its own `cockroachdb://` scheme, the one SQLAlchemy's
+CockroachDB dialect uses, and rewrites it to `postgres://` (`toPostgresScheme`) before anything parses the DSN: the
+driver, the session time-zone pin, and the database-name helpers all understand only the PostgreSQL schemes. The
+rewrite happens after inference, which is what reads the scheme. The port rule stays, for `postgres://` DSNs that
+already rely on it.
+
+`CreateTestingDatabase` hands its testing DSN back in `cockroachdb://` form when its base was. The testing DSN is
+opened without a driver name, and in `postgres://` form it would name PostgreSQL again on any port but 26257.
+
 ## `CreateTestingDatabase` and the `SEQUEL_TESTING_DSN` fallback
 
 `CreateTestingDatabase` provisions an isolated, auto-dropped database per test. When the caller names
