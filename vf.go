@@ -31,10 +31,6 @@ type virtualFunc struct {
 	handler func(driverName string, args string) (string, error)
 }
 
-// vfIdentPattern matches an identifier directly followed by '('.
-// It is intentionally a single, VF-list-independent pass over the query.
-var vfIdentPattern = regexp.MustCompile(`[A-Za-z_][A-Za-z0-9_]*\(`)
-
 // virtualFuncs holds the registered virtual functions as a copy-on-write map. Reads are lock-free (a single
 // atomic load), which matters because every query that may contain a virtual function reads it; writes are
 // rare (process startup, occasional RegisterVirtualFunc) and clone-then-swap under virtualFuncsMutex. A
@@ -127,50 +123,60 @@ func expandVirtualFuncs(driverName string, query string) (string, error) {
 	}
 }
 
-// expandOnce performs a single left-to-right scan, expanding every virtual function call.
-// It returns the (possibly new) query, whether any expansion occurred, and any error.
+// expandOnce performs a single left-to-right scan, expanding every virtual function call outside string literals,
+// quoted identifiers and comments, which hold data rather than SQL (skipNonCode). A dollar-quoted PostgreSQL body is
+// code - a function's SQL - so calls inside one expand. It returns the (possibly new) query, whether any expansion
+// occurred, and any error.
 func expandOnce(driverName, query string, vfs map[string]virtualFunc) (string, bool, error) {
 	var b strings.Builder
 	changed := false
+	last := 0 // query[last:i] is yet to be copied to b
 	i := 0
 	for i < len(query) {
-		loc := vfIdentPattern.FindStringIndex(query[i:])
-		if loc == nil {
-			b.WriteString(query[i:])
-			break
+		if j := skipNonCode(driverName, query, i, false); j > i {
+			i = j
+			continue
 		}
-		absStart := i + loc[0]
-		absEnd := i + loc[1] // position just after the opening '('
-		// Identifier excludes the trailing '('.
-		name := query[absStart : absEnd-1]
-		vf, ok := vfs[strings.ToUpper(name)]
+		ch := query[i]
+		if !isWordByte(ch) || (ch >= '0' && ch <= '9') || (i > 0 && isIdentByte(query[i-1])) {
+			i++
+			continue
+		}
+		// An identifier: a virtual function when a known name is followed at once by '('
+		j := i
+		for j < len(query) && isWordByte(query[j]) {
+			j++
+		}
+		if j >= len(query) || query[j] != '(' {
+			i = j
+			continue
+		}
+		vf, ok := vfs[strings.ToUpper(query[i:j])]
 		if !ok {
-			// Not a virtual function - skip past the '(' and keep scanning.
-			b.WriteString(query[i:absEnd])
-			i = absEnd
+			i = j + 1
 			continue
 		}
-		closePos := findBalancedClose(query, absEnd)
+		closePos := findBalancedClose(query, j+1)
 		if closePos < 0 {
-			// Unbalanced; emit verbatim and continue scanning.
-			b.WriteString(query[i:absEnd])
-			i = absEnd
+			// Unbalanced; leave it as it is
+			i = j + 1
 			continue
 		}
-		args := query[absEnd:closePos]
-		result, err := vf.handler(driverName, args)
+		result, err := vf.handler(driverName, query[j+1:closePos])
 		if err != nil {
 			return "", false, err
 		}
-		b.WriteString(query[i:absStart])
+		b.WriteString(query[last:i])
 		b.WriteString(result)
 		i = closePos + 1
+		last = i
 		changed = true
 	}
 	if !changed {
 		// Avoid an unnecessary allocation on the common no-VF path.
 		return query, false, nil
 	}
+	b.WriteString(query[last:])
 	return b.String(), true, nil
 }
 

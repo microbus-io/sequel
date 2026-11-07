@@ -386,3 +386,27 @@ func TestVF_ArgumentsKeepTheirOrder(t *testing.T) {
 		}
 	}
 }
+
+// TestVF_NotExpandedInsideStringsOrComments pins that a virtual function inside a string literal, a quoted identifier
+// or a comment is left alone, which once stored 'use NOW_UTC() here' rewritten on MySQL. A dollar-quoted PostgreSQL
+// body is SQL, so a call inside one still expands.
+func TestVF_NotExpandedInsideStringsOrComments(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	cases := []struct{ driver, in, want string }{
+		{"mysql", "INSERT INTO t VALUES ('use NOW_UTC() here', NOW_UTC())", "INSERT INTO t VALUES ('use NOW_UTC() here', (UTC_TIMESTAMP(3)))"},
+		{"mysql", `SELECT 'it\'s NOW_UTC()', "NOW_UTC()", ` + "`NOW_UTC(`" + ` FROM t`, `SELECT 'it\'s NOW_UTC()', "NOW_UTC()", ` + "`NOW_UTC(`" + ` FROM t`},
+		{"sqlite", "SELECT 'it''s NOW_UTC()' -- NOW_UTC()\n/* NOW_UTC() */", "SELECT 'it''s NOW_UTC()' -- NOW_UTC()\n/* NOW_UTC() */"},
+		{"mssql", "SELECT [NOW_UTC(]]] FROM t", "SELECT [NOW_UTC(]]] FROM t"},
+		{"pgx", "SELECT E'\\' NOW_UTC()', 1", "SELECT E'\\' NOW_UTC()', 1"},
+		{"pgx", "CREATE FUNCTION f() RETURNS TIMESTAMP AS $$ SELECT NOW_UTC(6) $$ LANGUAGE SQL",
+			"CREATE FUNCTION f() RETURNS TIMESTAMP AS $$ SELECT (NOW() AT TIME ZONE 'UTC') $$ LANGUAGE SQL"},
+	}
+	for _, c := range cases {
+		q, err := callExpand(c.driver, c.in)
+		if assert.NoError(err, "%s %s", c.driver, c.in) {
+			assert.Equal(c.want, q, "%s %s", c.driver, c.in)
+		}
+	}
+}

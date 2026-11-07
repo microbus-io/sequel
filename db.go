@@ -1927,10 +1927,8 @@ func conformPlaceholders(driverName string, stmt string) string {
 	if n == 0 {
 		return stmt
 	}
-	brackets := driverName == "mssql"
 	// Fast path: nothing a ? could hide in
-	if !strings.ContainsAny(stmt, `'"`) && !strings.Contains(stmt, "--") && !strings.Contains(stmt, "/*") &&
-		!(brackets && strings.Contains(stmt, "[")) {
+	if !strings.ContainsAny(stmt, `'"[$`) && !strings.Contains(stmt, "--") && !strings.Contains(stmt, "/*") {
 		var sb strings.Builder
 		sb.Grow(len(stmt) + n*3)
 		argIndex := 1
@@ -1948,52 +1946,25 @@ func conformPlaceholders(driverName string, stmt string) string {
 		}
 		return sb.String()
 	}
-	// Slow path: scan character by character, copying skipped regions verbatim. An escaped quote ('') closes
-	// the region and immediately reopens it, which copies the same bytes; an escaped bracket (]]) does not
-	// reopen, so it is skipped over explicitly.
+	// Slow path: skip what the driver skips - string literals, quoted identifiers, comments, and on PostgreSQL
+	// dollar-quoted bodies, whose ? is an operator (jsonb's) rather than a parameter
 	var sb strings.Builder
 	sb.Grow(len(stmt) + n*3)
 	argIndex := 1
-	for i := 0; i < len(stmt); i++ {
-		ch := stmt[i]
-		var closer string
-		switch {
-		case ch == '\'' || ch == '"':
-			closer = string(ch)
-		case ch == '[' && brackets:
-			closer = "]"
-		case ch == '-' && strings.HasPrefix(stmt[i:], "--"):
-			closer = "\n"
-		case ch == '/' && strings.HasPrefix(stmt[i:], "/*"):
-			closer = "*/"
-		case ch == '?':
+	for i := 0; i < len(stmt); {
+		if j := skipNonCode(driverName, stmt, i, true); j > i {
+			sb.WriteString(stmt[i:j])
+			i = j
+			continue
+		}
+		if stmt[i] == '?' {
 			sb.WriteString("$")
 			sb.WriteString(strconv.Itoa(argIndex))
 			argIndex++
-			continue
-		default:
-			sb.WriteByte(ch)
-			continue
+		} else {
+			sb.WriteByte(stmt[i])
 		}
-		// Copy everything up to and including the closer, or to the end if it is unterminated
-		end := i + 1
-		if closer == "*/" {
-			end++ // so that /*/ does not close itself
-		}
-		for {
-			j := strings.Index(stmt[end:], closer)
-			if j < 0 {
-				end = len(stmt)
-				break
-			}
-			end += j + len(closer)
-			if closer != "]" || end >= len(stmt) || stmt[end] != ']' {
-				break
-			}
-			end++
-		}
-		sb.WriteString(stmt[i:end])
-		i = end - 1
+		i++
 	}
 	return sb.String()
 }

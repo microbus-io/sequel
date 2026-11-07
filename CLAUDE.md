@@ -140,6 +140,15 @@ correct on any session. So `normalizeDriverAndDSN` adds `timezone=UTC` to every 
   against `NOW_UTC()`: the comparison converts both through the same session zone and the error cancels.
   It skips on CockroachDB, where a database default does not reach the root user the suite connects as.
 
+## Virtual functions are not expanded inside strings or comments
+
+`expandOnce` skips string literals, quoted identifiers and comments (`skipNonCode`), and looks for a call only at the
+start of an identifier. It once matched names anywhere, so `INSERT ... VALUES ('use NOW_UTC() here')` was stored
+rewritten on MySQL and became broken SQL elsewhere. A PostgreSQL dollar-quoted body is the exception, deliberately: it
+is a function's SQL, a migration may rely on `NOW_UTC()` inside one, and skipping it would leave the call to fail when
+the function runs. The placeholder conformer skips those bodies all the same, since a `?` there is never a parameter of
+the statement being sent. `TestVF_NotExpandedInsideStringsOrComments` and `TestVF_StringLiteralIsData` pin it.
+
 ## An expansion keeps its arguments in the order they were written
 
 MySQL, MariaDB and SQLite bind bare `?` in text order, and PostgreSQL and CockroachDB number `?` after expansion, so on
@@ -173,7 +182,10 @@ Two consequences carry the safety:
   `[bracketed identifiers]` (with `]]` as an escaped bracket). Before, sequel left SQL Server's `?` alone and the
   driver numbered them; now sequel numbers them, so a `?` it numbered inside a comment would shift every later
   ordinal. `conformPlaceholders` therefore skips comments on PostgreSQL and SQL Server and brackets on SQL Server
-  only - on PostgreSQL `arr[?]` is an array subscript and must be numbered.
+  only - on PostgreSQL `arr[?]` is an array subscript and must be numbered. On PostgreSQL it also skips dollar-quoted
+  bodies (`$tag$ ... $tag$`), where `?` is jsonb's key-exists operator in a function's SQL, and honours a backslash
+  escape inside an `E'...'` string. The region rules live in one place, `skipNonCode` (`sqllex.go`), which the
+  virtual-function scanner shares.
 - **A handler must not introduce a `?` on SQL Server.** The ordinals are fixed before it runs, so a new bare `?`
   would collide with `$1` (the driver numbers bare `?` from 1, independently of `$N`). Re-conforming the expansion
   and finding a change means one was introduced, and the statement fails to unpack rather than binding the wrong

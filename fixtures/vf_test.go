@@ -497,3 +497,43 @@ func TestVF_JSONFieldLongScalar(t *testing.T) {
 	}
 	assert.Equal(strings.Repeat("z", 5000), got.String)
 }
+
+// TestVF_StringLiteralIsData stores a string that spells a virtual function call, next to a real call, and reads it
+// back unchanged. The call inside the literal was once expanded, and on MySQL stored rewritten.
+func TestVF_StringLiteralIsData(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB(t)
+	_, err := db.Exec("CREATE TABLE vf_literal (note VARCHAR(64), n INT)")
+	if !assert.NoError(err) {
+		return
+	}
+	_, err = db.Exec("INSERT INTO vf_literal (note, n) VALUES ('use NOW_UTC() here -- not a comment', ?) -- NOW_UTC()", 7)
+	if !assert.NoError(err) {
+		return
+	}
+	var note string
+	var n int
+	assert.NoError(db.QueryRow("SELECT note, n FROM vf_literal WHERE n=?", 7).Scan(&note, &n))
+	assert.Equal("use NOW_UTC() here -- not a comment", note)
+}
+
+// TestVF_DollarQuotedBody creates a PostgreSQL function whose body uses jsonb's ? operator, which must not be taken for
+// a parameter, and calls it with a bound argument numbered after it.
+func TestVF_DollarQuotedBody(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB(t)
+	if db.DriverName() != "pgx" && db.DriverName() != "cockroachdb" {
+		t.Skip("dollar quotes are PostgreSQL's")
+	}
+	_, err := db.Exec("CREATE FUNCTION has_k(j JSONB) RETURNS BOOL AS $$ SELECT j ? 'k' $$ LANGUAGE SQL")
+	if !assert.NoError(err) {
+		return
+	}
+	var has bool
+	assert.NoError(db.QueryRow("SELECT has_k(CAST(? AS JSONB))", `{"k": 1}`).Scan(&has))
+	assert.True(has)
+}

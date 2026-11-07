@@ -1497,3 +1497,22 @@ func TestDB_TestingDatabaseNames(t *testing.T) {
 		testingDatabaseKey("mariadb", "mariadb://root@tcp(h:3306)/testing_14_x", "testing_14_x"),
 		testingDatabaseKey("mysql", "root:pw@tcp(h:3306)/testing_14_x?parseTime=true", "testing_14_x"))
 }
+
+// TestDB_ConformPlaceholdersSkipsQuotedCode pins that a ? which the server does not take for a parameter is left
+// alone: inside a PostgreSQL dollar-quoted body, where it is jsonb's operator, and inside an E'...' string whose
+// backslash escapes a quote.
+func TestDB_ConformPlaceholdersSkipsQuotedCode(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	for _, driver := range []string{"pgx", "cockroachdb"} {
+		assert.Equal("CREATE FUNCTION f(j JSONB) RETURNS BOOL AS $$ SELECT j ? 'k' $$ LANGUAGE SQL",
+			conformPlaceholders(driver, "CREATE FUNCTION f(j JSONB) RETURNS BOOL AS $$ SELECT j ? 'k' $$ LANGUAGE SQL"))
+		assert.Equal("SELECT $body$ ? $body$, $1", conformPlaceholders(driver, "SELECT $body$ ? $body$, ?"))
+		assert.Equal(`SELECT E'\'?', $1`, conformPlaceholders(driver, `SELECT E'\'?', ?`))
+		assert.Equal("SELECT arr[$1], $2", conformPlaceholders(driver, "SELECT arr[?], ?"))
+		assert.Equal("SELECT a$b, $1", conformPlaceholders(driver, "SELECT a$b, ?"))
+	}
+	// SQL Server has no dollar quotes
+	assert.Equal("SELECT $$ $1 $$", conformPlaceholders("mssql", "SELECT $$ ? $$"))
+}

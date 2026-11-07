@@ -121,7 +121,7 @@ So a DSN in the MySQL driver's own format is taken for MySQL, and a `postgres://
 
 ### Automatic Placeholder Conversion
 
-All query methods (`Exec`, `Query`, `QueryRow`, `Prepare`, and their `Context` variants) automatically convert `?` placeholders to the driver's native syntax. For PostgreSQL and SQL Server, `?` becomes `$1`, `$2`, etc. For MySQL and SQLite, `?` is left as-is. A `?` inside a quoted string or a comment, or on SQL Server inside a bracketed identifier, is left untouched.
+All query methods (`Exec`, `Query`, `QueryRow`, `Prepare`, and their `Context` variants) automatically convert `?` placeholders to the driver's native syntax. For PostgreSQL and SQL Server, `?` becomes `$1`, `$2`, etc. For MySQL and SQLite, `?` is left as-is. A `?` inside a quoted string or identifier or a comment is left untouched, as is one on PostgreSQL inside a dollar-quoted body (`$$ ... $$`), where `?` is jsonb's operator, and on SQL Server inside a bracketed identifier.
 
 ```go
 // Works on all drivers - placeholders are converted automatically
@@ -131,7 +131,7 @@ rows, err := db.Query("SELECT * FROM users WHERE tenant_id = ? AND active = ?", 
 
 ### Virtual Functions
 
-Virtual functions are driver-agnostic function calls in your SQL that Sequel expands into driver-specific expressions before execution. They are matched case-insensitively and support nesting. Quoted strings inside arguments are handled correctly.
+Virtual functions are driver-agnostic function calls in your SQL that Sequel expands into driver-specific expressions before execution. They are matched case-insensitively and support nesting. A name inside a string literal, a quoted identifier or a comment is not a call and is left as written; one inside a PostgreSQL dollar-quoted body (`$$ ... $$`), which is SQL, is expanded.
 
 #### Built-in Virtual Functions
 
