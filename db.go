@@ -1713,7 +1713,9 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		}
 		statement = strings.Join(lines, "\n")
 
-		done := make(chan error)
+		// Buffered, so the goroutine never blocks on a receiver that has gone; cancelled if the lock is lost
+		runCtx, cancelRun := context.WithCancel(ctx)
+		done := make(chan error, 1)
 		go func() {
 			for stmt := range strings.SplitSeq(statement, ";\n") {
 				stmt = strings.TrimSpace(stmt)
@@ -1727,9 +1729,8 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 						continue
 					}
 				}
-				lines := strings.Split(stmt, "\n")
+				lines := strings.Split(stripLineComments(stmt), "\n")
 				for i := range lines {
-					lines[i], _, _ = strings.Cut(lines[i], "--")
 					lines[i] = strings.TrimSpace(lines[i])
 				}
 				stmt = strings.Join(lines, "\n")
@@ -1738,7 +1739,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 					// Empty after stripping comments (e.g. a comment-only segment); skip to avoid erroring out
 					continue
 				}
-				_, e := db.Exec(stmt)
+				_, e := db.ExecContext(runCtx, stmt)
 				if e != nil {
 					done <- e
 					return
@@ -1753,15 +1754,20 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			select {
 			case err = <-done:
 				exit = true
-			case <-time.After(5 * time.Second):
+			case <-time.After(migrationLockRenewal):
 				// Extend the lock while the migration is in progress
-				stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000) WHERE seq_name=? AND seq_num=?`
-				_, err = db.execRetryingContention(stmt, sequenceName, seqNum)
-				if err != nil {
+				if extendErr := extendMigrationLock(db, sequenceName, seqNum); extendErr != nil {
+					// The lock will lapse, and another runner may take it. Stop this run before giving it up, and
+					// wait for it, so that the two do not run the same migration at once
+					cancelRun()
+					if runErr := <-done; runErr != nil {
+						err = errors.New("unable to extend the migration lock", extendErr)
+					}
 					exit = true
 				}
 			}
 		}
+		cancelRun()
 
 		db.telemetry.Load().recordMigration(ctx, db.driverName, sequenceName, err)
 
@@ -1795,6 +1801,46 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 func isDuplicateKeyError(driverName string, err error) bool {
 	var msErr mssql.Error
 	return driverName == "mssql" && errors.As(err, &msErr) && (msErr.Number == 2627 || msErr.Number == 2601)
+}
+
+// migrationLockRenewal is how often a running migration extends its lock, which lasts 15 seconds.
+var migrationLockRenewal = 5 * time.Second
+
+// extendMigrationLock extends the lock of a running migration. A variable, so that a test can make it fail.
+var extendMigrationLock = func(db *DB, sequenceName string, seqNum int) error {
+	_, err := db.execRetryingContention(
+		`UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000) WHERE seq_name=? AND seq_num=?`,
+		sequenceName, seqNum)
+	return err
+}
+
+// stripLineComments removes the -- comments of a migration statement, up to the end of each line, and leaves a "--"
+// inside a quoted string or identifier alone. A quote is escaped by doubling it.
+func stripLineComments(stmt string) string {
+	var b strings.Builder
+	b.Grow(len(stmt))
+	var quote byte
+	for i := 0; i < len(stmt); i++ {
+		ch := stmt[i]
+		switch {
+		case quote != 0:
+			if ch == quote {
+				quote = 0 // A doubled quote closes and reopens, which copies the same bytes
+			}
+		case ch == '\'' || ch == '"' || ch == '`':
+			quote = ch
+		case ch == '-' && i+1 < len(stmt) && stmt[i+1] == '-':
+			for i < len(stmt) && stmt[i] != '\n' {
+				i++
+			}
+			if i < len(stmt) {
+				b.WriteByte('\n')
+			}
+			continue
+		}
+		b.WriteByte(ch)
+	}
+	return b.String()
 }
 
 // retryContention runs fn again, with Transact's jittered backoff, while it fails on lock contention or a

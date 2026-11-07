@@ -19,6 +19,7 @@ package sequel
 import (
 	"context"
 	"encoding/json"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -27,6 +28,7 @@ import (
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
+	"github.com/microbus-io/errors"
 	"github.com/microbus-io/testarossa"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
@@ -1410,4 +1412,49 @@ func TestMigrate_ADroppedTableIsMadeAgain(t *testing.T) {
 	var n int
 	assert.NoError(db.QueryRow("SELECT COUNT(*) FROM sequel_migrations").Scan(&n))
 	assert.Equal(1, n)
+}
+
+// A migration whose lock cannot be extended is stopped and waited for before the lock is given up, so that a runner
+// taking the lapsed lock cannot run the same migration alongside it. Here the lock renewal fails while a long
+// statement runs: Migrate must cancel it, not run the statement after it, and return the failure. Not parallel: it
+// replaces package-level hooks.
+func TestMigrate_StopsWhenItsLockCannotBeExtended(t *testing.T) {
+	assert := testarossa.For(t)
+
+	renewal, extend := migrationLockRenewal, extendMigrationLock
+	defer func() { migrationLockRenewal, extendMigrationLock = renewal, extend }()
+	migrationLockRenewal = 50 * time.Millisecond
+	extendMigrationLock = func(*DB, string, int) error { return errors.New("connection lost") }
+
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	db, err := Open("sqlite", dsn)
+	if !assert.NoError(err) {
+		return
+	}
+	defer db.Close()
+	fs := fstest.MapFS{"1.slow.sql": {Data: []byte(
+		"WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 2000000000) SELECT COUNT(*) FROM c;\n" +
+			"CREATE TABLE after_lost_lock (id INT);\n")}}
+	before := runtime.NumGoroutine()
+	start := time.Now()
+	err = db.Migrate(t.Name(), fs)
+	assert.Error(err)
+	assert.True(time.Since(start) < 10*time.Second, "the slow statement was not cancelled")
+	// The run was waited for: no goroutine is left executing the migration
+	time.Sleep(200 * time.Millisecond)
+	assert.True(runtime.NumGoroutine() <= before, "a goroutine is still running the migration: %d > %d", runtime.NumGoroutine(), before)
+	var n int
+	assert.NoError(db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name='after_lost_lock'").Scan(&n))
+	assert.Equal(0, n, "the statement after the lost lock ran")
+}
+
+// Migrate strips -- comments, but not a "--" inside a quoted string.
+func TestMigrate_StripsCommentsOutsideQuotes(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	assert.Equal("SELECT 'a--b', \"c--d\" \nFROM t", stripLineComments("SELECT 'a--b', \"c--d\" -- trailing\nFROM t"))
+	assert.Equal("SELECT 'it''s--fine' ", stripLineComments("SELECT 'it''s--fine' -- note"))
+	assert.Equal("\nSELECT 1", stripLineComments("-- DRIVER: sqlite\nSELECT 1"))
 }

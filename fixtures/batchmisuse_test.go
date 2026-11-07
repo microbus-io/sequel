@@ -290,7 +290,6 @@ func TestBatch_MisuseOnBeginTx(t *testing.T) {
 	assert.Error(res.Close(), "Close did not report the scan error")
 }
 
-
 // TestBatch_ReadsOutOfRange: reading past the last statement, or after Close, is an error; it is not a statement's
 // failure, so the transaction still commits.
 func TestBatch_ReadsOutOfRange(t *testing.T) {

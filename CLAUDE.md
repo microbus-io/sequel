@@ -723,6 +723,21 @@ that an OTel batch processor exports after the call returns, and an async `slog`
 Recycling the buffer would rewrite a pgx map key in place and could run one statement's prepared plan with another's
 arguments. Caching gives the same steady-state saving with immutable strings.
 
+## `Migrate` runs a migration only while it holds the lock
+
+A migration runs in a goroutine while `Migrate` extends its 15-second lock every 5 seconds. When an extension fails
+(not contention, which is retried, but a lost connection, say), the lock will lapse and another runner may take it.
+`Migrate` used to give the lock up and return at once, leaving the goroutine executing statements - so two runners
+ran one migration concurrently, and the goroutine then blocked forever on an unbuffered channel. It now cancels the
+run's context and waits for the goroutine before releasing the lock, and the channel is buffered. Cancelling stops
+the statements after the one in flight; whether the in-flight one stops is the driver's and server's business (MySQL
+closes the connection, and the server may finish a DDL anyway). `migrationLockRenewal` and `extendMigrationLock` are
+variables so that `TestMigrate_StopsWhenItsLockCannotBeExtended` can make the renewal fail.
+
+Statements are split at a `;` that ends a line, and their `--` comments are stripped by `stripLineComments`, which
+leaves a `--` inside a quoted string alone; `strings.Cut` on each line once truncated `'a--b'`. A comment after a `;`
+on the same line keeps that `;` from ending the statement, so comments go on their own lines or before the `;`.
+
 ## Hardening against uncontrolled input
 
 Sequel splices text into SQL, error messages, and telemetry attributes in a handful of places. The rule in

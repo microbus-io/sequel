@@ -148,3 +148,21 @@ func TestMigrate_ExistingRowIsNotAnError(t *testing.T) {
 		assert.NotEqual(codes.Error, span.Status().Code, "%s reported an error: %s", span.Name(), span.Status().Description)
 	}
 }
+
+// TestMigrate_KeepsDashesInStrings runs a migration whose string literal holds "--", followed by a real comment. The
+// comment must go and the literal must arrive whole.
+func TestMigrate_KeepsDashesInStrings(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB(t)
+	fs := fstest.MapFS{"1.dashes.sql": {Data: []byte(
+		"-- a table\nCREATE TABLE dashes (v VARCHAR(16));\n" +
+			"INSERT INTO dashes (v) -- a row\nVALUES ('a--b');\n")}}
+	if !assert.NoError(db.Migrate(t.Name(), fs)) {
+		return
+	}
+	var v string
+	assert.NoError(db.QueryRow("SELECT v FROM dashes").Scan(&v))
+	assert.Equal("a--b", v)
+}
