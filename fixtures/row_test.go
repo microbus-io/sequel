@@ -115,3 +115,51 @@ func TestTransact_QueryRowShortCircuits(t *testing.T) {
 	// The short-circuited Scan reports the original error, not a driver cascade error.
 	assert.Equal(first, afterScan)
 }
+
+// TestTransact_QueryRowUnpackErrorIsNotErrNoRows runs a QueryRow whose virtual function cannot expand, inside a
+// closure that defaults a missing row as TestTransact_CommitsOnErrNoRows does. The Scan must report the unpack error,
+// not sql.ErrNoRows, and the transaction must not commit the default. An empty statement once ran in its place, which
+// several drivers answer as no rows.
+func TestTransact_QueryRowUnpackErrorIsNotErrNoRows(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+	ctx := context.Background()
+
+	db := newTestDB(t)
+	_, err := db.Exec("CREATE TABLE row_unpack (id INT, v INT)")
+	assert.NoError(err)
+
+	const malformed = "SELECT JSON_FIELD(v, '$.a-b') FROM row_unpack WHERE id=?"
+	var scanErr error
+	err = db.Transact(ctx, func(tx *sequel.Tx) error {
+		var v int
+		scanErr = tx.QueryRowContext(ctx, malformed, 42).Scan(&v)
+		if errors.Is(scanErr, sql.ErrNoRows) {
+			v = 7
+		}
+		_, _ = tx.ExecContext(ctx, "INSERT INTO row_unpack (id, v) VALUES (?, ?)", 42, v)
+		return nil
+	})
+	assert.Error(err)
+	if assert.Error(scanErr) {
+		assert.False(errors.Is(scanErr, sql.ErrNoRows), "the unpack error read as no rows")
+		assert.Contains(scanErr.Error(), "JSON_FIELD")
+	}
+	var n int
+	assert.NoError(db.QueryRow("SELECT COUNT(*) FROM row_unpack").Scan(&n))
+	assert.Equal(0, n, "the default was committed")
+
+	// Outside a transaction too, with and without arguments
+	for _, args := range [][]any{{42}, nil} {
+		q := malformed
+		if args == nil {
+			q = "SELECT JSON_FIELD(v, '$.a-b') FROM row_unpack"
+		}
+		var v int
+		err := db.QueryRowContext(ctx, q, args...).Scan(&v)
+		if assert.Error(err) {
+			assert.False(errors.Is(err, sql.ErrNoRows), "the unpack error read as no rows")
+			assert.Contains(err.Error(), "JSON_FIELD")
+		}
+	}
+}

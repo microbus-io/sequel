@@ -599,6 +599,12 @@ carries the recorded error in a `shortErr` field with a **nil embedded `*sql.Row
 report it without touching the database or starting a span (consistent with short-circuited statements
 emitting no telemetry). `TestTransact_QueryRowShortCircuits` asserts the *first* error surfaces verbatim.
 
+A `QueryRow` whose statement failed to unpack (a malformed virtual function) returns the same kind of `Row`, carrying
+the unpack error, recorded into the transaction. It used to run an empty statement in its place and let the driver
+complain at `Scan`, which SQLite, and pgx and SQL Server without arguments, answer as `sql.ErrNoRows` - the one error
+the latch exempts - so a closure that defaulted a missing row committed. `TestTransact_QueryRowUnpackErrorIsNotErrNoRows`
+pins it.
+
 ### Prepared statements are inside the net (`Stmt`)
 
 A raw `*sql.Stmt` from `Tx.Prepare` was the last way out of the guarantee: the *prepare* error was

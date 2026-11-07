@@ -620,20 +620,25 @@ func instrumentExec[T any](t *telemetry, rtt time.Duration, ctx context.Context,
 
 // instrumentQueryRow wraps QueryRow/QueryRowContext. Because database/sql defers the query error to Scan,
 // the returned *Row carries the operation and reports its error (and duration ending) when the caller calls
-// Scan or Err. An unpack error is swallowed here exactly as the original shadow methods do: the empty
-// statement run in its place surfaces a driver error at Scan time. Telemetry still labels the operation from
-// the statement as written. tx is the transaction whose error the Row latches, nil for none.
+// Scan or Err. A statement that failed to unpack is not run: its Row reports the unpack error, recorded into
+// tx like any statement error. Running an empty statement in its place, as this once did, read as
+// sql.ErrNoRows on some drivers - which the latch exempts - so a Transact closure that defaulted a missing row
+// committed. tx is the transaction whose error the Row latches, nil for none.
 func instrumentQueryRow(t *telemetry, rtt time.Duration, ctx context.Context, pq *preparedQuery, tx *Tx, run func(ctx context.Context, unpacked string) *sql.Row) *Row {
-	unpacked := pq.text
-	if pq.err != nil {
-		unpacked = ""
-	}
 	op := t.begin(ctx, pq)
+	if pq.err != nil {
+		op.finish(pq.err)
+		err := errors.Trace(pq.err)
+		if tx != nil {
+			tx.recordErr(err)
+		}
+		return &Row{shortErr: err}
+	}
 	// A context that expires during the simulated round trip needs no handling of its own here: the query
 	// below is issued with that same context, so the driver surfaces the cancellation at Scan - which is
 	// where a QueryRow error surfaces in any case.
 	_ = simulateRTT(op.ctx, rtt)
-	return &Row{Row: run(op.ctx, unpacked), op: op, tx: tx}
+	return &Row{Row: run(op.ctx, pq.text), op: op, tx: tx}
 }
 
 // instrumentTxOp wraps a transaction lifecycle operation - BEGIN, COMMIT, ROLLBACK. database/sql exposes
@@ -690,9 +695,9 @@ type Row struct {
 	// tx is the transaction the Row's error is latched into (recording only in autoErr mode); nil for a *DB
 	// query.
 	tx *Tx
-	// shortErr is the already-recorded transaction error for a Row returned by a short-circuited Tx
-	// query. When set, the embedded *sql.Row is nil and Scan/Err report shortErr without touching the
-	// database; no span was ever started, so op is zero too.
+	// shortErr is the error of a Row that never ran: the recorded transaction error of a short-circuited Tx
+	// query, or the statement's unpack error. When set, the embedded *sql.Row is nil and Scan/Err report
+	// shortErr without touching the database, and op is zero.
 	shortErr error
 	done     bool
 }
