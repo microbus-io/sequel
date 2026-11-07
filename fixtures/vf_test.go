@@ -47,6 +47,26 @@ func TestVF_NowUTC(t *testing.T) {
 	assert.True(math.Abs(diff) < 1000, "two NOW_UTC() in one statement should be ~equal, got %v ms", diff)
 }
 
+// tsText formats a timestamp as the text tsParam binds.
+func tsText(t time.Time) string {
+	return t.UTC().Format("2006-01-02 15:04:05.000")
+}
+
+// tsParam returns a bound timestamp of millisecond precision in the configured engine's natural type: a ? cast from
+// tsText, so that date arithmetic can be checked with its arguments bound.
+func tsParam(db *sequel.DB) string {
+	switch db.DriverName() {
+	case "mysql", "mariadb":
+		return "CAST(? AS DATETIME(3))"
+	case "pgx", "cockroachdb":
+		return "CAST(? AS TIMESTAMP(3))"
+	case "mssql":
+		return "CAST(? AS DATETIME2(3))"
+	default:
+		return "?"
+	}
+}
+
 // tsLiteral returns a timestamp literal of millisecond precision in the configured engine's natural type, so
 // that date arithmetic can be checked exactly from a fixed base rather than approximately around NOW_UTC().
 // SQLite has no timestamp type; its date functions read this text form.
@@ -100,6 +120,13 @@ func TestVF_DateMillisExact(t *testing.T) {
 	assert.True(math.Abs(diff-float64(later.Sub(base).Milliseconds())) < tolerance, "a after b: got %v ms", diff)
 	diff = queryFloat(t, db, "SELECT DATE_DIFF_MILLIS("+baseLit+", "+tsLiteral(db, later)+")")
 	assert.True(math.Abs(diff+float64(later.Sub(base).Milliseconds())) < tolerance, "a before b: got %v ms", diff)
+
+	// Both arguments bound, so that a swap of their binds changes the answer
+	diff = queryFloat(t, db, "SELECT DATE_DIFF_MILLIS("+tsParam(db)+", "+tsParam(db)+")", tsText(later), tsText(base))
+	assert.True(math.Abs(diff-float64(later.Sub(base).Milliseconds())) < tolerance, "bound, a after b: got %v ms", diff)
+	diff = queryFloat(t, db, "SELECT DATE_DIFF_MILLIS(DATE_ADD_MILLIS("+tsParam(db)+", ?), "+tsParam(db)+")", tsText(base), 1500, tsText(later))
+	want := float64(1500 - later.Sub(base).Milliseconds())
+	assert.True(math.Abs(diff-want) < tolerance, "bound, nested: got %v ms, want %v", diff, want)
 
 	for _, ms := range []int64{
 		0, 1, -1, 999, 1001, 3723004, -3723004,

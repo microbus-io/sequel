@@ -170,6 +170,8 @@ On PostgreSQL and CockroachDB, sequel opens every connection with its session ti
 | SQL Server | `REGEXP_LIKE(CONCAT_WS(' ',name,email), ?, 'i')`             |
 | SQLite     | `CONCAT_WS(' ',name,email) LIKE '%' \|\| ? \|\| '%'`        |
 
+Every expansion writes the columns ahead of the search expression, so the columns must not contain a `?`: on the drivers that bind placeholders in the order they appear, the search value would go to the column.
+
 **`DATE_ADD_MILLIS(baseExpr, milliseconds)`** adds milliseconds to a timestamp expression.
 
 | Driver     | `DATE_ADD_MILLIS(created_at, ?)` expands to                                       |
@@ -192,7 +194,7 @@ fewer than three fractional digits passed as `baseExpr` rounds the milliseconds 
 
 | Driver     | `DATE_DIFF_MILLIS(updated_at, created_at)` expands to                   |
 |------------|--------------------------------------------------------------------------|
-| MySQL      | `TIMESTAMPDIFF(MICROSECOND, created_at, updated_at) / 1000.0`          |
+| MySQL      | `-TIMESTAMPDIFF(MICROSECOND, updated_at, created_at) / 1000.0`         |
 | PostgreSQL | `EXTRACT(EPOCH FROM (updated_at - created_at)) * 1000.0`               |
 | SQL Server | `DATEDIFF_BIG(MILLISECOND, created_at, updated_at)`                     |
 | SQLite     | `(JULIANDAY(updated_at) - JULIANDAY(created_at)) * 86400000.0`         |

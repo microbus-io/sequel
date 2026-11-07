@@ -17,6 +17,7 @@ limitations under the License.
 package sequel
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/microbus-io/testarossa"
@@ -352,6 +353,36 @@ func TestVF_JSONFieldRootOptional(t *testing.T) {
 			without, err := callExpand(driver, "SELECT JSON_FIELD(state, "+pair[1]+")")
 			assert.NoError(err)
 			assert.Equal(withRoot, without, "%s: %s and %s must expand identically", driver, pair[0], pair[1])
+		}
+	}
+}
+
+// TestVF_ArgumentsKeepTheirOrder pins that an expansion leaves its arguments in the order they were written, on every
+// driver that binds placeholders in text order after expansion: bare ? on MySQL, MariaDB and SQLite, and $N numbered
+// after expansion on PostgreSQL and CockroachDB. An expansion that swapped two arguments would swap their binds, as
+// DATE_DIFF_MILLIS once did on MySQL. SQL Server numbers placeholders before expansion, so it may reorder freely.
+// REGEXP_TEXT_SEARCH writes its columns ahead of its search expression on every driver, by the syntax of the match,
+// which is why its columns must not hold a placeholder.
+func TestVF_ArgumentsKeepTheirOrder(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	for _, driver := range []string{"mysql", "mariadb", "sqlite", "pgx", "cockroachdb"} {
+		for _, call := range []string{
+			"DATE_DIFF_MILLIS(first_arg, second_arg)",
+			"DATE_ADD_MILLIS(first_arg, second_arg)",
+			"LIMIT_OFFSET(first_arg, second_arg)",
+			"DATE_DIFF_MILLIS(DATE_ADD_MILLIS(first_arg, second_arg), third_arg)",
+		} {
+			q, err := callExpand(driver, "SELECT "+call)
+			if !assert.NoError(err, "%s %s", driver, call) {
+				continue
+			}
+			first, second, third := strings.Index(q, "first_arg"), strings.Index(q, "second_arg"), strings.Index(q, "third_arg")
+			assert.True(first < second, "%s reorders %s: %s", driver, call, q)
+			if third >= 0 {
+				assert.True(second < third, "%s reorders %s: %s", driver, call, q)
+			}
 		}
 	}
 }

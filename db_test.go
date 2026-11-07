@@ -546,7 +546,7 @@ func TestDB_UnpackQuery_DateDiffMillis(t *testing.T) {
 	db := newTestDB("mysql")
 	q, err := db.UnpackQuery("SELECT DATE_DIFF_MILLIS(updated_at, created_at)")
 	assert.NoError(err)
-	assert.Equal("SELECT (TIMESTAMPDIFF(MICROSECOND, created_at, updated_at) / 1000.0)", q)
+	assert.Equal("SELECT (-TIMESTAMPDIFF(MICROSECOND, updated_at, created_at) / 1000.0)", q)
 
 	db = newTestDB("pgx")
 	q, err = db.UnpackQuery("SELECT DATE_DIFF_MILLIS(updated_at, created_at)")

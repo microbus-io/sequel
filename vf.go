@@ -400,7 +400,8 @@ func vfDateDiffMillis(driverName string, args string) (string, error) {
 	}
 	switch driverName {
 	case "mysql", "mariadb":
-		return "(TIMESTAMPDIFF(MICROSECOND, " + b + ", " + a + ") / 1000.0)", nil
+		// Negated rather than swapped: MySQL binds bare ? in text order, so a and b must keep theirs
+		return "(-TIMESTAMPDIFF(MICROSECOND, " + a + ", " + b + ") / 1000.0)", nil
 	case "pgx", "cockroachdb":
 		return "(EXTRACT(EPOCH FROM (" + a + " - " + b + ")) * 1000.0)", nil
 	case "mssql":

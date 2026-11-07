@@ -140,6 +140,16 @@ correct on any session. So `normalizeDriverAndDSN` adds `timezone=UTC` to every 
   against `NOW_UTC()`: the comparison converts both through the same session zone and the error cancels.
   It skips on CockroachDB, where a database default does not reach the root user the suite connects as.
 
+## An expansion keeps its arguments in the order they were written
+
+MySQL, MariaDB and SQLite bind bare `?` in text order, and PostgreSQL and CockroachDB number `?` after expansion, so on
+all five an expansion that swaps two arguments swaps their binds - silently, with values of the same type.
+`DATE_DIFF_MILLIS` did exactly that on MySQL (`TIMESTAMPDIFF(MICROSECOND, b, a)`), and `DATE_DIFF_MILLIS(?, ?)` came
+back with its sign flipped; it is now negated instead (`-TIMESTAMPDIFF(MICROSECOND, a, b)`). SQL Server is the
+exception that may reorder, because its placeholders are numbered before expansion (below). `REGEXP_TEXT_SEARCH`
+cannot keep its order - every engine's match puts the columns first - so its columns must not hold a `?`, which the
+README states. `TestVF_ArgumentsKeepTheirOrder` checks the order of every two-argument function on the five drivers.
+
 ## SQL Server numbers placeholders before expansion
 
 On PostgreSQL, `?` becomes `$1, $2, ...` *after* virtual functions expand; on SQL Server it happens *before*
