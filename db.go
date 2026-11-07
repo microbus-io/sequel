@@ -328,34 +328,30 @@ func callerChoseTimeZone(dsn string) bool {
 // Such errors are transient and the operation can typically be retried.
 // Recognizes lock errors from SQLite, MySQL, PostgreSQL, SQL Server, and CockroachDB.
 //
-// Classification prefers the driver's native error code (immune to message wording, localization, and
-// user data appearing in error messages); a substring match is used as a fallback for errors whose
-// driver type is not present in the chain (e.g. some wrapped or text-only CockroachDB retry errors).
+// An error carrying a driver's native error type is classified by its code alone, immune to message wording,
+// localization, and user data appearing in the message. A substring match is used only when no driver type is
+// present in the chain (e.g. some wrapped or text-only CockroachDB retry errors).
 func IsLockContentionError(err error) bool {
 	if err == nil {
 		return false
 	}
 
+	// A typed error decides by its code. Falling through to the message once took a duplicate key whose value
+	// read "restart transaction" for contention, and Transact re-ran a closure that was not safe to repeat.
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
 		// 40P01 deadlock_detected, 40001 serialization_failure (PostgreSQL and CockroachDB).
-		if pgErr.Code == "40P01" || pgErr.Code == "40001" {
-			return true
-		}
+		return pgErr.Code == "40P01" || pgErr.Code == "40001"
 	}
 	var myErr *mysql.MySQLError
 	if errors.As(err, &myErr) {
 		// 1213 ER_LOCK_DEADLOCK, 1205 ER_LOCK_WAIT_TIMEOUT.
-		if myErr.Number == 1213 || myErr.Number == 1205 {
-			return true
-		}
+		return myErr.Number == 1213 || myErr.Number == 1205
 	}
 	var msErr mssql.Error
 	if errors.As(err, &msErr) {
 		// 1205 deadlock victim, 1222 lock request time out.
-		if msErr.Number == 1205 || msErr.Number == 1222 {
-			return true
-		}
+		return msErr.Number == 1205 || msErr.Number == 1222
 	}
 	var liteErr *sqlite.Error
 	if errors.As(err, &liteErr) {
@@ -365,6 +361,7 @@ func IsLockContentionError(err error) bool {
 		case 5, 6:
 			return true
 		}
+		return false
 	}
 
 	return isLockContentionMessage(err.Error())

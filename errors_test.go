@@ -79,6 +79,10 @@ func TestErrors_IsLockContentionError(t *testing.T) {
 	assert.True(IsLockContentionError(&pgconn.PgError{Code: "40P01"}))   // PG deadlock
 	assert.True(IsLockContentionError(&pgconn.PgError{Code: "40001"}))   // PG/CRDB serialization
 	assert.False(IsLockContentionError(&pgconn.PgError{Code: "23505"}))  // PG unique violation
+	// A typed error is classified by its code alone, whatever its message says
+	assert.False(IsLockContentionError(&mysql.MySQLError{Number: 1062, Message: "Duplicate entry 'restart transaction' for key 'PRIMARY'"}))
+	assert.False(IsLockContentionError(&pgconn.PgError{Code: "23505", Message: `duplicate key value: (note)=(deadlock detected)`}))
+	assert.False(IsLockContentionError(mssql.Error{Number: 2627, Message: "duplicate key value is (database is locked)"}))
 	assert.True(IsLockContentionError(&mysql.MySQLError{Number: 1213}))  // MySQL deadlock
 	assert.True(IsLockContentionError(&mysql.MySQLError{Number: 1205}))  // MySQL lock wait timeout
 	assert.False(IsLockContentionError(&mysql.MySQLError{Number: 1062})) // MySQL duplicate entry

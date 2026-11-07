@@ -896,7 +896,10 @@ classified for the `sequel_lock_contention` counter. Classifying opportunistical
 `IsLockContentionError` happens to be called would be unreliable - that function may be called zero times or
 several times per error. `Transact` does **not** separately increment the counter; it only reads the error
 to decide whether to retry. Each failed attempt still counts exactly once - at whichever operation failed,
-statement *or* commit - which is the correct semantics: N contended attempts -> N increments. Statements
+statement *or* commit - which is the correct semantics: N contended attempts -> N increments. The classification
+itself decides a typed driver error (`PgError`, `MySQLError`, `mssql.Error`, `sqlite.Error`) by its code alone and
+reads the message only when no driver type is in the chain: a duplicate key whose value happened to contain "restart
+transaction" once counted as contention, and `Transact` re-ran a closure that was not safe to repeat. Statements
 short-circuited in `Transact` mode return before the wrapper, so they emit no span, metric, or log.
 
 ### `BEGIN`, `COMMIT` and `ROLLBACK` are instrumented operations, not free
