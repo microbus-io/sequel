@@ -5,11 +5,11 @@ go 1.27.3
 tool github.com/microbus-io/copyrighter
 
 require (
-	github.com/denisenkom/go-mssqldb v0.12.3
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/jackc/pgx/v5 v5.12.0
 	github.com/microbus-io/errors v1.0.1
 	github.com/microbus-io/testarossa v0.7.4
+	github.com/microsoft/go-mssqldb v1.11.2
 	go.opentelemetry.io/otel v1.47.0
 	go.opentelemetry.io/otel/metric v1.47.0
 	go.opentelemetry.io/otel/sdk v1.47.0
@@ -35,6 +35,7 @@ require (
 	github.com/microbus-io/copyrighter v1.4.0 // indirect
 	github.com/ncruces/go-strftime v1.1.0 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	github.com/shopspring/decimal v1.4.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	golang.org/x/crypto v0.58.0 // indirect

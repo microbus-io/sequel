@@ -30,11 +30,11 @@ import (
 	"testing/fstest"
 	"time"
 
-	"github.com/denisenkom/go-mssqldb/msdsn"
 	"github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
 	"github.com/microbus-io/errors"
 	"github.com/microbus-io/testarossa"
+	"github.com/microsoft/go-mssqldb/msdsn"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
 	sqlite "modernc.org/sqlite"
@@ -1820,8 +1820,8 @@ func TestDB_DatabaseInEveryDSNGrammar(t *testing.T) {
 			if !assert.NoError(err, "%q", dsn) {
 				continue
 			}
-			before, _, _ := msdsn.Parse(dsn)
-			cfg, _, err := msdsn.Parse(altered)
+			before, _ := msdsn.Parse(dsn)
+			cfg, err := msdsn.Parse(altered)
 			assert.NoError(err)
 			assert.Equal(db, cfg.Database, "%q", altered)
 			assert.Equal("localhost", cfg.Host)
@@ -1912,7 +1912,6 @@ func TestDB_SQLServerDatabaseKeyCaseVariants(t *testing.T) {
 	t.Parallel()
 	for _, query := range []string{
 		"Database=production", "DATABASE=production", "dAtAbAsE=production",
-		"Database=production&database=other&DATABASE=third",
 	} {
 		for _, target := range []string{"testing_02_review", ""} {
 			dsn, err := setDatabaseInDataSourceName("mssql", "sqlserver://review:secret@localhost:1433?"+query, target)
@@ -1936,12 +1935,17 @@ func TestDB_SQLServerDatabaseKeyCaseVariants(t *testing.T) {
 				t.Fatalf("unexpected database keys in %q", dsn)
 			}
 			for range 100 {
-				cfg, _, err := msdsn.Parse(dsn)
+				cfg, err := msdsn.Parse(dsn)
 				if err != nil || cfg.Database != target {
 					t.Fatalf("unstable database selection: %q, %v", cfg.Database, err)
 				}
 			}
 		}
+	}
+	// The driver refuses a URL that repeats a key in any letter case, so there is no database to replace
+	_, err := setDatabaseInDataSourceName("mssql", "sqlserver://review:secret@localhost:1433?Database=production&database=other", "testing_02_review")
+	if err == nil {
+		t.Fatal("expected an error for a repeated database key")
 	}
 }
 

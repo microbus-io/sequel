@@ -20,11 +20,11 @@ import (
 	"database/sql"
 	"testing"
 
-	mssql "github.com/denisenkom/go-mssqldb"
 	"github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/microbus-io/errors"
 	"github.com/microbus-io/testarossa"
+	mssql "github.com/microsoft/go-mssqldb"
 )
 
 // The database/sql sentinels pass through untouched: they are routine control flow, and callers are

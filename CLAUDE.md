@@ -729,8 +729,8 @@ Four places carry input sequel does not control:
   both drivers let a later key override an earlier one, and then **re-parses and checks** the database, host, port,
   user and password, refusing a DSN it cannot rewrite - a keyword DSN ending in a backslash, which escapes the
   separator - rather than returning one that connects somewhere else. `TestDB_DatabaseInEveryDSNGrammar` pins it. SQL Server URL
-  database keys must be removed case-insensitively before setting one canonical key: the driver lowercases keys
-  while iterating a map, so a case-variant duplicate can select a different database on the next parse.
+  database keys must be removed case-insensitively before setting one canonical key: the driver lowercases keys and
+  refuses a URL that gives one twice, so a case variant left beside it makes the testing DSN unparsable.
   Keyword testing DSNs carry `pgx+dsn://` or `cockroachdb+dsn://`; strip that prefix before driver parsing and cache
   identity calculation. This keeps keyword syntax intact while preserving the logical driver at an inferred open.
   A bare keyword DSN is inferred as pgx only when its first key is a libpq keyword and it has no `;` outside quotes
@@ -1164,7 +1164,10 @@ on CockroachDB, where it also pings fine afterwards. Two mechanisms close it, an
 The `DROP` runs under a 5s context timeout. The refcount means it normally runs uncontended, but a handle
 that never closes - a test binary that panicked - leaves the database in use and puts the server back into
 that block-until-it-gives-up state. Since the drop is best-effort either way (errors are swallowed, and
-`CreateTestingDatabase` sweeps leftovers on the next run), waiting longer buys nothing.
+`CreateTestingDatabase` sweeps leftovers on the next run), waiting longer buys nothing. On SQL Server the timeout bounds the drop only
+because the driver bounds its own wait after it: a cancelled statement sends an attention and reads until the server
+confirms it, and the deprecated `denisenkom/go-mssqldb` read with no limit, so an unconfirmed attention held `Close`
+until the test binary timed out. `microsoft/go-mssqldb` gives up after 5s per response and discards the connection.
 
 ### A SQLite testing database is pinned by an anchor connection
 

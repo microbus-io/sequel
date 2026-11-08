@@ -36,13 +36,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	mssql "github.com/denisenkom/go-mssqldb"
-	"github.com/denisenkom/go-mssqldb/msdsn"
 	"github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/microbus-io/errors"
+	mssql "github.com/microsoft/go-mssqldb"
+	"github.com/microsoft/go-mssqldb/msdsn"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	"go.opentelemetry.io/otel/trace"
@@ -130,7 +130,7 @@ func serverAddress(driverName, dsn string) string {
 			return cfg.Host + ":" + strconv.Itoa(int(cfg.Port))
 		}
 	case "mssql":
-		if cfg, _, err := msdsn.Parse(dsn); err == nil {
+		if cfg, err := msdsn.Parse(dsn); err == nil {
 			return cfg.Host + ":" + strconv.Itoa(int(cfg.Port)) + "/" + cfg.Instance
 		}
 	}
@@ -1180,7 +1180,7 @@ func databaseNameFromDataSourceName(driverName string, dsn string) (databaseName
 		return cfg.Database, nil
 	case "mssql":
 		// https://github.com/microsoft/go-mssqldb?tab=readme-ov-file#common-parameters
-		cfg, _, err := msdsn.Parse(dsn)
+		cfg, err := msdsn.Parse(dsn)
 		if err != nil {
 			return "", dsnParseError(driverName)
 		}
@@ -1237,7 +1237,7 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 		return alteredDSN, nil
 	case "mssql":
 		// https://github.com/microsoft/go-mssqldb?tab=readme-ov-file#common-parameters
-		before, _, err := msdsn.Parse(dsn)
+		before, err := msdsn.Parse(dsn)
 		if err != nil {
 			return "", dsnParseError(driverName)
 		}
@@ -1247,8 +1247,8 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 				return "", dsnParseError(driverName)
 			}
 			q := u.Query()
-			// The driver folds keys to lower case while iterating a map. Leaving a case variant would make
-			// the selected database depend on map iteration order, even after a successful validation parse.
+			// The driver folds keys to lower case and refuses a key given twice, so a case variant left
+			// beside the canonical key would make the DSN unparsable.
 			for key := range q {
 				if strings.EqualFold(key, "database") {
 					q.Del(key)
@@ -1267,7 +1267,7 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 			}
 			alteredDSN = dsn + sep + "database=" + databaseName
 		}
-		after, _, err := msdsn.Parse(alteredDSN)
+		after, err := msdsn.Parse(alteredDSN)
 		if err != nil || after.Database != databaseName || after.Host != before.Host || after.Port != before.Port ||
 			after.Instance != before.Instance || after.User != before.User || after.Password != before.Password {
 			return "", errors.New("unable to set the database in this %s data source name", driverName)
