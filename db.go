@@ -59,14 +59,21 @@ var (
 	// testingProcessToken is part of every testing database name this process mints, so that two test processes -
 	// go test ./... runs packages in parallel - never mint, and drop, each other's database.
 	testingProcessToken = newTestingProcessToken()
-	// testingDBRefs counts the live *DB handles on each testing database, keyed by testingDatabaseKey, so the
-	// auto-drop happens on the last close rather than on every one.
+	// testingDBRefs counts the live *DB handles on each generation of each testing database, keyed by
+	// testingGenerationKey, so the auto-drop happens on the last close rather than on every one.
 	testingDBRefs = map[string]int{}
+	// testingGenerations counts the provisionings of each testing database, keyed by testingDatabaseKey. A handle
+	// belongs to the generation it was opened on, and the last close of an older one drops nothing: its database
+	// is gone already, and the name now belongs to a newer one.
+	testingGenerations = map[string]int{}
+	// testingLifecycles serializes, per testing database (testingDatabaseKey), its provisioning against its drop, so
+	// a DROP that the last close decided on cannot run after the database was provisioned again.
+	testingLifecycles = map[string]*sync.Mutex{}
 	// testingDBKeys maps a testing database, by testingDatabaseKey, to its testingDSNs cache key, so dropping the
 	// database can evict the DSN that named it.
 	testingDBKeys = map[string]string{}
-	// testingAnchors holds one connection, outside every handle's pool, to each live SQLite testing
-	// database. An in-memory database is dropped with its last connection, and a pool may close all of
+	// testingAnchors holds one connection, outside every handle's pool, to each live generation of each SQLite
+	// testing database, keyed by testingGenerationKey. An in-memory database is dropped with its last connection, and a pool may close all of
 	// its connections while its handle stays open.
 	testingAnchors = map[string]*sql.DB{}
 )
@@ -89,6 +96,27 @@ func newTestingProcessToken() string {
 func testingDatabaseKey(driverName, dsn, databaseName string) string {
 	return physicalDriverName(driverName) + "|" + serverAddress(driverName, dsn) + "|" + databaseName
 }
+
+// testingGenerationKey identifies one generation of a testing database.
+func testingGenerationKey(key string, generation int) string {
+	return key + "#" + strconv.Itoa(generation)
+}
+
+// testingLifecycle returns the mutex that serializes the provisioning and the drop of a testing database.
+func testingLifecycle(key string) *sync.Mutex {
+	testingGlobalMutex.Lock()
+	defer testingGlobalMutex.Unlock()
+	mux, ok := testingLifecycles[key]
+	if !ok {
+		mux = &sync.Mutex{}
+		testingLifecycles[key] = mux
+	}
+	return mux
+}
+
+// testingRetireHook runs after the last close of a testing database decided to drop it, before the drop, while its
+// lifecycle is held. A variable, so that a test can hold a drop there.
+var testingRetireHook = func() {}
 
 // serverAddress returns the address of the server a DSN connects to, or "" for SQLite or a DSN that does not parse.
 func serverAddress(driverName, dsn string) string {
@@ -125,7 +153,9 @@ type DB struct {
 	// since its readers take no lock: a closed singleton leaves the singleton map, and the next opener makes a
 	// new *DB.
 	closed bool
-	mutex  sync.Mutex
+	// testingGeneration is the generation of the testing database this handle was opened on, if any.
+	testingGeneration int
+	mutex             sync.Mutex
 	// pool mirrors the embedded *sql.DB for the pool-stats callback, which must not take mutex: OTel holds its
 	// own lock while it runs the callback, and SetMeterProvider holds mutex while it takes that lock.
 	pool      atomic.Pointer[sql.DB]
@@ -188,16 +218,17 @@ func Open(driverName string, dataSourceName string) (db *DB, err error) {
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	err = retainTestingDatabase(driverName, dataSourceName)
+	generation, err := retainTestingDatabase(driverName, dataSourceName)
 	if err != nil {
 		sqlDB.Close()
 		return nil, errors.Trace(err)
 	}
 	db = &DB{
-		DB:             sqlDB,
-		driverName:     driverName,
-		dataSourceName: dataSourceName,
-		refCount:       1,
+		DB:                sqlDB,
+		driverName:        driverName,
+		dataSourceName:    dataSourceName,
+		refCount:          1,
+		testingGeneration: generation,
 	}
 	db.pool.Store(sqlDB)
 	db.telemetry.Store(newDefaultTelemetry(db))
@@ -257,11 +288,12 @@ func OpenSingleton(driverName string, dataSourceName string) (db *DB, err error)
 		return nil, errors.Trace(err)
 	}
 	// Only on this branch, not the coalescing one above: the extra callers share this *DB.
-	err = retainTestingDatabase(driverName, dataSourceName)
+	generation, err := retainTestingDatabase(driverName, dataSourceName)
 	if err != nil {
 		sqlDB.Close()
 		return nil, errors.Trace(err)
 	}
+	singletonDB.testingGeneration = generation
 	singletonDB.DB = sqlDB
 	singletonDB.pool.Store(sqlDB)
 	singletonDB.refCount = 1
@@ -569,67 +601,78 @@ func testingDatabaseNameOf(driverName string, dsn string) (string, bool) {
 	return databaseName, true
 }
 
-// retainTestingDatabase records one more handle on the testing database the DSN names, and pins a SQLite
-// testing database with an anchor connection when this is its first handle. Call it once per *DB that will
-// eventually run maybeDropTestingDatabase.
-func retainTestingDatabase(driverName string, dsn string) error {
+// retainTestingDatabase records one more handle on the current generation of the testing database the DSN names,
+// and returns that generation. It pins a SQLite testing database with an anchor connection when this is the
+// generation's first handle. Call it once per *DB that will eventually run maybeDropTestingDatabase.
+func retainTestingDatabase(driverName string, dsn string) (generation int, err error) {
 	databaseName, ok := testingDatabaseNameOf(driverName, dsn)
 	if !ok {
-		return nil
+		return 0, nil
 	}
 	key := testingDatabaseKey(driverName, dsn, databaseName)
 	testingGlobalMutex.Lock()
 	defer testingGlobalMutex.Unlock()
-	if testingDBRefs[key] == 0 && driverName == "sqlite" {
+	generation = testingGenerations[key]
+	refKey := testingGenerationKey(key, generation)
+	if testingDBRefs[refKey] == 0 && driverName == "sqlite" {
 		anchor, err := sql.Open(physicalDriverName(driverName), dsn)
 		if err != nil {
-			return errors.Trace(err)
+			return 0, errors.Trace(err)
 		}
 		anchor.SetMaxOpenConns(1)
 		anchor.SetMaxIdleConns(1)
 		err = anchor.Ping()
 		if err != nil {
 			anchor.Close()
-			return errors.Trace(err)
+			return 0, errors.Trace(err)
 		}
-		testingAnchors[key] = anchor
+		testingAnchors[refKey] = anchor
 	}
-	testingDBRefs[key]++
-	return nil
+	testingDBRefs[refKey]++
+	return generation, nil
 }
 
-// maybeDropTestingDatabase releases this handle on the database backing this *DB if its
-// name has the testing prefix produced by [CreateTestingDatabase], and drops the database
-// once the last handle is gone. Errors are swallowed: the leftover-DB sweep on the next
-// test run is the safety net. For SQLite (in-memory), closing the anchor connection is the drop.
+// maybeDropTestingDatabase releases this handle on the database backing this *DB if its name has the testing prefix
+// produced by [CreateTestingDatabase], and drops the database once the last handle on its generation is gone. The
+// decision and the drop are made under the database's lifecycle, so that it cannot be provisioned again in between;
+// the last handle on an older generation drops nothing. Errors are swallowed: the leftover-DB sweep on the next test
+// run is the safety net. For SQLite (in-memory), closing the anchor connection is the drop.
 func (db *DB) maybeDropTestingDatabase() {
 	dbName, ok := testingDatabaseNameOf(db.driverName, db.dataSourceName)
 	if !ok {
 		return
 	}
 	key := testingDatabaseKey(db.driverName, db.dataSourceName, dbName)
+	lifecycle := testingLifecycle(key)
+	lifecycle.Lock()
+	defer lifecycle.Unlock()
+
+	refKey := testingGenerationKey(key, db.testingGeneration)
 	testingGlobalMutex.Lock()
-	testingDBRefs[key]--
-	last := testingDBRefs[key] <= 0
+	testingDBRefs[refKey]--
+	last := testingDBRefs[refKey] <= 0
+	current := db.testingGeneration == testingGenerations[key]
 	if last {
-		delete(testingDBRefs, key)
+		delete(testingDBRefs, refKey)
 		// Close under the mutex: a retainTestingDatabase that ran before the close would anchor
 		// this database instead of minting a fresh one.
-		if anchor, ok := testingAnchors[key]; ok {
+		if anchor, ok := testingAnchors[refKey]; ok {
 			anchor.Close()
-			delete(testingAnchors, key)
+			delete(testingAnchors, refKey)
 		}
-		// The cached DSN names a database that is about to stop existing, so evict it and let
-		// the next CreateTestingDatabase caller mint it afresh.
-		if cacheKey, ok := testingDBKeys[key]; ok {
+		// The cached DSN names a database that is about to stop existing, so evict it at once, before a cache hit
+		// can hand it out, and let the next CreateTestingDatabase caller mint it afresh - after the drop, since it
+		// waits for the lifecycle.
+		if cacheKey, ok := testingDBKeys[key]; ok && current {
 			delete(testingDBKeys, key)
 			delete(testingDSNs, cacheKey)
 		}
 	}
 	testingGlobalMutex.Unlock()
-	if !last {
+	if !last || !current {
 		return
 	}
+	testingRetireHook()
 	if db.driverName == "sqlite" {
 		return
 	}
@@ -1592,6 +1635,15 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 		readable = readable[:max(room, 0)]
 	}
 	testingDatabaseName := prefix + readable + suffix
+	testingDSN, err := setDatabaseInDataSourceName(driverName, baseDataSourceName, testingDatabaseName)
+	if err != nil {
+		return "", errors.Trace(err)
+	}
+	// Held until the DSN is published: a drop decided by the last close of the previous generation finishes first
+	dbKey := testingDatabaseKey(driverName, testingDSN, testingDatabaseName)
+	lifecycle := testingLifecycle(dbKey)
+	lifecycle.Lock()
+	defer lifecycle.Unlock()
 
 	// For server-based drivers, open the master database and CREATE/DROP DATABASE.
 	// SQLite uses in-memory databases for testing, so this step is skipped.
@@ -1652,15 +1704,11 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 		}
 	}
 
-	testingDSN, err := setDatabaseInDataSourceName(driverName, baseDataSourceName, testingDatabaseName)
-	if err != nil {
-		return "", errors.Trace(err)
-	}
-
-	// Cache for other openers in the same test
+	// Cache for other openers in the same test, as a new generation: handles left on the previous one drop nothing
 	testingGlobalMutex.Lock()
+	testingGenerations[dbKey]++
 	testingDSNs[cacheKey] = testingDSN
-	testingDBKeys[testingDatabaseKey(driverName, testingDSN, testingDatabaseName)] = cacheKey
+	testingDBKeys[dbKey] = cacheKey
 	testingGlobalMutex.Unlock()
 
 	return named(testingDSN), nil

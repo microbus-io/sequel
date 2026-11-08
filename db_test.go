@@ -946,7 +946,8 @@ func TestDB_CreateTestingDatabase_DistinctPools(t *testing.T) {
 func testingRefsOf(databaseName string) int {
 	testingGlobalMutex.Lock()
 	defer testingGlobalMutex.Unlock()
-	return testingDBRefs[testingDatabaseKey("sqlite", "", databaseName)]
+	key := testingDatabaseKey("sqlite", "", databaseName)
+	return testingDBRefs[testingGenerationKey(key, testingGenerations[key])]
 }
 
 func testingDSNIsCached(databaseName string) bool {
@@ -1992,4 +1993,97 @@ func TestDB_InferKeywordDSN(t *testing.T) {
 	} {
 		assert.Equal(want, inferDriverName(dsn), "%q", dsn)
 	}
+}
+
+// A testing database provisioned again while the last close of its previous generation is still dropping it waits for
+// that drop, rather than being created first and deleted by it. Not parallel: it replaces a package-level hook.
+func TestDB_ReprovisionWaitsForThePendingDrop(t *testing.T) {
+	assert := testarossa.For(t)
+
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	old, err := Open("sqlite", dsn)
+	if !assert.NoError(err) {
+		return
+	}
+
+	reached, release := make(chan struct{}), make(chan struct{})
+	hook := testingRetireHook
+	defer func() { testingRetireHook = hook }()
+	testingRetireHook = func() {
+		close(reached)
+		<-release
+	}
+	closed := make(chan error, 1)
+	go func() { closed <- old.Close() }()
+	<-reached
+	testingRetireHook = hook
+
+	provisioned := make(chan string, 1)
+	go func() {
+		again, err := CreateTestingDatabase("sqlite", "", t.Name())
+		assert.NoError(err)
+		provisioned <- again
+	}()
+	again := ""
+	select {
+	case again = <-provisioned:
+		t.Error("the database was provisioned again while its drop was pending")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	assert.NoError(<-closed)
+	if again == "" {
+		again = <-provisioned
+	}
+	assert.Equal(dsn, again)
+
+	fresh, err := Open("sqlite", again)
+	if !assert.NoError(err) {
+		return
+	}
+	defer fresh.Close()
+	_, err = fresh.Exec("CREATE TABLE after_reprovision (id INT)")
+	assert.NoError(err)
+	_, err = fresh.Exec("INSERT INTO after_reprovision VALUES (1)")
+	assert.NoError(err)
+	assert.True(testingDSNIsCached(testingDatabaseNameFor(t, again)))
+}
+
+// A handle opened on a testing database after it was dropped belongs to that dropped generation. Its last close,
+// after the database was provisioned again, must not drop the new generation or evict its DSN.
+func TestDB_StaleGenerationDropsNothing(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	name := testingDatabaseNameFor(t, dsn)
+	first, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	assert.NoError(first.Close()) // Drops the first generation
+
+	stale, err := Open("sqlite", dsn) // Opened without provisioning again
+	assert.NoError(err)
+	again, err := CreateTestingDatabase("sqlite", "", t.Name()) // The second generation
+	assert.NoError(err)
+	assert.Equal(dsn, again)
+	assert.NoError(stale.Close())
+	assert.True(testingDSNIsCached(name), "a stale handle evicted the new generation's DSN")
+
+	fresh, err := Open("sqlite", again)
+	assert.NoError(err)
+	assert.Equal(1, testingRefsOf(name))
+	assert.NoError(fresh.Close())
+	assert.False(testingDSNIsCached(name))
+}
+
+// testingDatabaseNameFor returns the database name a testing DSN names.
+func testingDatabaseNameFor(t *testing.T, dsn string) string {
+	t.Helper()
+	name, ok := testingDatabaseNameOf("sqlite", dsn)
+	if !ok {
+		t.Fatalf("not a testing DSN: %s", dsn)
+	}
+	return name
 }

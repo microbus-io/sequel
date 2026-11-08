@@ -1140,6 +1140,27 @@ second engine in a shared-database test failed at startup after the first had sh
 next `CreateTestingDatabase` with the same triple mint the database again, which is what asking for a testing
 database after releasing every handle on the previous one should mean.
 
+**Dropping and provisioning a name are serialized, and handles belong to a generation.** The last close used to
+decide and evict under `testingGlobalMutex`, then release it for the network `DROP`. A `CreateTestingDatabase` in
+that gap minted the same name again, and the pending `DROP` deleted the new database under its new handles - shown
+on CockroachDB, where it also pings fine afterwards. Two mechanisms close it, and each covers a case the other cannot:
+
+- **A per-database lifecycle lock** (`testingLifecycles`, by `testingDatabaseKey`) is held by the last close from its
+  decision through the `DROP`, and by provisioning from its `DROP IF EXISTS`/`CREATE` through publishing the DSN. A
+  re-provision therefore waits for a pending drop. The eviction still happens at the decision, under the global
+  mutex, so a cache hit cannot hand out the DSN in the meantime. The lock is per database, so no network I/O is done
+  under the global mutex. Lock order is `db.mutex`, then the lifecycle, then the global mutex; the master pool's
+  handles never take a lifecycle, since its DSN names no testing database.
+- **Generations** (`testingGenerations`). Each provisioning starts one, a handle records the one it was opened on
+  (`DB.testingGeneration`), and reference counts and SQLite anchors are kept per generation
+  (`testingGenerationKey`). A handle opened on a DSN after its database was dropped - from a cache hit taken just
+  before the eviction, or a DSN kept from earlier - counts toward the dropped generation. Its last close drops and
+  evicts nothing once a newer generation exists, which the lock alone could not prevent: the stale close comes after
+  the new provisioning, not during it.
+
+`testingRetireHook` holds a decided drop in place for `TestDB_ReprovisionWaitsForThePendingDrop`;
+`TestDB_StaleGenerationDropsNothing` covers the stale handle.
+
 The `DROP` runs under a 5s context timeout. The refcount means it normally runs uncontended, but a handle
 that never closes - a test binary that panicked - leaves the database in use and puts the server back into
 that block-until-it-gives-up state. Since the drop is best-effort either way (errors are swallowed, and
