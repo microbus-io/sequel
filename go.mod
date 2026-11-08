@@ -1,6 +1,6 @@
 module github.com/microbus-io/sequel
 
-go 1.26.0
+go 1.27.3
 
 tool github.com/microbus-io/copyrighter
 

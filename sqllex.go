@@ -25,7 +25,7 @@ import "strings"
 //     PostgreSQL E'...' string
 //   - "..." everywhere (an identifier, or a string on MySQL), doubled to escape, with backslashes on MySQL
 //   - `...` on MySQL, MariaDB and SQLite, and [...] on SQL Server and SQLite, with ]] escaping a bracket
-//   - -- to the end of the line, and /* ... */
+//   - -- to the end of the line (on MySQL and MariaDB, -- followed by whitespace, or #), and /* ... */
 //   - $tag$...$tag$ on PostgreSQL and CockroachDB, only when dollarQuotes is set
 //
 // An unterminated region runs to the end of s.
@@ -51,7 +51,9 @@ func skipNonCode(driverName, s string, i int, dollarQuotes bool) int {
 			}
 		}
 		return len(s)
-	case ch == '-' && strings.HasPrefix(s[i:], "--"):
+	case ch == '-' && strings.HasPrefix(s[i:], "--") && (!mysqlish || i+2 == len(s) || s[i+2] <= ' '),
+		ch == '#' && mysqlish:
+		// On MySQL and MariaDB, -- starts a comment only before whitespace (1--1 is arithmetic), and # starts one too
 		if j := strings.IndexByte(s[i:], '\n'); j >= 0 {
 			return i + j + 1
 		}

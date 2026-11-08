@@ -149,6 +149,14 @@ is a function's SQL, a migration may rely on `NOW_UTC()` inside one, and skippin
 the function runs. The placeholder conformer skips those bodies all the same, since a `?` there is never a parameter of
 the statement being sent. `TestVF_NotExpandedInsideStringsOrComments` and `TestVF_StringLiteralIsData` pin it.
 
+**Every scanner of SQL text uses `skipNonCode`**: finding a call's closing parenthesis (`findBalancedClose`), splitting
+its arguments (`topLevelCommas`, and `topLevelIn` for `REGEXP_TEXT_SEARCH`), conforming placeholders, and splitting and
+reading migrations. The argument scanners once skipped only `'` and `"`, so a `)` in a comment closed the call early and
+the expansion landed inside the comment, and a backslash-escaped MySQL quote ran a string past its end. An argument
+that ends in a line comment (`--`, or MySQL/MariaDB `#`) keeps its newline (`trimArg`), or the comment would swallow whatever the expansion writes
+after the argument. On MySQL and MariaDB a `--` is a comment only before whitespace (`1--1` is arithmetic) and `#` is
+one too, which `skipNonCode` follows. `TestVF_ArgumentsFollowTheLexer` and `TestVF_MySQLCommentRules` pin it.
+
 ## An expansion keeps its arguments in the order they were written
 
 MySQL, MariaDB and SQLite bind bare `?` in text order, and PostgreSQL and CockroachDB number `?` after expansion, so on
@@ -469,33 +477,19 @@ make the caller's `Commit`/`Rollback` responsible for releasing it, including on
 finalizes the transaction itself after a cancelled context - the bookkeeping is not worth it when `Transact` is the
 path that wants speed.
 
-### A batch is inside the no-partial-commit net
+### Batch error recording and lifecycle
 
-Every way a batch can fail reaches `Tx.recordErr` (`BatchResults.fail` records into the transaction): a statement
-error, a scan error (including a superseded read), a panic out of a statement (an argument Valuer - `run` notes that
-its statement never returned), and misuse. A pipelined statement's failure is recorded when a read or `Close`
-reaches it in queue order, as on the sequential path: recording it at `Send` would fail the reads of the statements
-before it, which succeeded. Once a `Transact` transaction is doomed - by a scan error, say - every later read and
-`Close` report it, on either path (`doomed`, checked by `advance` and `Close`). Misuse is the easy one to leave out,
-and each case is work that would otherwise silently not happen in a transaction that commits: a second `Send`, a
-statement queued after `Send`, a batch never sent (`Tx.unsentBatches`), and results never closed (`Tx.openBatch`
-still set) - `transactOnce`, and `Tx.Commit` itself, refuse to commit while either is outstanding. A statement queued
-after `Send` also sets `Tx.batchMisuse`, which `Tx.Commit` refuses on in a `BeginTx` transaction too, where nothing is
-recorded: otherwise the dropped statement committed silently. For the same reason a scan error fails the batch's
-results in either mode (`BatchRows.Scan` calls `fail`), so `Close` reports it as its godoc says. A batch on an
-already-doomed transaction short-circuits like any statement: `Send` touches nothing, and its reads and `Close`
-return the recorded error verbatim, which is why `fail` keeps an error the transaction already recorded as recorded
-and traces any other once, when it is stored. `sql.ErrNoRows` from a `QueryRow` is the one outcome that is not a
-failure, for the same reason `Row` exempts it. Reading past the last statement, or after `Close`, is an error of the
-read, not of a statement, and is not recorded.
+`BatchResults.fail` feeds the transaction's error slot and preserves an already-recorded error verbatim.
+Pipelined failures become visible in result order, not at Send, so earlier successful results stay readable.
+Once the transaction is doomed, `advance` and Close report its recorded error on either execution path.
 
-`Close` releases the transaction however it ends - its unread statements run inside it, and one whose argument
-panics would otherwise leave the transaction refusing every statement - so `abandon` is deferred.
+Commit checks `unsentBatches`, `openBatch` and `batchMisuse` even outside Transact: missing Send/Close or Queue
+after Send would otherwise silently discard work. Statement and scan errors fail the results in either mode;
+reading past the results is a read misuse, not a statement failure. Close defers `abandon` so a panicking
+argument Valuer cannot leave the transaction reserved for the batch.
 
-Arguments are positional. `database/sql` unwraps a `sql.NamedArg` for the driver and pgx's `Batch.Queue` does not,
-so a named argument would work on one path and fail on the other; `Send` rejects it up front instead.
-`sql.RawBytes` is rejected as a `QueryRow` destination for the reason `sql.Row` rejects it: the row is closed before
-the caller could read the bytes.
+Send rejects named arguments because database/sql unwraps them but pgx Batch.Queue does not. QueryRow rejects
+sql.RawBytes because its backing rows close before the caller can use them.
 
 ### What differs when pipelined, and why it is documented rather than hidden
 
@@ -535,118 +529,35 @@ seeded so the label is deterministic. A sequential batch is ordinary statements 
 
 ## `Tx` error recording and short-circuit
 
-In `Transact` mode (and only then - `BeginTx` callers are unaffected) a `Tx` records the **first**
-statement error and short-circuits every subsequent statement, returning that recorded error without
-touching the database. Three reasons, in priority order:
+`Transact` sets `autoErr`: the first error is recorded in `Tx.err`, later statements return it without I/O,
+and the transaction rolls back even if the closure ignores the error. This preserves the driver error needed
+for retry classification instead of masking it with a cascade error, and prevents partial commits on engines
+that leave a transaction usable after a statement fails. `BeginTx` does not enable recording.
 
-1. **Preserve the first, real error.** After a statement fails, the transaction is doomed: PostgreSQL
-   reports `current transaction is aborted, commands ignored until end of block` on the next statement,
-   SQL Server (under `XACT_ABORT ON`) has rolled back, and the eventual `Commit` throws its own error.
-   These cascade errors *mask* the original one. Freezing at the first error lets `Transact` classify it
-   (`IsLockContentionError`) and decide whether to retry. Without this, a deadlock looks like an
-   un-retryable commit failure.
+All statement paths must participate, including prepared-statement executions and deferred row errors:
 
-2. **Enforce no partial commits, portably.** Recording the error is what makes `Transact` refuse to
-   commit. Short-circuiting is what makes that safe on drivers that do **not** auto-abort on a statement
-   error - notably MySQL, where statements after a failure would otherwise keep executing and succeeding,
-   building up state that only the final rollback undoes. Short-circuit makes "first error wins, nothing
-   after it runs" a hard, dialect-independent rule, so a closure that ignores a statement's error can
-   never commit half its work.
+- `Rows` records Scan failures and streaming errors when Next or NextResultSet returns false. A healthy drain
+  or deliberate early break records nothing. `fixtures/rows_test.go` covers ignored scan errors and healthy reads.
+- `Row` records Scan/Err failures except `sql.ErrNoRows`, which is normal control flow a caller may handle and
+  commit after (`TestTransact_CommitsOnErrNoRows`). An unpack failure must return a `shortErr` Row rather than
+  execute an empty query: some drivers report that as `ErrNoRows`, bypassing recording
+  (`TestTransact_QueryRowUnpackErrorIsNotErrNoRows`).
+- `Stmt` executions use the same guard and recording, whether prepared through Tx or rebound with Tx.Stmt.
+  DB-prepared statements read telemetry and latency live; Tx-bound statements use the transaction's snapshots.
+  Raw `sql.Conn` operations are outside this boundary.
 
-3. **Avoid pointless round-trips** on a transaction that is going to roll back regardless.
+`Tx.mu` protects the first error and batch bookkeeping. Do not call into batch execution with it held;
+Rollback snapshots the open batch under the lock and abandons it afterward. `TestTx_ConcurrentUseIsRaceFree`
+protects concurrent statement use. Batch-specific refusal and result-order rules are recorded in the batch section.
 
-Recording is opt-in via an internal `autoErr` flag set only by `Transact`; a `Tx` from `BeginTx` records
-nothing and short-circuits nothing, so existing direct-transaction callers see identical behavior.
-`Tx.Err()` exposes the recorded error for callers that want to inspect it.
+## A closed `DB` keeps its closed pool
 
-The recorded error and the batch bookkeeping (`unsentBatches`, `batchMisuse`, `openBatch`, `batchExecuting`) sit
-behind `Tx.mu`. `sql.Tx` may be used from several goroutines, and this file's own `Tx.done` reasoning promises the
-shadow is as safe; a plain `err` field raced under `-race` as soon as two statements of one closure ran concurrently,
-and could lose the first error. Nothing is called with `mu` held - `Rollback` takes the open batch under it and
-abandons it after - so a statement issued by the batch itself cannot deadlock on it.
-`TestTx_ConcurrentUseIsRaceFree` pins it.
-
-### The "no partial commit" guarantee extends to row reads (`Rows`)
-
-The statement-level recording above covers `Exec`/`Query`/`InsertReturnID` - the errors returned when a
-statement is *issued*. It did **not** originally cover the errors that surface *while iterating a result
-set*: a mid-stream `rows.Scan` failure or a streaming error reported by `rows.Err()` (a connection drop
-mid-fetch, a type-conversion failure on a row). Those are invisible to the issuing call, so a closure that
-looped over rows and forgot to check `rows.Err()` could build state from a **truncated read** and commit
-it - the one hole in the "a closure that ignores an error can never commit half its work" promise. It is not
-hypothetical: a consumer committed state merged from a partial read, because a loop over a result set dropped a
-row error.
-
-`Query`/`QueryContext` therefore return a **`sequel.Rows`** (embeds `*sql.Rows`, so `for rows.Next() {
-rows.Scan(...) }` / `rows.Err()` / `rows.Close()` are unchanged - same source-compat shape as `Row`). In
-`Transact` (`autoErr`) mode it **latches** a `Scan` error, and the `rows.Err()` observed when `Next()`
-returns false, into the same recorded-error slot as a statement error - so the transaction refuses to
-commit and the subsequent statements short-circuit, exactly as for a failed `Exec`. The latch fires only
-on a real error: draining a healthy result set latches a nil `rows.Err()` (no-op), and an early `break`
-(where `Next()` is still returning `true`) latches nothing - a streaming error would itself have made
-`Next()` return `false`. `NextResultSet` latches on the same rule as `Next` - running out of result sets is
-a nil `rows.Err()` (no-op), a failed advance is not - so a multi-result-set consumer is not a side door
-around the latch. Outside `Transact` - a `*DB` query or a `BeginTx` `Tx` - `recordErr` is nil and
-`Rows` is a pure passthrough, so direct callers are unaffected (same opt-in boundary as statement
-recording). `fixtures/rows_test.go` pins both halves: an ignored `Scan` error rolls the closure's write back; a healthy
-full drain commits.
-
-### `Row` latches too - but must exempt `sql.ErrNoRows`
-
-`Row` (from `QueryRow`) carries the same latch, for the same reason: a closure that drops a
-`QueryRow(...).Scan` error can otherwise commit work built on a row it never read. The argument that it
-need not - that a `QueryRow` error is checked at the call site rather than deferred behind an iteration
-loop - is weaker than it looks, since `if err != nil { /* skip */ }` reproduces the truncated-read failure above
-exactly.
-
-The asymmetry with `Rows` is not *whether* to latch but *what*. `Rows` can latch unconditionally because an
-empty result set is `Next()` returning false, never an error. For `Row`, "no row" arrives **as an error** -
-`sql.ErrNoRows` - and handling it is routine control flow (`if err == sql.ErrNoRows { ...default... }`). A
-`Row` that latched it would doom every transaction that legitimately defaults a missing row, so the
-exemption is load-bearing, not a nicety, and `TestTransact_CommitsOnErrNoRows` pins it. Every other error -
-deadlock, type-conversion failure, connection drop - latches.
-
-Note that the latch is the *second* net for deadlock retry, not the first. `transactOnce` returns whichever
-of `fn`'s error or `tx.err` is non-nil, so a deadlock on a `QueryRow` the closure **returns** was always
-retried correctly; the latch only extends that to closures that drop the error.
-
-### `QueryRow` short-circuits like every other statement method
-
-`QueryRow`/`QueryRowContext` originally skipped the `shortCircuit()` guard that `Exec`/`Query`/`Prepare`/
-`InsertReturnID` all open with - an oversight, not a decision. Without it, a `QueryRow` issued after the
-transaction is already doomed still goes to the database and comes back with a driver cascade error
-(`current transaction is aborted...` on PostgreSQL), which is exactly the masking the recorded-error design
-exists to prevent. Because the guard must return a `*Row` rather than an `error`, a short-circuited `Row`
-carries the recorded error in a `shortErr` field with a **nil embedded `*sql.Row`**, and `Scan`/`Err`
-report it without touching the database or starting a span (consistent with short-circuited statements
-emitting no telemetry). `TestTransact_QueryRowShortCircuits` asserts the *first* error surfaces verbatim.
-
-A `QueryRow` whose statement failed to unpack (a malformed virtual function) returns the same kind of `Row`, carrying
-the unpack error, recorded into the transaction. It used to run an empty statement in its place and let the driver
-complain at `Scan`, which SQLite, and pgx and SQL Server without arguments, answer as `sql.ErrNoRows` - the one error
-the latch exempts - so a closure that defaulted a missing row committed. `TestTransact_QueryRowUnpackErrorIsNotErrNoRows`
-pins it.
-
-### Prepared statements are inside the net (`Stmt`)
-
-A raw `*sql.Stmt` from `Tx.Prepare` was the last way out of the guarantee: the *prepare* error was
-recorded, but the statement's *executions* talked to the driver directly, so a closure that executed a
-prepared statement and ignored the error could still commit its other work on the engines that do not
-auto-abort (MySQL, SQLite). The promoted `sql.Tx.Stmt`/`StmtContext` were the same hole by another door.
-`Prepare` therefore returns a **`sequel.Stmt`** (embeds `*sql.Stmt` - same source-compat shape as `Rows`
-and `Row`), whose executions short-circuit, record errors, pay the simulated round trip, and emit
-spans/metrics exactly like a statement issued through the `Tx` - and whose `Query`/`QueryRow` hand out the
-same latching `Rows`/`Row`.
-
-`DB.Prepare` returns the same type even though there is no latch outside a transaction, because the
-`Executor` interface requires `DB` and `Tx` to agree on the signature - and because a DB-prepared statement
-is the natural argument to `Tx.Stmt`, which re-binds it (`stmt.pq` carries the unpacked statement; only the
-tx binding changes). This is also why `Tx.Stmt` takes a `*sequel.Stmt` rather than `*sql.Stmt`: the common
-flow `db.Prepare` -> `tx.Stmt(stmt)` must keep compiling. A DB-bound `Stmt` reads telemetry and the
-simulated delay *live* per execution (matching `DB` methods); a Tx-bound one uses the transaction's
-snapshots (matching `Tx` methods, one consistent latency per transaction). `Stmt.Close` stays a
-passthrough - releasing the handle is lifecycle, not caller-facing work. Statements executed on a
-`*sql.Conn` remain outside sequel's path; that is documented, not enforced.
+`Close` once set the embedded `*sql.DB` to nil, so any call after it - or racing it - dereferenced nil instead of
+returning `database/sql`'s closed-database error, and a reopened singleton wrote the same field while stragglers read
+it. The embedded pointer is now written only before the `*DB` is handed out. The last `Close` sets `closed` and closes
+the pool in place; a closed singleton leaves `singletonsMap`, and the next `OpenSingleton` makes a new `*DB`
+(`OpenSingleton` loops if it looked one up just as it closed). Lock order is `db.mutex` then `singletonMutex`, and
+`OpenSingleton` never holds both. `TestDB_ClosedDBFailsWithoutPanicking` and `TestDB_CloseRacesQueries` pin it.
 
 ## Error wrapping (`traceErr`)
 
@@ -737,18 +648,42 @@ arguments. Caching gives the same steady-state saving with immutable strings.
 
 ## `Migrate` runs a migration only while it holds the lock
 
-A migration runs in a goroutine while `Migrate` extends its 15-second lock every 5 seconds. When an extension fails
-(not contention, which is retried, but a lost connection, say), the lock will lapse and another runner may take it.
-`Migrate` used to give the lock up and return at once, leaving the goroutine executing statements - so two runners
-ran one migration concurrently, and the goroutine then blocked forever on an unbuffered channel. It now cancels the
-run's context and waits for the goroutine before releasing the lock, and the channel is buffered. Cancelling stops
-the statements after the one in flight; whether the in-flight one stops is the driver's and server's business (MySQL
-closes the connection, and the server may finish a DDL anyway). `migrationLockRenewal` and `extendMigrationLock` are
-variables so that `TestMigrate_StopsWhenItsLockCannotBeExtended` can make the renewal fail.
+A migration runs in a goroutine while `Migrate` extends its 15-second lock every 5 seconds. Three things keep a second
+runner from running it too, each the fix for a way it once did:
 
-Statements are split at a `;` that ends a line, and their `--` comments are stripped by `stripLineComments`, which
-leaves a `--` inside a quoted string alone; `strings.Cut` on each line once truncated `'a--b'`. A comment after a `;`
-on the same line keeps that `;` from ending the statement, so comments go on their own lines or before the `;`.
+- **The extension does not share the caller's pool** (`openLeasePool`). It once ran on the same pool as the
+  migration, so with `SetMaxOpenConns(1)` a long statement held the only connection, the extension waited for it, and
+  the lease lapsed while the first runner was still at work; a second runner took it and both ran the migration. The
+  lease pool is a second `*sql.DB` on the same DSN, capped at one connection and closed when `Migrate` returns. It is
+  not opened with `Open`, so closing it releases no testing database, and it borrows the caller's telemetry. A private
+  in-memory SQLite database (no `cache=shared`) cannot be reached from another pool, and no other runner can reach it
+  either, so its lock is extended on the caller's pool. `TestMigrate_ExtendsItsLockWhileHoldingEveryConnection` fails
+  with a shared pool.
+- **Each extension must succeed before the lease it extends lapses.** It runs under a deadline of the last lease's
+  start plus 15s, less a 2s margin, taken from before the statement that set it, so the local deadline is never later
+  than the server's. An extension that fails or misses the deadline cancels the run's context and waits for the
+  goroutine before giving the lock up. Cancelling stops the statements after the one in flight; whether the
+  in-flight one stops is the driver's and server's business (MySQL closes the connection, and the server may finish
+  a DDL anyway). That in-flight statement is the one remaining way two runners can overlap; nothing short of a
+  server-side lock held for the statement's lifetime prevents it.
+- **The lock has an owner** (`locked_by`, a random token per `Migrate` call). Extending, releasing and completing are
+  conditional on the lock still naming the runner, so a runner that lost its lock - a process paused past its lease,
+  say - fails with `errMigrationLockLost` rather than recording the migration as done. MySQL counts only the rows an
+  update changed, so no rows affected is confirmed by reading the lock (`migrationLockHeld`). A table made by an
+  earlier version gains the column on first use (`createMigrationsTable`), tested by selecting it, since MySQL and
+  SQLite have no `ADD COLUMN IF NOT EXISTS`. `TestMigrate_DoesNotCompleteALostLock` and
+  `TestMigrate_AddsTheOwnerColumnToAnOldTable` pin it.
+
+`migrationLockRenewal` and `extendMigrationLock` are variables so that tests can make the renewal fail.
+
+**Statements are split at a `;` that ends a line, outside strings, quoted identifiers, block comments and
+dollar-quoted bodies** (`splitMigration`). Splitting the raw text on `;\n` broke a string holding a line-ending `;`
+into two invalid statements after the ones before it had run. A `;` at the end of a `--` comment line still ends the
+statement, because it always did and a migration may rely on it; a comment after a `;` on the same line keeps that
+`;` from ending the statement. A `-- DRIVER:` directive counts only as a comment (`migrationDriverDirective`): found
+anywhere in the text, one inside a string literal skipped its statement and the migration was recorded as done.
+`--` comments are stripped by `stripLineComments`, which leaves one inside a quoted string alone. Whitespace inside a
+statement is no longer trimmed line by line, since that rewrote multi-line string literals.
 
 ## Hardening against uncontrolled input
 
@@ -766,11 +701,9 @@ Four places carry input sequel does not control:
   else is left alone. A name that fails the match is by definition not sequel's leftover, so refusing to
   drop it costs nothing. The auto-drop on `Close` (`testingDatabaseNameOf`) applies the same full match: it
   once checked only the `testing_NN_` prefix before splicing the name into its `DROP`.
-- **DSNs quoted in error messages** are redacted first (`redactDataSourceName`): a DSN carries a password,
-  and parse errors end up in the caller's logs. Both credential spellings are masked - URL userinfo
-  (`://user:pass@`) and the mysql form (`user:pass@tcp(...)`), plus ADO-style `password=`/`pwd=` params.
-  The mysql pattern is greedy to the *last* `@`, mirroring how the mysql driver itself splits the DSN, so
-  a password containing `@` over-redacts rather than leaks a suffix.
+- **DSN parse errors omit both the DSN and parser error text** (`dsnParseError`). Parser errors can echo
+  credentials, and malformed input cannot be reliably redacted across URL, keyword, ADO and ODBC grammars.
+  Report only the driver; do not wrap the original error or reintroduce a best-effort redactor.
 - **`db.operation.name` is bounded, not curated** - see the section below.
 - **`InsertReturnID`'s idColumn** is spliced into the statement (`RETURNING <col>` on PostgreSQL/
   CockroachDB, `OUTPUT INSERTED.<col>` on SQL Server), so it must match `identifierPattern`
@@ -899,8 +832,9 @@ per-span text volume on every operation. The full parameterized statement is ava
 per-query Debug log (below), where the caller's logger level decides whether to pay for it. There was once a
 `SetVerbose` switch that attached `db.query.text` to spans and force-enabled the Debug log; it was removed
 because it duplicated `slog`'s own level filtering and put text on spans that the parent span already
-distinguishes. (Statement text is never a privacy risk either way: sequel always parameterizes arguments, so
-the text holds only `?`/`$1` placeholders, never argument values.)
+distinguishes. Leaving text off spans keeps their volume down; it is not a redaction guarantee. Bound arguments
+are not recorded directly. Literals remain in Debug query text, and driver errors recorded on spans and in Debug
+logs can expose bound values, such as a duplicate key.
 
 ### Lock contention is classified once, centrally
 
@@ -985,16 +919,12 @@ explicitly stores the result as `*sql.Row` must change. The trade-off, documente
 measured until `Scan`, and a `Row` whose `Scan`/`Err` is never called leaves its span unended - the same
 resource-leak shape as an unscanned `sql.Row`.
 
-### Logs never carry operation errors
+### Operation errors are not logged above Debug
 
-Traces and metrics record per-operation errors (span error status; `status=error` on the duration
-histogram); `slog` does **not**. Every error is returned to the caller, who will log it - having the library
-log it too would double every failure in operators' logs. Logging is reserved for what the caller cannot
-already see at the call site: one-off lifecycle events (each migration as it is attempted, at Info) and
-per-query Debug lines. The Debug lines are gated on `logger.Enabled(ctx, slog.LevelDebug)`, so the caller's
-own logger level - not a separate sequel switch - decides whether to pay for per-query logging, and the gate
-keeps the string-building cost off the hot path when Debug is disabled. `Migrate` logs at *attempt* time
-regardless of outcome, so the log shows what was tried even when the migration then fails.
+Callers own error logging, so sequel emits no Warn/Error log for a failed operation. Debug query lines include
+statement and error text; gate them with `logger.Enabled` before building attributes. Migrate logs attempts at
+Info regardless of outcome. Traces record error messages and metrics record error status independently of the
+logger's level.
 
 ## Simulated network latency (`DB.SimulateRTT`, `rtt.go`)
 
@@ -1155,9 +1085,15 @@ count shared between them dropped one while it was in use.
 **Names are unique per process.** A testing database is `testing_HH_<token>_<base>_<test>`, where the token is six
 random characters drawn once per process (`testingProcessToken`). Without it, `go test ./...` - which runs packages
 as parallel processes - minted the same name for two packages' tests of the same name, and the second's
-`DROP DATABASE IF EXISTS` dropped the first's database mid-run. A name longer than 63 characters (PostgreSQL's
-identifier limit; MySQL refuses one over 64) keeps its first 54 and ends with `_` and eight hex digits of a hash of
-the whole, so it stays unique and within the leftover pattern.
+`DROP DATABASE IF EXISTS` dropped the first's database mid-run.
+
+**Names end in a hash of the cache key**: `testing_HH_<token>_<readable>_<hash>`, where the readable part is the base
+database name and test ID sanitized to `[a-z0-9_]`, cut to fit 63 characters (PostgreSQL's identifier limit; MySQL
+refuses one over 64). Sanitizing is lossy - `Review/a`, `Review_a` and `review_a` all read `review_a` - so without the
+hash those tests shared one database, and a second one's `DROP DATABASE IF EXISTS` could drop it under the first. A
+hash of the sanitized name would collide the same way; the cache key is the identity the cache already tells apart
+(Go driver, base, raw test ID), so MySQL and MariaDB, or PostgreSQL and CockroachDB, still share a database where they
+should. `TestDB_TestingDatabaseNamesDoNotCollide` pins it.
 
 Only handles that will actually attempt the drop are counted. `OpenSingleton` coalesces by DSN, so its extra
 callers share one `*DB` and ride `DB.refCount`; their `Close` never reaches the drop path. Counting them
@@ -1193,6 +1129,12 @@ already keep with their `DROP`. Do not pin through a handle's own pool (an idle-
 `TestDB_TestingDatabaseOutlivesItsConnections`.
 
 A plain in-memory SQLite DSN that is not a testing database is not anchored: its lifetime is the caller's.
+
+**A SQLite base becomes a `file:` URI with `mode=memory&cache=shared`** (`sqliteTestingBase`), whatever its shape,
+replacing any other `mode` or `cache` and keeping the rest. A bare `:memory:` or `example.db` base once lost its
+parameters when the testing name replaced its path, leaving a DSN that named a file and that no driver inference
+recognized; a base with only one of the two settings kept it, so `mode=memory` without a shared cache gave each
+connection its own empty database. `TestDB_SQLiteTestingDatabaseIsSharedMemory` pins it.
 
 ### Unit tests in the root package, integration tests under `fixtures/`
 

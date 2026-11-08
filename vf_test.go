@@ -410,3 +410,60 @@ func TestVF_NotExpandedInsideStringsOrComments(t *testing.T) {
 		}
 	}
 }
+
+// A virtual function's arguments are scanned with the rules that find the function: a parenthesis or a comma in a
+// comment, a quoted identifier or a backslash-escaped MySQL string neither closes the call nor separates arguments,
+// and an argument ending in a -- comment keeps the newline that ends it.
+func TestVF_ArgumentsFollowTheLexer(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	q, err := callExpand("pgx", "SELECT DATE_ADD_MILLIS('2020-01-01', /* ) */ 1000)")
+	assert.NoError(err)
+	assert.Equal("SELECT ('2020-01-01' + MAKE_INTERVAL(secs => (/* ) */ 1000) / 1000.0))", q)
+
+	q, err = callExpand("pgx", "SELECT DATE_DIFF_MILLIS(a /* , */, b)")
+	assert.NoError(err)
+	assert.Equal("SELECT (EXTRACT(EPOCH FROM (a /* , */ - b)) * 1000.0)", q)
+
+	q, err = callExpand("pgx", "SELECT DATE_ADD_MILLIS(a, 1000 -- a comment, with a comma )\n) FROM t")
+	assert.NoError(err)
+	assert.Equal("SELECT (a + MAKE_INTERVAL(secs => (1000 -- a comment, with a comma )\n) / 1000.0)) FROM t", q)
+
+	q, err = callExpand("mysql", `SELECT DATE_DIFF_MILLIS('it\'s (', b)`)
+	assert.NoError(err)
+	assert.Equal(`SELECT (-TIMESTAMPDIFF(MICROSECOND, 'it\'s (', b) / 1000.0)`, q)
+
+	q, err = callExpand("mssql", "SELECT LIMIT_OFFSET([a,b)], 5)")
+	assert.NoError(err)
+	assert.Equal("SELECT OFFSET 5 ROWS FETCH NEXT [a,b)] ROWS ONLY", q)
+
+	q, err = callExpand("mysql", "SELECT REGEXP_TEXT_SEARCH(? IN CONCAT(a, b), `x,y`, 'p IN q')")
+	assert.NoError(err)
+	assert.Equal("SELECT (CONCAT_WS(' ',CONCAT(a, b),`x,y`,'p IN q') REGEXP ?)", q)
+}
+
+// On MySQL and MariaDB, -- is a comment only before whitespace, and # is one too.
+func TestVF_MySQLCommentRules(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	q, err := callExpand("mysql", "SELECT 1--1, NOW_UTC()")
+	assert.NoError(err)
+	assert.Equal("SELECT 1--1, (UTC_TIMESTAMP(3))", q)
+	q, err = callExpand("mysql", "SELECT 1 -- NOW_UTC()\n")
+	assert.NoError(err)
+	assert.Equal("SELECT 1 -- NOW_UTC()\n", q)
+	q, err = callExpand("mariadb", "SELECT 1 # NOW_UTC()\n, NOW_UTC()")
+	assert.NoError(err)
+	assert.Equal("SELECT 1 # NOW_UTC()\n, (UTC_TIMESTAMP(3))", q)
+	q, err = callExpand("pgx", "SELECT 1--NOW_UTC()\n")
+	assert.NoError(err)
+	assert.Equal("SELECT 1--NOW_UTC()\n", q)
+
+	for _, driver := range []string{"mysql", "mariadb"} {
+		q, err := callExpand(driver, "SELECT DATE_ADD_MILLIS(a, 1000 # comment , )\n)")
+		assert.NoError(err)
+		assert.Equal("SELECT DATE_ADD(a, INTERVAL (1000 # comment , )\n) * 1000 MICROSECOND)", q)
+	}
+}

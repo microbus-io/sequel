@@ -175,7 +175,7 @@ func TestErrors_IsUndefinedTableError(t *testing.T) {
 		"connection refused",
 		"SQL logic error: no such column: name (1)",
 		"SQLITE_BUSY: database is locked",
-		`ERROR: missing FROM-clause entry for table "f" (SQLSTATE 42P01)`,                  // PostgreSQL
+		`ERROR: missing FROM-clause entry for table "f" (SQLSTATE 42P01)`, // PostgreSQL
 		`ERROR: invalid reference to FROM-clause entry for table "users" (SQLSTATE 42P01)`, // PostgreSQL
 		`ERROR: no data source matches prefix: f in this context (SQLSTATE 42P01)`,         // CockroachDB
 		`ERROR: no data source matches pattern: f.* (SQLSTATE 42P01)`,                      // CockroachDB

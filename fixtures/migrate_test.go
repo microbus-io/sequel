@@ -166,3 +166,24 @@ func TestMigrate_KeepsDashesInStrings(t *testing.T) {
 	assert.NoError(db.QueryRow("SELECT v FROM dashes").Scan(&v))
 	assert.Equal("a--b", v)
 }
+
+// TestMigrate_SemicolonsAndDirectivesInStrings runs a migration whose string literals hold a line-ending ";" and a
+// "-- DRIVER:" marker. Neither is SQL: the first must not end its statement, and the second must not skip it.
+func TestMigrate_SemicolonsAndDirectivesInStrings(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB(t)
+	fs := fstest.MapFS{"1.literals.sql": {Data: []byte(
+		"CREATE TABLE literals (id INT, v VARCHAR(64));\n" +
+			"INSERT INTO literals (id, v) VALUES (1, 'first;\nsecond');\n" +
+			"INSERT INTO literals (id, v) VALUES (2, '-- DRIVER: none');\n")}}
+	if !assert.NoError(db.Migrate(t.Name(), fs)) {
+		return
+	}
+	var v string
+	assert.NoError(db.QueryRow("SELECT v FROM literals WHERE id=1").Scan(&v))
+	assert.Equal("first;\nsecond", v)
+	assert.NoError(db.QueryRow("SELECT v FROM literals WHERE id=2").Scan(&v))
+	assert.Equal("-- DRIVER: none", v)
+}

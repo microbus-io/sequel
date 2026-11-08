@@ -671,19 +671,13 @@ func instrumentTxEnd(t *telemetry, rtt time.Duration, ctx context.Context, drive
 }
 
 /*
-Row shadows *sql.Row so sequel can observe a single-row query and latch its error into a [DB.Transact]-managed
-transaction. database/sql does not surface a QueryRow error until Scan, so Row records the operation's
-duration, classifies lock contention, and ends the span when the caller calls Scan (or Err). It embeds
-*sql.Row, so the common QueryRow(...).Scan(...) call site is unchanged; only code that explicitly stores the
-result as *sql.Row needs adjustment.
+Row shadows *sql.Row. database/sql reports a QueryRow error only at Scan, so the operation's span and duration
+end when the caller calls Scan (or Err). It embeds *sql.Row, so the common QueryRow(...).Scan(...) call site is
+unchanged; only code that explicitly stores the result as *sql.Row needs adjustment.
 
-In Transact (autoErr) mode Scan/Err also latch the error into the transaction, exactly as [Rows] does for a
-streamed read, so a closure that ignores a QueryRow error cannot commit work built on a row it never read.
-[sql.ErrNoRows] is deliberately exempt: unlike a Rows iteration, where an empty result set is simply Next
-returning false, "no row" reaches a QueryRow caller as an error and is routine control flow
-(`if err == sql.ErrNoRows { ...default... }`). Latching it would doom every transaction that legitimately
-handles a missing row. Every other error - deadlock, type-conversion failure, connection drop - is latched.
-Outside a Transact-managed Tx no latching occurs.
+Inside a [DB.Transact] transaction, an error from Scan or Err is recorded like a statement error, so the
+transaction will not commit - except [sql.ErrNoRows], which is an ordinary outcome a caller may handle and
+commit after. Outside a Transact-managed Tx nothing is recorded.
 
 Always call Scan. As with *sql.Row, only Scan releases the connection: Err ends the span and reports the
 query's error, but after a successful query the connection stays held until Scan is called. A Row that is

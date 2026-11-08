@@ -18,6 +18,7 @@ package sequel
 
 import (
 	"context"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -125,7 +126,11 @@ type DB struct {
 	dataSourceName string
 	singletonKey   string
 	refCount       int
-	mutex          sync.Mutex
+	// closed is set, under mutex, when the last handle closes. The embedded *sql.DB is never replaced once set,
+	// since its readers take no lock: a closed singleton leaves the singleton map, and the next opener makes a
+	// new *DB.
+	closed bool
+	mutex  sync.Mutex
 	// pool mirrors the embedded *sql.DB for the pool-stats callback, which must not take mutex: OTel holds its
 	// own lock while it runs the callback, and SetMeterProvider holds mutex while it takes that lock.
 	pool      atomic.Pointer[sql.DB]
@@ -219,19 +224,28 @@ func OpenSingleton(driverName string, dataSourceName string) (db *DB, err error)
 	}
 	singletonKey := hashStr(driverName + "|" + dataSourceName)
 
-	singletonMutex.Lock()
-	singletonDB, ok := singletonsMap[singletonKey]
-	if !ok {
-		singletonDB = &DB{
-			driverName:     driverName,
-			dataSourceName: dataSourceName,
-			singletonKey:   singletonKey,
+	var singletonDB *DB
+	for {
+		singletonMutex.Lock()
+		var ok bool
+		singletonDB, ok = singletonsMap[singletonKey]
+		if !ok {
+			singletonDB = &DB{
+				driverName:     driverName,
+				dataSourceName: dataSourceName,
+				singletonKey:   singletonKey,
+			}
+			singletonsMap[singletonKey] = singletonDB
 		}
-		singletonsMap[singletonKey] = singletonDB
-	}
-	singletonMutex.Unlock()
+		singletonMutex.Unlock()
 
-	singletonDB.mutex.Lock()
+		singletonDB.mutex.Lock()
+		if !singletonDB.closed {
+			break
+		}
+		// Closed by its last holder after it was looked up; the map no longer holds it
+		singletonDB.mutex.Unlock()
+	}
 	defer singletonDB.mutex.Unlock()
 	if singletonDB.DB != nil {
 		singletonDB.refCount++
@@ -504,13 +518,15 @@ func isFromClauseEntryMessage(msg string) bool {
 // cleanup, making [CreateTestingDatabase]-provisioned databases self-cleaning on
 // test teardown. Last across every handle on that database, not just this one:
 // [Open] hands out a *DB per call, so several may share one testing database.
+//
+// Once the last handle is closed, operations on the *DB fail as they do on a closed [sql.DB].
 func (db *DB) Close() (err error) {
 	if db == nil {
 		return nil
 	}
 	db.mutex.Lock()
 	defer db.mutex.Unlock()
-	if db.DB == nil || db.refCount == 0 {
+	if db.DB == nil || db.closed {
 		return nil
 	}
 	db.refCount--
@@ -520,8 +536,17 @@ func (db *DB) Close() (err error) {
 			_ = reg.Unregister()
 		}
 		db.pool.Store(nil)
+		// The closed *sql.DB stays in place, so that a later call reports a closed database rather than
+		// dereferencing nil; a reopened singleton is a new *DB
+		db.closed = true
+		if db.singletonKey != "" {
+			singletonMutex.Lock()
+			if singletonsMap[db.singletonKey] == db {
+				delete(singletonsMap, db.singletonKey)
+			}
+			singletonMutex.Unlock()
+		}
 		err = db.DB.Close()
-		db.DB = nil
 		db.maybeDropTestingDatabase()
 	} else {
 		db.adjustConnectionLimits()
@@ -662,10 +687,10 @@ func (db *DB) SetMeterProvider(mp metric.MeterProvider) {
 	db.telemetry.Store(nt)
 }
 
-// SetLogger attaches an slog.Logger. The library does not log operation errors (they are returned to the
-// caller, who logs them); it logs one-off events such as schema migrations at Info, and - when the logger
-// is enabled at Debug level - each query at Debug. Per-query logging is therefore controlled by the
-// logger's own level, not a separate switch. A freshly opened *DB uses a discard logger; pass nil here to
+// SetLogger attaches an slog.Logger. Errors are returned to the caller, who logs them, so nothing is logged above
+// Debug for one; sequel logs one-off events such as schema migrations at Info, and - when the logger is enabled at
+// Debug level - each query at Debug, with its statement text and any error message. Per-query logging is therefore
+// controlled by the logger's own level, not a separate switch. A freshly opened *DB uses a discard logger; pass nil here to
 // revert to that discard logger (disabling logging).
 func (db *DB) SetLogger(logger *slog.Logger) {
 	if logger == nil {
@@ -777,7 +802,7 @@ func (db *DB) PrepareContext(ctx context.Context, query string) (*Stmt, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Stmt{Stmt: sqlStmt, pq: pq, driverName: db.driverName, db: db}, nil
+	return &Stmt{Stmt: sqlStmt, pq: pq, db: db}, nil
 }
 
 // Ping shadows sql.DB.Ping so a simulated round-trip delay ([DB.SimulateRTT]) applies to it: a ping is a
@@ -1043,28 +1068,10 @@ func injectOutputInserted(stmt string, idColumn string) (string, error) {
 // multi-statement batches - fails the match and is left alone rather than escaped.
 var leftoverTestingDatabasePattern = regexp.MustCompile(`^testing_[0-2][0-9]_[a-z0-9_]*$`)
 
-// dsnURLCredentialsPattern matches the userinfo of a URL-form DSN (postgres://user:pass@host). The password match is
-// greedy to the last '@', so a raw '@' or '/' in a password is fully redacted rather than partially leaked, at the
-// cost of masking more than the password when the query holds an '@'. The user name may be empty.
-var dsnURLCredentialsPattern = regexp.MustCompile(`://([^:/@?]*):(.*)@`)
-
-// dsnMySQLCredentialsPattern matches the credentials of a mysql-form DSN (user:pass@tcp(host)/db).
-// The password match is greedy to the last '@', mirroring how the mysql driver itself splits the DSN,
-// so a password containing '@' is fully redacted rather than partially leaked.
-var dsnMySQLCredentialsPattern = regexp.MustCompile(`^([^:@/]+):(.*)@`)
-
-// dsnPasswordParamPattern matches a password passed as a key=value parameter (ADO-style SQL Server DSNs).
-var dsnPasswordParamPattern = regexp.MustCompile(`(?i)(password|pwd)=[^;& ]*`)
-
-// redactDataSourceName masks the credentials in a DSN so it can be quoted in an error message. DSNs carry
-// passwords, and errors end up in the caller's logs - a raw DSN in an error is a credential leak.
-func redactDataSourceName(dsn string) string {
-	if strings.Contains(dsn, "://") {
-		dsn = dsnURLCredentialsPattern.ReplaceAllString(dsn, "://$1:***@")
-	} else {
-		dsn = dsnMySQLCredentialsPattern.ReplaceAllString(dsn, "$1:***@")
-	}
-	return dsnPasswordParamPattern.ReplaceAllString(dsn, "$1=***")
+// dsnParseError omits the DSN and parser error: either can contain credentials, and malformed input
+// cannot be reliably redacted across the supported DSN grammars.
+func dsnParseError(driverName string) error {
+	return errors.New("error parsing %s data source name", driverName)
 }
 
 // databaseNameFromDataSourceName extracts the database name part of the data source name.
@@ -1076,28 +1083,28 @@ func databaseNameFromDataSourceName(driverName string, dsn string) (databaseName
 	case "mysql", "mariadb":
 		cfg, err := mysql.ParseDSN(trimMySQLScheme(dsn))
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
+			return "", dsnParseError(driverName)
 		}
 		return cfg.DBName, nil
 	case "pgx", "cockroachdb":
 		_, err = pgx.ParseConfig(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
+			return "", dsnParseError(driverName)
 		}
 		u, err := url.Parse(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
+			return "", dsnParseError(driverName)
 		}
 		return strings.TrimPrefix(u.Path, "/"), nil
 	case "mssql":
 		// https://github.com/microsoft/go-mssqldb?tab=readme-ov-file#common-parameters
 		_, _, err = msdsn.Parse(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
+			return "", dsnParseError(driverName)
 		}
 		u, err := url.Parse(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
+			return "", dsnParseError(driverName)
 		}
 		return u.Query().Get("database"), nil
 	case "sqlite":
@@ -1122,7 +1129,7 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 	case "mysql", "mariadb":
 		cfg, err := mysql.ParseDSN(trimMySQLScheme(dsn))
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
+			return "", dsnParseError(driverName)
 		}
 		cfg.DBName = databaseName
 		alteredDSN = cfg.FormatDSN()
@@ -1130,11 +1137,11 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 	case "pgx", "cockroachdb":
 		_, err = pgx.ParseConfig(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
+			return "", dsnParseError(driverName)
 		}
 		u, err := url.Parse(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
+			return "", dsnParseError(driverName)
 		}
 		u.Path = "/" + databaseName
 		alteredDSN = u.String()
@@ -1143,11 +1150,11 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 		// https://github.com/microsoft/go-mssqldb?tab=readme-ov-file#common-parameters
 		_, _, err = msdsn.Parse(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
+			return "", dsnParseError(driverName)
 		}
 		u, err := url.Parse(dsn)
 		if err != nil {
-			return "", errors.New("error parsing data source name %s", redactDataSourceName(dsn), err)
+			return "", dsnParseError(driverName)
 		}
 		q := u.Query()
 		if databaseName == "" {
@@ -1171,6 +1178,26 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 	default:
 		return "", errors.New("unsupported driver name %s", driverName)
 	}
+}
+
+// sqliteTestingBase rewrites a SQLite DSN as the file: URI of an in-memory database with a shared cache, which is what
+// a testing database is: every connection of every handle reaches one database, and nothing reaches the disk. A bare
+// path would lose its parameters when the testing name replaces it, and name a file. The other parameters are kept;
+// a :memory: path is dropped, since the testing database name takes its place.
+func sqliteTestingBase(dsn string) string {
+	path, query, _ := strings.Cut(strings.TrimPrefix(dsn, "file:"), "?")
+	if path == ":memory:" {
+		path = ""
+	}
+	var params []string
+	for p := range strings.SplitSeq(query, "&") {
+		key, _, _ := strings.Cut(p, "=")
+		if p != "" && key != "mode" && key != "cache" {
+			params = append(params, p)
+		}
+	}
+	params = append(params, "mode=memory", "cache=shared")
+	return "file:" + path + "?" + strings.Join(params, "&")
 }
 
 // physicalDriverName maps a sequel driver name to the driver registered with database/sql.
@@ -1393,12 +1420,8 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 		}
 		return native
 	}
-	if driverName == "sqlite" && !strings.Contains(baseDataSourceName, "mode=memory") && !strings.Contains(baseDataSourceName, "cache=shared") {
-		if strings.Contains(baseDataSourceName, "?") {
-			baseDataSourceName += "&mode=memory&cache=shared"
-		} else {
-			baseDataSourceName += "?mode=memory&cache=shared"
-		}
+	if driverName == "sqlite" {
+		baseDataSourceName = sqliteTestingBase(baseDataSourceName)
 	}
 
 	// Keyed on the physical target, not the driver name: MySQL and MariaDB, or PostgreSQL and CockroachDB, asked for
@@ -1438,12 +1461,15 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 		baseDatabaseName = strings.ToLower(baseDatabaseName) + "_"
 	}
 	now := testingStartedAt // Avoid hour change mid-run
-	testingDatabaseName := "testing_" + now.Format("15") + "_" + testingProcessToken + "_" + baseDatabaseName + strings.ToLower(uniqueTestID)
-	testingDatabaseName = regexp.MustCompile(`[^a-z0-9_]`).ReplaceAllString(testingDatabaseName, "_")
-	if len(testingDatabaseName) > maxTestingDatabaseName {
-		// MySQL refuses a longer name and PostgreSQL truncates it, so the tail is replaced by a hash of the whole
-		testingDatabaseName = testingDatabaseName[:maxTestingDatabaseName-9] + "_" + hashStr(testingDatabaseName)[:8]
+	prefix := "testing_" + now.Format("15") + "_" + testingProcessToken + "_"
+	readable := regexp.MustCompile(`[^a-z0-9_]`).ReplaceAllString(baseDatabaseName+strings.ToLower(uniqueTestID), "_")
+	// The readable part is lossy (Review/a and review_a both read review_a), so the name ends in a hash of the cache
+	// key, which tells apart every target and test ID the cache does
+	suffix := "_" + cacheKey[:8]
+	if room := maxTestingDatabaseName - len(prefix) - len(suffix); len(readable) > room {
+		readable = readable[:max(room, 0)]
 	}
+	testingDatabaseName := prefix + readable + suffix
 
 	// For server-based drivers, open the master database and CREATE/DROP DATABASE.
 	// SQLite uses in-memory databases for testing, so this step is skipped.
@@ -1555,6 +1581,7 @@ func (db *DB) createMigrationsTable() error {
 			completed BOOL NOT NULL DEFAULT FALSE,
 			completed_on DATETIME(3),
 			locked_before DATETIME(3) NOT NULL DEFAULT NOW_UTC(),
+			locked_by VARCHAR(64),
 			PRIMARY KEY (seq_name, seq_num)
 		)`
 	case "pgx", "cockroachdb":
@@ -1565,6 +1592,7 @@ func (db *DB) createMigrationsTable() error {
 			completed BOOL NOT NULL DEFAULT FALSE,
 			completed_on TIMESTAMP(3),
 			locked_before TIMESTAMP(3) NOT NULL DEFAULT NOW_UTC(),
+			locked_by VARCHAR(64),
 			PRIMARY KEY (seq_name, seq_num)
 		)`
 	case "mssql":
@@ -1576,6 +1604,7 @@ func (db *DB) createMigrationsTable() error {
 				completed BIT NOT NULL DEFAULT 0,
 				completed_on DATETIME2(3),
 				locked_before DATETIME2(3) NOT NULL DEFAULT NOW_UTC(),
+				locked_by VARCHAR(64),
 				PRIMARY KEY (seq_name, seq_num)
 			)
 		END`
@@ -1587,6 +1616,7 @@ func (db *DB) createMigrationsTable() error {
 			completed INTEGER NOT NULL DEFAULT 0,
 			completed_on TEXT,
 			locked_before TEXT NOT NULL DEFAULT NOW_UTC(),
+			locked_by TEXT,
 			PRIMARY KEY (seq_name, seq_num)
 		)`
 	default:
@@ -1600,6 +1630,25 @@ func (db *DB) createMigrationsTable() error {
 		if db.QueryRow(`SELECT COUNT(*) FROM sequel_migrations WHERE 1=0`).Scan(&n) != nil {
 			return errors.Trace(err)
 		}
+	}
+	// A table made by an earlier version has no locked_by column. Concurrent runners race to add it, as they race to
+	// make the table, so a failure is taken as the column being there if it now is
+	const hasOwner = `SELECT COUNT(locked_by) FROM sequel_migrations WHERE 1=0`
+	var n int
+	if db.QueryRow(hasOwner).Scan(&n) == nil {
+		return nil
+	}
+	switch db.driverName {
+	case "mysql", "mariadb", "pgx", "cockroachdb":
+		stmt = `ALTER TABLE sequel_migrations ADD COLUMN locked_by VARCHAR(64)`
+	case "mssql":
+		stmt = `ALTER TABLE sequel_migrations ADD locked_by VARCHAR(64) NULL`
+	case "sqlite":
+		stmt = `ALTER TABLE sequel_migrations ADD COLUMN locked_by TEXT`
+	}
+	_, err = db.Exec(stmt)
+	if err != nil && db.QueryRow(hasOwner).Scan(&n) != nil {
+		return errors.Trace(err)
 	}
 	return nil
 }
@@ -1679,6 +1728,16 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 	}
 	slices.Sort(sequenceNumbersToRun)
 
+	// The owner token makes the lock this runner's: renewing, releasing and completing a migration succeed only
+	// while the lock still names it, so a runner whose lease lapsed and was taken finds out
+	owner := newMigrationOwner()
+	var lease *DB
+	defer func() {
+		if lease != nil && lease != db {
+			lease.DB.Close()
+		}
+	}()
+
 	// Execute the migrations
 	for len(sequenceNumbersToRun) > 0 {
 		seqNum := sequenceNumbersToRun[0]
@@ -1729,15 +1788,17 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		// comparison must include it: with a strict < a lock taken within that millisecond fails and sleeps.
 		switch db.driverName {
 		case "mysql", "mariadb", "pgx", "cockroachdb":
-			stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000)
+			stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000), locked_by=?
 					WHERE seq_name=? AND seq_num=? AND locked_before<=NOW_UTC() AND completed=FALSE`
 		case "mssql", "sqlite":
-			stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000)
+			stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000), locked_by=?
 					WHERE seq_name=? AND seq_num=? AND locked_before<=NOW_UTC() AND completed=0`
 		default:
 			return errors.New("unsupported driver name: %s", db.driverName)
 		}
-		res, err := db.execRetryingContention(stmt, sequenceName, seqNum)
+		// The lease runs from before the statement, so the deadline kept here is never later than the server's
+		leasedAt := time.Now()
+		res, err := db.execRetryingContention(stmt, owner, sequenceName, seqNum)
 		if err != nil {
 			return errors.Trace(err)
 		}
@@ -1753,35 +1814,24 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 
 		// Obtained lock, execute migration in a goroutine
 		db.telemetry.Load().logMigrationAttempt(ctx, db.driverName, sequenceName, fileNames[seqNum])
-		statement := migrations[seqNum]
-		lines := strings.Split(statement, "\n")
-		for i := range lines {
-			lines[i] = strings.TrimRight(lines[i], " \t\r")
+		if lease == nil {
+			lease, err = db.openLeasePool()
+			if err != nil {
+				_, _ = db.releaseMigrationLock(sequenceName, seqNum, owner)
+				return errors.Trace(err)
+			}
 		}
-		statement = strings.Join(lines, "\n")
+		statements := splitMigration(db.driverName, migrations[seqNum])
 
 		// Buffered, so the goroutine never blocks on a receiver that has gone; cancelled if the lock is lost
 		runCtx, cancelRun := context.WithCancel(ctx)
 		done := make(chan error, 1)
 		go func() {
-			for stmt := range strings.SplitSeq(statement, ";\n") {
-				stmt = strings.TrimSpace(stmt)
-				if stmt == "" {
+			for _, stmt := range statements {
+				if drivers, ok := migrationDriverDirective(db.driverName, stmt); ok && !slices.Contains(drivers, db.driverName) {
 					continue
 				}
-				p := strings.Index(stmt, "-- DRIVER:")
-				if p >= 0 {
-					driverLine, _, _ := strings.Cut(stmt[p+10:], "\n")
-					if !slices.Contains(strings.Fields(driverLine), db.driverName) {
-						continue
-					}
-				}
-				lines := strings.Split(stripLineComments(stmt), "\n")
-				for i := range lines {
-					lines[i] = strings.TrimSpace(lines[i])
-				}
-				stmt = strings.Join(lines, "\n")
-				stmt = strings.TrimSpace(stmt)
+				stmt = strings.TrimSpace(stripLineComments(db.driverName, stmt))
 				if stmt == "" {
 					// Empty after stripping comments (e.g. a comment-only segment); skip to avoid erroring out
 					continue
@@ -1795,23 +1845,29 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			done <- nil
 		}()
 
-		// Wait for it to finish
+		// Wait for it to finish, extending the lock while it runs. Each extension must succeed before the lease it
+		// extends lapses, or another runner may take the lock: one that cannot is given up on, and the run stopped
 		exit := false
 		for !exit {
 			select {
 			case err = <-done:
 				exit = true
 			case <-time.After(migrationLockRenewal):
-				// Extend the lock while the migration is in progress
-				if extendErr := extendMigrationLock(db, sequenceName, seqNum); extendErr != nil {
-					// The lock will lapse, and another runner may take it. Stop this run before giving it up, and
-					// wait for it, so that the two do not run the same migration at once
-					cancelRun()
-					if runErr := <-done; runErr != nil {
-						err = errors.New("unable to extend the migration lock", extendErr)
-					}
-					exit = true
+				extendCtx, cancelExtend := context.WithDeadline(ctx, leasedAt.Add(migrationLease-migrationLeaseMargin))
+				extendedAt := time.Now()
+				extendErr := extendMigrationLock(extendCtx, lease, sequenceName, seqNum, owner)
+				cancelExtend()
+				if extendErr == nil {
+					leasedAt = extendedAt
+					continue
 				}
+				// The lock will lapse, and another runner may take it. Stop this run before giving it up, and
+				// wait for it, so that the two do not run the same migration at once
+				cancelRun()
+				if runErr := <-done; runErr != nil {
+					err = errors.New("unable to extend the migration lock", extendErr)
+				}
+				exit = true
 			}
 		}
 		cancelRun()
@@ -1819,24 +1875,25 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		db.telemetry.Load().recordMigration(ctx, db.driverName, sequenceName, err)
 
 		if err != nil {
-			// Release the lock
-			stmt = `UPDATE sequel_migrations SET locked_before=NOW_UTC() WHERE seq_name=? AND seq_num=?`
-			_, _ = db.execRetryingContention(stmt, sequenceName, seqNum)
+			_, _ = db.releaseMigrationLock(sequenceName, seqNum, owner)
 			return errors.New("error running migration %s", fileNames[seqNum], err)
 		}
 
-		// Mark as complete
+		// Mark as complete, only while the lock is still this runner's
 		switch db.driverName {
 		case "mysql", "mariadb", "pgx", "cockroachdb":
-			stmt = `UPDATE sequel_migrations SET locked_before=NOW_UTC(), completed_on=NOW_UTC(), completed=TRUE WHERE seq_name=? AND seq_num=?`
+			stmt = `UPDATE sequel_migrations SET locked_before=NOW_UTC(), completed_on=NOW_UTC(), completed=TRUE WHERE seq_name=? AND seq_num=? AND locked_by=?`
 		case "mssql", "sqlite":
-			stmt = `UPDATE sequel_migrations SET locked_before=NOW_UTC(), completed_on=NOW_UTC(), completed=1 WHERE seq_name=? AND seq_num=?`
+			stmt = `UPDATE sequel_migrations SET locked_before=NOW_UTC(), completed_on=NOW_UTC(), completed=1 WHERE seq_name=? AND seq_num=? AND locked_by=?`
 		default:
 			return errors.New("unsupported driver name: %s", db.driverName)
 		}
-		_, err = db.execRetryingContention(stmt, sequenceName, seqNum)
+		res, err = db.execRetryingContention(stmt, sequenceName, seqNum, owner)
+		if err == nil {
+			err = migrationLockHeld(ctx, db, res, sequenceName, seqNum, owner)
+		}
 		if err != nil {
-			return errors.Trace(err)
+			return errors.New("unable to mark migration %s as complete", fileNames[seqNum], err)
 		}
 		sequenceNumbersToRun = sequenceNumbersToRun[1:]
 	}
@@ -1850,42 +1907,160 @@ func isDuplicateKeyError(driverName string, err error) bool {
 	return driverName == "mssql" && errors.As(err, &msErr) && (msErr.Number == 2627 || msErr.Number == 2601)
 }
 
-// migrationLockRenewal is how often a running migration extends its lock, which lasts 15 seconds.
+// migrationLease is how long a migration lock lasts unless extended, as set by the statements that take and extend
+// it, and migrationLeaseMargin how long before it lapses an extension must have succeeded.
+const (
+	migrationLease       = 15 * time.Second
+	migrationLeaseMargin = 2 * time.Second
+)
+
+// migrationLockRenewal is how often a running migration extends its lock.
 var migrationLockRenewal = 5 * time.Second
 
-// extendMigrationLock extends the lock of a running migration. A variable, so that a test can make it fail.
-var extendMigrationLock = func(db *DB, sequenceName string, seqNum int) error {
-	_, err := db.execRetryingContention(
-		`UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000) WHERE seq_name=? AND seq_num=?`,
-		sequenceName, seqNum)
-	return err
+// errMigrationLockLost reports a migration lock that no longer names its owner: its lease lapsed and another runner
+// took it.
+var errMigrationLockLost = errors.New("the migration lock was lost to another runner")
+
+// newMigrationOwner returns a random token that identifies one Migrate call as the owner of the locks it takes.
+func newMigrationOwner() string {
+	b := make([]byte, 16)
+	_, _ = crand.Read(b)
+	return hex.EncodeToString(b)
 }
 
-// stripLineComments removes the -- comments of a migration statement, up to the end of each line, and leaves a "--"
-// inside a quoted string or identifier alone. A quote is escaped by doubling it.
-func stripLineComments(stmt string) string {
-	var b strings.Builder
-	b.Grow(len(stmt))
-	var quote byte
-	for i := 0; i < len(stmt); i++ {
-		ch := stmt[i]
-		switch {
-		case quote != 0:
-			if ch == quote {
-				quote = 0 // A doubled quote closes and reopens, which copies the same bytes
+// openLeasePool opens the pool that extends a running migration's lock. It is apart from the caller's pool, which
+// the migration may be holding every connection of - a pool of one, say - so that an extension never waits for the
+// migration it extends. A private in-memory SQLite database cannot be reached from another pool, and no other
+// runner can reach it either, so its lock is extended on the caller's pool.
+func (db *DB) openLeasePool() (*DB, error) {
+	dsn := db.dataSourceName
+	if db.driverName == "sqlite" && (strings.Contains(dsn, ":memory:") || strings.Contains(dsn, "mode=memory")) &&
+		!strings.Contains(dsn, "cache=shared") {
+		return db, nil
+	}
+	sqlDB, err := sql.Open(physicalDriverName(db.driverName), dsn)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+	sqlDB.SetMaxOpenConns(1)
+	sqlDB.SetMaxIdleConns(1)
+	// Not opened with Open: closing it must not release a testing database, and it registers no pool metrics
+	lease := &DB{DB: sqlDB, driverName: db.driverName, refCount: 1}
+	lease.pool.Store(sqlDB)
+	lease.telemetry.Store(db.telemetry.Load())
+	lease.simulatedRTT.Store(db.simulatedRTT.Load())
+	return lease, nil
+}
+
+// extendMigrationLock extends the lock of a running migration, as long as it is still owned by owner. A variable, so
+// that a test can make it fail.
+var extendMigrationLock = func(ctx context.Context, db *DB, sequenceName string, seqNum int, owner string) error {
+	return retryContention(func() error {
+		res, err := db.ExecContext(ctx,
+			`UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000) WHERE seq_name=? AND seq_num=? AND locked_by=?`,
+			sequenceName, seqNum, owner)
+		if err != nil {
+			return err
+		}
+		return migrationLockHeld(ctx, db, res, sequenceName, seqNum, owner)
+	})
+}
+
+// releaseMigrationLock gives up a migration lock held by owner, so that another runner can take it at once.
+func (db *DB) releaseMigrationLock(sequenceName string, seqNum int, owner string) (sql.Result, error) {
+	return db.execRetryingContention(
+		`UPDATE sequel_migrations SET locked_before=NOW_UTC() WHERE seq_name=? AND seq_num=? AND locked_by=?`,
+		sequenceName, seqNum, owner)
+}
+
+// migrationLockHeld reports errMigrationLockLost unless the update that res reports, made on the condition that the
+// lock names owner, found it. MySQL counts only the rows an update changed, so no rows affected is confirmed by
+// reading the lock.
+func migrationLockHeld(ctx context.Context, db *DB, res sql.Result, sequenceName string, seqNum int, owner string) error {
+	if affected, err := res.RowsAffected(); err != nil {
+		return err
+	} else if affected > 0 {
+		return nil
+	}
+	var n int
+	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sequel_migrations WHERE seq_name=? AND seq_num=? AND locked_by=?`,
+		sequenceName, seqNum, owner).Scan(&n)
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errMigrationLockLost
+	}
+	return nil
+}
+
+// splitMigration splits a migration into its statements, at each ; that ends a line, which it drops. A ; inside a
+// string literal, a quoted identifier, a block comment or a PostgreSQL dollar-quoted body does not end a statement.
+// One at the end of a -- comment does, as it always has.
+func splitMigration(driverName, migration string) []string {
+	var statements []string
+	start := 0
+	for i := 0; i < len(migration); {
+		if j := skipNonCode(driverName, migration, i, true); j > i {
+			if (strings.HasPrefix(migration[i:], "--") || migration[i] == '#') && strings.HasSuffix(strings.TrimRight(migration[i:j], " \t\r\n"), ";") {
+				statements = append(statements, migration[start:j])
+				start = j
 			}
-		case ch == '\'' || ch == '"' || ch == '`':
-			quote = ch
-		case ch == '-' && i+1 < len(stmt) && stmt[i+1] == '-':
-			for i < len(stmt) && stmt[i] != '\n' {
-				i++
-			}
-			if i < len(stmt) {
-				b.WriteByte('\n')
-			}
+			i = j
 			continue
 		}
-		b.WriteByte(ch)
+		if migration[i] == ';' {
+			j := i + 1
+			for j < len(migration) && (migration[j] == ' ' || migration[j] == '\t' || migration[j] == '\r') {
+				j++
+			}
+			if j == len(migration) || migration[j] == '\n' {
+				statements = append(statements, migration[start:i])
+				start = j
+				i = j
+				continue
+			}
+		}
+		i++
+	}
+	return append(statements, migration[start:])
+}
+
+// migrationDriverDirective returns the drivers named by the first -- DRIVER: comment of a migration statement, and
+// whether it has one. Only a comment counts: the same text inside a string literal is data.
+func migrationDriverDirective(driverName, stmt string) (drivers []string, ok bool) {
+	for i := 0; i < len(stmt); {
+		j := skipNonCode(driverName, stmt, i, true)
+		if j == i {
+			i++
+			continue
+		}
+		if directive, found := strings.CutPrefix(stmt[i:j], "-- DRIVER:"); found {
+			return strings.Fields(directive), true
+		}
+		i = j
+	}
+	return nil, false
+}
+
+// stripLineComments removes the -- comments of a migration statement (and # on MySQL and MariaDB), up to the end of
+// each line, and leaves a "--" inside a string literal, a quoted identifier or a PostgreSQL dollar-quoted body alone.
+func stripLineComments(driverName, stmt string) string {
+	var b strings.Builder
+	b.Grow(len(stmt))
+	for i := 0; i < len(stmt); {
+		j := skipNonCode(driverName, stmt, i, true)
+		if j == i {
+			b.WriteByte(stmt[i])
+			i++
+			continue
+		}
+		if !strings.HasPrefix(stmt[i:], "--") && stmt[i] != '#' {
+			b.WriteString(stmt[i:j])
+		} else if stmt[j-1] == '\n' {
+			b.WriteByte('\n')
+		}
+		i = j
 	}
 	return b.String()
 }

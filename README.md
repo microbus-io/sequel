@@ -486,7 +486,7 @@ db.SetMeterProvider(meterProvider)   // metric.MeterProvider - sequel_* metrics
 db.SetLogger(logger)                 // *slog.Logger - migration events; per-query when enabled at Debug
 ```
 
-Configure once, before the `*DB` is used concurrently. For an `OpenSingleton`-shared `*DB`, the providers are process-wide for that pool; set them from the owning caller (last writer wins). Pass `nil` to any setter to disable that signal.
+Configure once, before the `*DB` is used concurrently. For an `OpenSingleton`-shared `*DB`, the providers are process-wide for that pool; set them from the owning caller (last writer wins). Pass `nil` to a setter to restore its default: the global provider for traces and metrics, and the discard logger for logs.
 
 ### Spans
 
@@ -527,10 +527,20 @@ or `increase()` rather than reading the raw value.
 
 ### Logs
 
-The library **does not log operation errors** - every error is returned to the caller, who is best placed to log it. Logging is reserved for:
+Every error is returned to the caller, who is best placed to log it, so sequel logs none above Debug. Logging is reserved for:
 
 - **Info** - one-off events: each schema migration as it is attempted (regardless of outcome).
-- **Debug** - every query, including the full parameterized statement text, and each statement of a batch sent in one round trip. There is no separate sequel switch: the lines are gated on your own logger's level, so they cost nothing when Debug is disabled. (Statement text is never a privacy risk - sequel always parameterizes, so the text carries `?`/`$1` placeholders, never argument values.)
+- **Debug** - every query, with its statement text and, when it fails, the error message; and each statement of a batch sent in one round trip. There is no separate sequel switch: the lines are gated on your own logger's level, so they cost nothing when Debug is disabled.
+
+### What reaches each signal
+
+Sequel does not record bound argument values directly: they remain `?`/`$1` placeholders in statement text. Literals remain in that text, and driver error messages can reveal bound values, such as a duplicate key. So:
+
+- **Spans** carry the operation and, when unambiguous, the table, never the statement text. A failed operation records its error message.
+- **Metrics** carry operation and status labels, never statement text or error messages.
+- **Debug logs** carry the statement text, literals included, and a failed operation's error message.
+
+Keep secrets out of literals. A logger above Debug omits query and error text from logs; spans still record error messages.
 
 ### `Query`, `QueryRow` and `Prepare` return `*sequel.Rows` / `*sequel.Row` / `*sequel.Stmt`
 

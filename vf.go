@@ -27,7 +27,6 @@ import (
 )
 
 type virtualFunc struct {
-	name    string
 	handler func(driverName string, args string) (string, error)
 }
 
@@ -43,12 +42,12 @@ var (
 
 func init() {
 	m := map[string]virtualFunc{
-		"NOW_UTC":            {name: "NOW_UTC", handler: vfNowUTC},
-		"REGEXP_TEXT_SEARCH": {name: "REGEXP_TEXT_SEARCH", handler: vfRegexpTextSearch},
-		"DATE_ADD_MILLIS":    {name: "DATE_ADD_MILLIS", handler: vfDateAddMillis},
-		"DATE_DIFF_MILLIS":   {name: "DATE_DIFF_MILLIS", handler: vfDateDiffMillis},
-		"LIMIT_OFFSET":       {name: "LIMIT_OFFSET", handler: vfLimitOffset},
-		"JSON_FIELD":         {name: "JSON_FIELD", handler: vfJSONField},
+		"NOW_UTC":            {handler: vfNowUTC},
+		"REGEXP_TEXT_SEARCH": {handler: vfRegexpTextSearch},
+		"DATE_ADD_MILLIS":    {handler: vfDateAddMillis},
+		"DATE_DIFF_MILLIS":   {handler: vfDateDiffMillis},
+		"LIMIT_OFFSET":       {handler: vfLimitOffset},
+		"JSON_FIELD":         {handler: vfJSONField},
 	}
 	virtualFuncs.Store(&m)
 }
@@ -71,7 +70,7 @@ func RegisterVirtualFunc(name string, handler func(driverName string, args strin
 	for k, v := range old {
 		clone[k] = v
 	}
-	clone[upper] = virtualFunc{name: upper, handler: handler}
+	clone[upper] = virtualFunc{handler: handler}
 	virtualFuncs.Store(&clone)
 	virtualFuncsMutex.Unlock()
 	// Registration invalidates previously-cached expansions.
@@ -156,7 +155,7 @@ func expandOnce(driverName, query string, vfs map[string]virtualFunc) (string, b
 			i = j + 1
 			continue
 		}
-		closePos := findBalancedClose(query, j+1)
+		closePos := findBalancedClose(driverName, query, j+1)
 		if closePos < 0 {
 			// Unbalanced; leave it as it is
 			i = j + 1
@@ -182,17 +181,15 @@ func expandOnce(driverName, query string, vfs map[string]virtualFunc) (string, b
 
 // findBalancedClose returns the index of the ')' that closes the call whose opening '('
 // was at position start-1 (i.e. start is the first char after the opening paren).
-// It skips characters inside single- and double-quoted strings. Returns -1 if unbalanced.
-func findBalancedClose(s string, start int) int {
+// Parentheses in string literals, quoted identifiers and comments do not count. Returns -1 if unbalanced.
+func findBalancedClose(driverName, s string, start int) int {
 	depth := 1
-	for i := start; i < len(s); i++ {
-		ch := s[i]
-		switch ch {
-		case '\'', '"':
-			i++
-			for i < len(s) && s[i] != ch {
-				i++
-			}
+	for i := start; i < len(s); {
+		if j := skipNonCode(driverName, s, i, false); j > i {
+			i = j
+			continue
+		}
+		switch s[i] {
 		case '(':
 			depth++
 		case ')':
@@ -201,8 +198,85 @@ func findBalancedClose(s string, start int) int {
 				return i
 			}
 		}
+		i++
 	}
 	return -1
+}
+
+// topLevelCommas returns the indexes of the commas in s outside parentheses, string literals, quoted identifiers and
+// comments: the ones that separate a virtual function's arguments.
+func topLevelCommas(driverName, s string) []int {
+	var commas []int
+	depth := 0
+	for i := 0; i < len(s); {
+		if j := skipNonCode(driverName, s, i, false); j > i {
+			i = j
+			continue
+		}
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ',':
+			if depth == 0 {
+				commas = append(commas, i)
+			}
+		}
+		i++
+	}
+	return commas
+}
+
+// topLevelIn returns the index of the first " IN " in s, in any letter case, outside parentheses, string literals,
+// quoted identifiers and comments, or -1 if there is none.
+func topLevelIn(driverName, s string) int {
+	depth := 0
+	for i := 0; i < len(s); {
+		if j := skipNonCode(driverName, s, i, false); j > i {
+			i = j
+			continue
+		}
+		switch s[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		case ' ':
+			if depth == 0 && len(s) >= i+4 && strings.EqualFold(s[i:i+4], " IN ") {
+				return i
+			}
+		}
+		i++
+	}
+	return -1
+}
+
+// lastTopLevelComma returns the index of the last of [topLevelCommas], or -1 if there is none.
+func lastTopLevelComma(driverName, s string) int {
+	commas := topLevelCommas(driverName, s)
+	if len(commas) == 0 {
+		return -1
+	}
+	return commas[len(commas)-1]
+}
+
+// trimArg trims the space around a virtual function's argument. An argument that ends in a line comment keeps the
+// newline that ends the comment, or the comment would swallow whatever the expansion writes after the argument.
+func trimArg(driverName, arg string) string {
+	arg = strings.TrimSpace(arg)
+	for i := 0; i < len(arg); {
+		j := skipNonCode(driverName, arg, i, false)
+		if j == i {
+			i++
+			continue
+		}
+		if j == len(arg) && (strings.HasPrefix(arg[i:], "--") || arg[i] == '#') {
+			return arg + "\n"
+		}
+		i = j
+	}
+	return arg
 }
 
 // nowUTCPrecision parses the argument of NOW_UTC: empty for the default 3, or a literal from 0 to 6.
@@ -260,19 +334,19 @@ func vfNowUTC(driverName string, args string) (string, error) {
 //
 //	REGEXP_TEXT_SEARCH(? IN first_name, last_name, email)
 func vfRegexpTextSearch(driverName string, args string) (string, error) {
-	upper := strings.ToUpper(args)
-	i := strings.Index(upper, " IN ")
+	i := topLevelIn(driverName, args)
 	if i < 0 {
 		return "", errors.New("REGEXP_TEXT_SEARCH requires syntax: REGEXP_TEXT_SEARCH(expr IN col1, col2, ...)")
 	}
-	searchExpr := strings.TrimSpace(args[:i])
+	searchExpr := trimArg(driverName, args[:i])
 	columnsStr := args[i+4:]
 	var columns []string
-	for _, col := range strings.Split(columnsStr, ",") {
-		col = strings.TrimSpace(col)
-		if col != "" {
+	from := 0
+	for _, comma := range append(topLevelCommas(driverName, columnsStr), len(columnsStr)) {
+		if col := trimArg(driverName, columnsStr[from:comma]); col != "" {
 			columns = append(columns, col)
 		}
+		from = comma + 1
 	}
 	concatenated := "''"
 	if len(columns) == 1 {
@@ -294,30 +368,6 @@ func vfRegexpTextSearch(driverName string, args string) (string, error) {
 	}
 }
 
-// lastTopLevelComma finds the last comma in s that is not inside parentheses or quotes.
-// Returns -1 if no top-level comma is found.
-func lastTopLevelComma(s string) int {
-	depth := 0
-	lastComma := -1
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		if ch == '\'' || ch == '"' {
-			// Skip to closing quote
-			i++
-			for i < len(s) && s[i] != ch {
-				i++
-			}
-		} else if ch == '(' {
-			depth++
-		} else if ch == ')' {
-			depth--
-		} else if ch == ',' && depth == 0 {
-			lastComma = i
-		}
-	}
-	return lastComma
-}
-
 // vfDateAddMillis is the handler for the DATE_ADD_MILLIS() virtual function.
 // The syntax is DATE_ADD_MILLIS(baseExpr, milliseconds) where baseExpr is a timestamp
 // expression and milliseconds is a numeric value. The baseExpr is recursively unpacked,
@@ -327,12 +377,12 @@ func lastTopLevelComma(s string) int {
 //	DATE_ADD_MILLIS(NOW_UTC(), ?)
 func vfDateAddMillis(driverName string, args string) (string, error) {
 	// Split by the last comma to separate baseExpr from milliseconds
-	lastComma := lastTopLevelComma(args)
+	lastComma := lastTopLevelComma(driverName, args)
 	if lastComma < 0 {
 		return "", errors.New("DATE_ADD_MILLIS requires syntax: DATE_ADD_MILLIS(baseExpr, milliseconds)")
 	}
-	baseExpr := strings.TrimSpace(args[:lastComma])
-	millis := strings.TrimSpace(args[lastComma+1:])
+	baseExpr := trimArg(driverName, args[:lastComma])
+	millis := trimArg(driverName, args[lastComma+1:])
 	if baseExpr == "" || millis == "" {
 		return "", errors.New("DATE_ADD_MILLIS requires syntax: DATE_ADD_MILLIS(baseExpr, milliseconds)")
 	}
@@ -359,7 +409,7 @@ func vfDateAddMillis(driverName string, args string) (string, error) {
 func isCoarseNowUTC(expr string) bool {
 	const name = "NOW_UTC("
 	expr = strings.TrimSpace(expr)
-	if len(expr) < len(name) || !strings.EqualFold(expr[:len(name)], name) || findBalancedClose(expr, len(name)) != len(expr)-1 {
+	if len(expr) < len(name) || !strings.EqualFold(expr[:len(name)], name) || findBalancedClose("mssql", expr, len(name)) != len(expr)-1 {
 		return false
 	}
 	p, err := nowUTCPrecision(expr[len(name) : len(expr)-1])
@@ -395,12 +445,12 @@ func mssqlDateAddMillis(baseExpr, millis string) string {
 //	DATE_DIFF_MILLIS(updated_at, created_at)
 //	DATE_DIFF_MILLIS(NOW_UTC(), created_at)
 func vfDateDiffMillis(driverName string, args string) (string, error) {
-	lastComma := lastTopLevelComma(args)
+	lastComma := lastTopLevelComma(driverName, args)
 	if lastComma < 0 {
 		return "", errors.New("DATE_DIFF_MILLIS requires syntax: DATE_DIFF_MILLIS(a, b)")
 	}
-	a := strings.TrimSpace(args[:lastComma])
-	b := strings.TrimSpace(args[lastComma+1:])
+	a := trimArg(driverName, args[:lastComma])
+	b := trimArg(driverName, args[lastComma+1:])
 	if a == "" || b == "" {
 		return "", errors.New("DATE_DIFF_MILLIS requires syntax: DATE_DIFF_MILLIS(a, b)")
 	}
@@ -512,12 +562,12 @@ func parseJSONPath(path string) ([]jsonPathElem, error) {
 // SQL Server needs an OPENJSON ... WITH rowset, which is a different statement shape than a virtual function
 // can expand to.
 func vfJSONField(driverName string, args string) (string, error) {
-	comma := lastTopLevelComma(args)
+	comma := lastTopLevelComma(driverName, args)
 	if comma < 0 {
 		return "", errors.New("JSON_FIELD requires syntax: JSON_FIELD(column, '$.path')")
 	}
-	col := strings.TrimSpace(args[:comma])
-	pathLit := strings.TrimSpace(args[comma+1:])
+	col := trimArg(driverName, args[:comma])
+	pathLit := trimArg(driverName, args[comma+1:])
 	if col == "" || len(pathLit) < 2 || pathLit[0] != '\'' || pathLit[len(pathLit)-1] != '\'' {
 		return "", errors.New("JSON_FIELD requires a literal path: JSON_FIELD(column, '$.path')")
 	}
@@ -583,12 +633,12 @@ func vfJSONField(driverName string, args string) (string, error) {
 //
 // Note: SQL Server requires an ORDER BY clause for OFFSET/FETCH to work.
 func vfLimitOffset(driverName string, args string) (string, error) {
-	comma := lastTopLevelComma(args)
+	comma := lastTopLevelComma(driverName, args)
 	if comma < 0 {
 		return "", errors.New("LIMIT_OFFSET requires syntax: LIMIT_OFFSET(limit, offset)")
 	}
-	limit := strings.TrimSpace(args[:comma])
-	offset := strings.TrimSpace(args[comma+1:])
+	limit := trimArg(driverName, args[:comma])
+	offset := trimArg(driverName, args[comma+1:])
 	if limit == "" || offset == "" {
 		return "", errors.New("LIMIT_OFFSET requires syntax: LIMIT_OFFSET(limit, offset)")
 	}

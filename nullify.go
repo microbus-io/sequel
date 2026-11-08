@@ -121,7 +121,9 @@ func ApplyBindings(args ...any) (err error) {
 	return nil
 }
 
-// UnsafeSQL wraps a string to indicate not to use an argument placeholder when inserting it into a SQL statement.
-// It should be used to insert values such as NOW() or calculation of other fields.
-// Use with caution to avoid SQL injection.
+// UnsafeSQL is a string type that nothing in sequel treats specially: passed as an argument, it is bound like any
+// other string, never spliced into the statement.
+//
+// Deprecated: UnsafeSQL served a code generator that sequel no longer has. Write SQL such as NOW_UTC() into the
+// statement text instead.
 type UnsafeSQL string

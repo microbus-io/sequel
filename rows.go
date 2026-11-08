@@ -19,21 +19,14 @@ package sequel
 import "database/sql"
 
 /*
-Rows shadows *sql.Rows so sequel can latch a row-iteration or Scan error into a [DB.Transact]-managed
-transaction, completing the "no partial commit" guarantee for streamed reads.
-
-Transact already records the first Exec/Query *statement* error and short-circuits the rest, so a closure
-that ignores a statement's error still cannot commit half its work. The gap that remained was the errors
-that surface *while iterating a result set* - a mid-stream Scan failure or a streaming error reported by
-rows.Err(). Those were invisible to Transact, so a closure that read rows in a loop and forgot to check
-rows.Err() could build state from a truncated read and commit it. Rows closes that gap: Scan and the
-end-of-iteration Err are latched exactly like a statement error, so such a closure can no longer commit
-partial work.
+Rows shadows *sql.Rows. Inside a [DB.Transact] transaction, a Scan error and the streaming error that ends
+iteration (what rows.Err() reports) are recorded like a statement error: the transaction will not commit, and
+later statements short-circuit. A closure that stops checking errors therefore cannot commit work built on a
+truncated read. Breaking out of the loop early records nothing.
 
 It embeds *sql.Rows, so the usual `for rows.Next() { rows.Scan(...) }`, `rows.Err()`, and `rows.Close()`
-call sites are unchanged; only code that explicitly stores the result as *sql.Rows needs adjustment (the
-same source-compat caveat as [Row]). Outside a Transact-managed Tx - a *DB query, or a Tx obtained from
-[DB.BeginTx] - nothing is latched, so Rows is a pure passthrough and behaves exactly like *sql.Rows.
+call sites are unchanged; only code that explicitly stores the result as *sql.Rows needs adjustment. Outside a
+Transact-managed Tx - a *DB query, or a Tx obtained from [DB.BeginTx] - Rows behaves exactly like *sql.Rows.
 */
 type Rows struct {
 	*sql.Rows

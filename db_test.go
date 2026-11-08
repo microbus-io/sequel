@@ -18,10 +18,13 @@ package sequel
 
 import (
 	"context"
+	"database/sql/driver"
 	"encoding/json"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -32,6 +35,7 @@ import (
 	"github.com/microbus-io/testarossa"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	sqlite "modernc.org/sqlite"
 )
 
 func TestDB_ConformArgPlaceholders(t *testing.T) {
@@ -1145,32 +1149,6 @@ func TestDB_LeftoverSweepRejectsHostileNames(t *testing.T) {
 	assert.False(leftoverTestingDatabasePattern.MatchString("testing_99_x"))
 }
 
-// DSNs carry passwords and error messages end up in logs, so a DSN quoted in an error must have its
-// credentials masked in every DSN dialect sequel accepts.
-func TestDB_RedactDataSourceName(t *testing.T) {
-	t.Parallel()
-	assert := testarossa.For(t)
-
-	cases := []struct{ dsn, redacted string }{
-		{"postgres://user:s3cret@127.0.0.1:5432/db", "postgres://user:***@127.0.0.1:5432/db"},
-		{"sqlserver://sa:Password123@localhost:1433?database=x", "sqlserver://sa:***@localhost:1433?database=x"},
-		{"root:s3cret@tcp(127.0.0.1:3306)/db", "root:***@tcp(127.0.0.1:3306)/db"},
-		{"root:p@ss@w0rd@tcp(127.0.0.1:3306)/db", "root:***@tcp(127.0.0.1:3306)/db"}, // greedy: '@' in the password cannot leak a suffix
-		{"server=localhost;user id=sa;password=s3cret;port=1433", "server=localhost;user id=sa;password=***;port=1433"},
-		{"Server=localhost;PWD=s3cret", "Server=localhost;PWD=***"},
-		{"mariadb://root:p@ss@tcp(h:3306)/db?tls=false", "mariadb://root:***@tcp(h:3306)/db?tls=false"}, // Greedy to the last '@'
-		{"mysql://:s3cret@tcp(h)/app", "mysql://:***@tcp(h)/app"},                                       // No user name
-		{"mariadb://root:pa/ss@tcp(h)/app", "mariadb://root:***@tcp(h)/app"},                            // A raw '/' cannot end the match
-		// No credentials: unchanged.
-		{"postgres://127.0.0.1:5432/db", "postgres://127.0.0.1:5432/db"},
-		{"tcp(127.0.0.1:3306)/db", "tcp(127.0.0.1:3306)/db"},
-		{"file:test.db?mode=memory", "file:test.db?mode=memory"},
-	}
-	for _, c := range cases {
-		assert.Equal(c.redacted, redactDataSourceName(c.dsn), "for %q", c.dsn)
-	}
-}
-
 // The ID column is spliced into SQL on some drivers (RETURNING / OUTPUT INSERTED), so it is validated
 // against a narrow identifier charset on every driver - rejected up front, never escaped.
 func TestDB_InsertReturnIDRejectsInvalidColumn(t *testing.T) {
@@ -1424,7 +1402,7 @@ func TestMigrate_StopsWhenItsLockCannotBeExtended(t *testing.T) {
 	renewal, extend := migrationLockRenewal, extendMigrationLock
 	defer func() { migrationLockRenewal, extendMigrationLock = renewal, extend }()
 	migrationLockRenewal = 50 * time.Millisecond
-	extendMigrationLock = func(*DB, string, int) error { return errors.New("connection lost") }
+	extendMigrationLock = func(context.Context, *DB, string, int, string) error { return errors.New("connection lost") }
 
 	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
 	assert.NoError(err)
@@ -1454,9 +1432,9 @@ func TestMigrate_StripsCommentsOutsideQuotes(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)
 
-	assert.Equal("SELECT 'a--b', \"c--d\" \nFROM t", stripLineComments("SELECT 'a--b', \"c--d\" -- trailing\nFROM t"))
-	assert.Equal("SELECT 'it''s--fine' ", stripLineComments("SELECT 'it''s--fine' -- note"))
-	assert.Equal("\nSELECT 1", stripLineComments("-- DRIVER: sqlite\nSELECT 1"))
+	assert.Equal("SELECT 'a--b', \"c--d\" \nFROM t", stripLineComments("sqlite", "SELECT 'a--b', \"c--d\" -- trailing\nFROM t"))
+	assert.Equal("SELECT 'it''s--fine' ", stripLineComments("sqlite", "SELECT 'it''s--fine' -- note"))
+	assert.Equal("\nSELECT 1", stripLineComments("sqlite", "-- DRIVER: sqlite\nSELECT 1"))
 }
 
 // A testing database name carries this process's token, so that two test processes never mint the same one; and only
@@ -1515,4 +1493,306 @@ func TestDB_ConformPlaceholdersSkipsQuotedCode(t *testing.T) {
 	}
 	// SQL Server has no dollar quotes
 	assert.Equal("SELECT $$ $1 $$", conformPlaceholders("mssql", "SELECT $$ ? $$"))
+}
+
+// DSN parse failures expose neither the input nor parser details, which can include credentials.
+func TestDB_ParseErrorsDoNotLeakPasswords(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	for _, c := range []struct{ driver, dsn string }{
+		{"mssql", "server=localhost;user id=sa;password=top secret;port=bad"},
+		{"mssql", "server=h;password=top token=secret;port=bad"},
+		{"mssql", "server=h;password='top' secret;port=bad"},
+		{"mssql", `server=h;password="top" secret;port=bad`},
+		{"mssql", "server=h;password={top} secret;port=bad"},
+		{"mssql", "sqlserver://sa:secret@host:bad"},
+		{"mssql", "server=h;user id=sa;password=a:secret@c;database=x"},
+		{"pgx", "host=x password='top secret' port=bad"},
+		{"pgx", "postgres://u:secret@host:bad/db"},
+		{"mysql", "user:secret@tcp(localhost)/db?timeout=bad"},
+		{"mariadb", "user:secret@tcp(localhost)/db?timeout=bad"},
+	} {
+		for _, parse := range []func() error{
+			func() error { _, err := databaseNameFromDataSourceName(c.driver, c.dsn); return err },
+			func() error { _, err := setDatabaseInDataSourceName(c.driver, c.dsn, "test"); return err },
+			func() error { _, err := CreateTestingDatabase(c.driver, c.dsn, t.Name()); return err },
+		} {
+			err := parse()
+			if assert.Error(err) {
+				assert.Equal("error parsing "+c.driver+" data source name", err.Error())
+			}
+		}
+	}
+}
+
+// A closed DB fails its operations as a closed sql.DB does, rather than dereferencing nil, and a singleton opened
+// again after its last close is a new DB, so the closed one is never written to while a straggler reads it.
+func TestDB_ClosedDBFailsWithoutPanicking(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	db, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	assert.NoError(db.Close())
+	assert.NoError(db.Close()) // A second close is a no-op
+	_, err = db.Exec("SELECT 1")
+	assert.Error(err)
+	assert.Error(db.Ping())
+	_, err = db.Begin()
+	assert.Error(err)
+	var n int
+	assert.Error(db.QueryRow("SELECT 1").Scan(&n))
+	assert.Error(db.Transact(context.Background(), func(tx *Tx) error { return nil }))
+
+	single, err := OpenSingleton("sqlite", dsn)
+	assert.NoError(err)
+	assert.NoError(single.Close())
+	again, err := OpenSingleton("sqlite", dsn)
+	assert.NoError(err)
+	defer again.Close()
+	assert.True(single != again, "a closed singleton was reused")
+	_, err = single.Exec("SELECT 1")
+	assert.Error(err)
+	_, err = again.Exec("SELECT 1")
+	assert.NoError(err)
+}
+
+// Queries racing the last Close of their DB fail or succeed, but never panic or race (run under -race).
+func TestDB_CloseRacesQueries(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	for range 20 {
+		db, err := OpenSingleton("sqlite", dsn)
+		assert.NoError(err)
+		var wg sync.WaitGroup
+		for range 4 {
+			wg.Go(func() {
+				for range 20 {
+					_, _ = db.Exec("SELECT 1")
+					_ = db.Ping()
+				}
+			})
+		}
+		wg.Go(func() {
+			_ = db.Close()
+			reopened, err := OpenSingleton("sqlite", dsn)
+			if err == nil {
+				_ = reopened.Close()
+			}
+		})
+		wg.Wait()
+	}
+}
+
+// Test IDs that read the same once sanitized - by case, or by punctuation - get databases of their own, since a
+// shared one would let one test read, and drop, another's data. Names stay within the leftover pattern and length.
+func TestDB_TestingDatabaseNamesDoNotCollide(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	long := strings.Repeat("x", 80)
+	seen := map[string]string{}
+	for _, id := range []string{t.Name() + "/a", t.Name() + "_a", strings.ToLower(t.Name()) + "_a", long + "1", long + "2"} {
+		dsn, err := CreateTestingDatabase("sqlite", "", id)
+		if !assert.NoError(err) {
+			continue
+		}
+		name, err := databaseNameFromDataSourceName("sqlite", dsn)
+		assert.NoError(err)
+		assert.True(leftoverTestingDatabasePattern.MatchString(name), "%s", name)
+		assert.True(len(name) <= maxTestingDatabaseName, "%s", name)
+		if other, ok := seen[name]; ok {
+			t.Errorf("%q and %q share the database %s", other, id, name)
+		}
+		seen[name] = id
+	}
+
+	// One test ID still reaches one database
+	a, err := CreateTestingDatabase("sqlite", "", t.Name()+"/a")
+	assert.NoError(err)
+	b, err := CreateTestingDatabase("sqlite", "", t.Name()+"/a")
+	assert.NoError(err)
+	assert.Equal(a, b)
+}
+
+// Whatever the SQLite base, a testing database is one in-memory database every handle reaches: a bare path keeps
+// its parameters and names no file, and a base with only one of mode=memory and cache=shared gains the other.
+func TestDB_SQLiteTestingDatabaseIsSharedMemory(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	for i, base := range []string{":memory:", "example.db", "file:partial?mode=memory", "file:partial?cache=shared",
+		"file:other.db?mode=rwc&_pragma=foreign_keys(1)"} {
+		dsn, err := CreateTestingDatabase("sqlite", base, t.Name()+strconv.Itoa(i))
+		if !assert.NoError(err, "for %q", base) {
+			continue
+		}
+		assert.True(strings.HasPrefix(dsn, "file:testing_"), "for %q: %s", base, dsn)
+		assert.Contains(dsn, "mode=memory", "for %q", base)
+		assert.Contains(dsn, "cache=shared", "for %q", base)
+		assert.NotContains(dsn, "mode=rwc", "for %q", base)
+		db1, err := Open("", dsn)
+		if !assert.NoError(err, "for %q", base) {
+			continue
+		}
+		db2, err := Open("", dsn)
+		assert.NoError(err)
+		_, err = db1.Exec("CREATE TABLE shared_mem (id INT)")
+		assert.NoError(err)
+		var n int
+		assert.NoError(db2.QueryRow("SELECT COUNT(*) FROM shared_mem").Scan(&n), "for %q", base)
+		db2.Close()
+		db1.Close()
+	}
+	assert.Contains(sqliteTestingBase("file:other.db?mode=rwc&_pragma=foreign_keys(1)"), "_pragma=foreign_keys(1)")
+}
+
+// Statements end at a ; that ends a line, but not one inside a string literal, a quoted identifier, a block comment
+// or a dollar-quoted body; one ending a -- comment line does, as it always has.
+func TestMigrate_SplitMigration(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	assert.Equal([]string{"CREATE TABLE t (v TEXT)", "\nINSERT INTO t VALUES ('first;\nsecond')", "\n"},
+		splitMigration("sqlite", "CREATE TABLE t (v TEXT);\nINSERT INTO t VALUES ('first;\nsecond');\n"))
+	assert.Equal([]string{"SELECT 1", "\nSELECT 2"}, splitMigration("sqlite", "SELECT 1; \t\r\nSELECT 2"))
+	assert.Equal([]string{"SELECT 1; -- not the end\nSELECT 2"}, splitMigration("sqlite", "SELECT 1; -- not the end\nSELECT 2"))
+	assert.Equal([]string{"-- nothing here;\n", "SELECT 2"}, splitMigration("sqlite", "-- nothing here;\nSELECT 2"))
+	assert.Equal([]string{"SELECT \"a;\nb\", /* c;\n */ 1"}, splitMigration("sqlite", "SELECT \"a;\nb\", /* c;\n */ 1"))
+	body := "CREATE FUNCTION f() RETURNS INT AS $$\nBEGIN\n  PERFORM 1;\n  RETURN 1;\nEND;\n$$ LANGUAGE plpgsql"
+	assert.Equal([]string{body, "\nSELECT f()"}, splitMigration("pgx", body+";\nSELECT f()"))
+	assert.Equal([]string{"SELECT 'it\\'s;\n'"}, splitMigration("mysql", "SELECT 'it\\'s;\n'"))
+}
+
+// A -- DRIVER: directive counts only as a comment; the same text in a string literal is data.
+func TestMigrate_DriverDirective(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	drivers, ok := migrationDriverDirective("sqlite", "-- DRIVER: mysql mariadb\nSELECT 1")
+	assert.True(ok)
+	assert.Equal([]string{"mysql", "mariadb"}, drivers)
+	_, ok = migrationDriverDirective("sqlite", "INSERT INTO d VALUES ('-- DRIVER: mysql')")
+	assert.False(ok)
+	_, ok = migrationDriverDirective("sqlite", "INSERT INTO \"-- DRIVER: mysql\" VALUES (1)")
+	assert.False(ok)
+	_, ok = migrationDriverDirective("sqlite", "/* -- DRIVER: mysql */ SELECT 1")
+	assert.False(ok)
+	_, ok = migrationDriverDirective("sqlite", "-- just a comment\nSELECT 1")
+	assert.False(ok)
+	drivers, ok = migrationDriverDirective("sqlite", "-- a note\n-- DRIVER: sqlite\nSELECT 1")
+	assert.True(ok)
+	assert.Equal([]string{"sqlite"}, drivers)
+
+	db := newSQLiteDB(t)
+	fs := fstest.MapFS{"1.directives.sql": {Data: []byte(
+		"CREATE TABLE directives (v TEXT);\nINSERT INTO directives VALUES ('-- DRIVER: mysql');\n" +
+			"INSERT INTO directives VALUES ('first;\nsecond');\n")}}
+	assert.NoError(db.Migrate(t.Name(), fs))
+	var n int
+	assert.NoError(db.QueryRow("SELECT COUNT(*) FROM directives").Scan(&n))
+	assert.Equal(2, n)
+	var v string
+	assert.NoError(db.QueryRow("SELECT v FROM directives WHERE v LIKE 'first%'").Scan(&v))
+	assert.Equal("first;\nsecond", v)
+}
+
+// A migration extends its lock on a pool of its own, so that a long statement holding the caller's only connection
+// cannot keep the extension waiting until the lease lapses. Not parallel: it replaces package-level hooks.
+func TestMigrate_ExtendsItsLockWhileHoldingEveryConnection(t *testing.T) {
+	assert := testarossa.For(t)
+
+	renewal, extend := migrationLockRenewal, extendMigrationLock
+	defer func() { migrationLockRenewal, extendMigrationLock = renewal, extend }()
+	migrationLockRenewal = 20 * time.Millisecond
+	// Extensions that succeed while the 300ms statement still holds the only connection
+	var extended atomic.Int32
+	var start time.Time
+	extendMigrationLock = func(ctx context.Context, db *DB, sequenceName string, seqNum int, owner string) error {
+		err := extend(ctx, db, sequenceName, seqNum, owner)
+		if err == nil && time.Since(start) < 250*time.Millisecond {
+			extended.Add(1)
+		}
+		return err
+	}
+
+	db := newSQLiteDB(t)
+	db.SetMaxOpenConns(1)
+	fs := fstest.MapFS{"1.slow.sql": {Data: []byte("SELECT sequel_test_sleep(300);\n")}}
+	start = time.Now()
+	assert.NoError(db.Migrate(t.Name(), fs))
+	assert.True(extended.Load() > 0, "the lock was not extended while the statement ran")
+}
+
+// sequel_test_sleep(ms) is a SQLite function that takes ms milliseconds, for statements that must run a known time.
+func init() {
+	sqlite.MustRegisterScalarFunction("sequel_test_sleep", 1, func(_ *sqlite.FunctionContext, args []driver.Value) (driver.Value, error) {
+		ms, _ := args[0].(int64)
+		time.Sleep(time.Duration(ms) * time.Millisecond)
+		return ms, nil
+	})
+}
+
+// A runner whose lock was taken by another while its migration ran does not record the migration as its own:
+// completing it requires the lock to still name the runner. Not parallel: it replaces package-level hooks.
+func TestMigrate_DoesNotCompleteALostLock(t *testing.T) {
+	assert := testarossa.For(t)
+
+	renewal, extend := migrationLockRenewal, extendMigrationLock
+	defer func() { migrationLockRenewal, extendMigrationLock = renewal, extend }()
+	migrationLockRenewal = 10 * time.Millisecond
+	extendMigrationLock = func(ctx context.Context, db *DB, sequenceName string, seqNum int, owner string) error {
+		// Another runner takes the lapsed lock, and this one's extension does not notice in time
+		_, err := db.ExecContext(ctx, "UPDATE sequel_migrations SET locked_by='another' WHERE seq_name=?", sequenceName)
+		return err
+	}
+
+	db := newSQLiteDB(t)
+	fs := fstest.MapFS{"1.slow.sql": {Data: []byte("SELECT sequel_test_sleep(300);\n")}}
+	err := db.Migrate(t.Name(), fs)
+	if assert.Error(err) {
+		assert.True(errors.Is(err, errMigrationLockLost), "%v", err)
+	}
+	var completed int
+	assert.NoError(db.QueryRow("SELECT completed FROM sequel_migrations WHERE seq_name=?", t.Name()).Scan(&completed))
+	assert.Equal(0, completed)
+
+	// An extension that finds the lock taken fails, and stops the run
+	extendMigrationLock = extend
+	_, err = db.Exec("UPDATE sequel_migrations SET locked_by='another' WHERE seq_name=?", t.Name())
+	assert.NoError(err)
+	assert.True(errors.Is(extend(context.Background(), db, t.Name(), 1, "mine"), errMigrationLockLost))
+}
+
+// A sequel_migrations table made before the lock had an owner gains the column, and migrations keep running.
+func TestMigrate_AddsTheOwnerColumnToAnOldTable(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newSQLiteDB(t)
+	_, err := db.Exec(`CREATE TABLE sequel_migrations (
+		seq_name TEXT NOT NULL,
+		seq_num INTEGER NOT NULL,
+		completed INTEGER NOT NULL DEFAULT 0,
+		completed_on TEXT,
+		locked_before TEXT NOT NULL DEFAULT NOW_UTC(),
+		PRIMARY KEY (seq_name, seq_num)
+	)`)
+	assert.NoError(err)
+	_, err = db.Exec("INSERT INTO sequel_migrations (seq_name, seq_num, completed) VALUES (?, 1, 1)", t.Name())
+	assert.NoError(err)
+	fs := fstest.MapFS{
+		"1.done.sql": {Data: []byte("CREATE TABLE never_runs (id INT)")},
+		"2.new.sql":  {Data: []byte("CREATE TABLE owner_col (id INT)")},
+	}
+	assert.NoError(db.Migrate(t.Name(), fs))
+	var n int
+	assert.NoError(db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('never_runs', 'owner_col')").Scan(&n))
+	assert.Equal(1, n)
 }

@@ -537,3 +537,20 @@ func TestVF_DollarQuotedBody(t *testing.T) {
 	assert.NoError(db.QueryRow("SELECT has_k(CAST(? AS JSONB))", `{"k": 1}`).Scan(&has))
 	assert.True(has)
 }
+
+// TestVF_CommentsInArguments executes virtual functions whose arguments hold comments with a parenthesis and a comma,
+// and one that ends in a -- comment. They must expand to valid SQL on every engine, with the same results.
+func TestVF_CommentsInArguments(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB(t)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	baseLit := tsLiteral(db, base)
+	diff := queryFloat(t, db, "SELECT DATE_DIFF_MILLIS(DATE_ADD_MILLIS("+baseLit+" /* ) , */, 1500 -- , )\n), "+baseLit+")")
+	assert.True(math.Abs(diff-1500) < 0.5, "got %v ms", diff)
+	if db.DriverName() == "mysql" || db.DriverName() == "mariadb" {
+		diff = queryFloat(t, db, "SELECT DATE_DIFF_MILLIS(DATE_ADD_MILLIS("+baseLit+", 1500 # , )\n), "+baseLit+")")
+		assert.True(math.Abs(diff-1500) < 0.5, "hash comment: got %v ms", diff)
+	}
+}

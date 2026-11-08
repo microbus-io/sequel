@@ -40,10 +40,9 @@ lifecycle, not caller-facing work.
 */
 type Stmt struct {
 	*sql.Stmt
-	pq         *preparedQuery // the statement, unpacked when it was prepared
-	driverName string
-	db         *DB // for a DB-prepared Stmt: telemetry and simulated delay are read live per execution
-	tx         *Tx // for a Tx-bound Stmt: latch, short-circuit and snapshots come from the transaction
+	pq *preparedQuery // the statement, unpacked when it was prepared
+	db *DB            // for a DB-prepared Stmt: telemetry and simulated delay are read live per execution
+	tx *Tx            // for a Tx-bound Stmt: latch, short-circuit and snapshots come from the transaction
 	// err is set on a Stmt that could not be bound to its transaction, and is what every execution returns; the
 	// embedded *sql.Stmt is then nil.
 	err error

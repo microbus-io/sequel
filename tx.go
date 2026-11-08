@@ -212,7 +212,7 @@ func (tx *Tx) PrepareContext(ctx context.Context, query string) (*Stmt, error) {
 	if err != nil {
 		return nil, tx.recordErr(err)
 	}
-	return &Stmt{Stmt: sqlStmt, pq: pq, driverName: tx.driverName, tx: tx}, nil
+	return &Stmt{Stmt: sqlStmt, pq: pq, tx: tx}, nil
 }
 
 // Stmt shadows sql.Tx.Stmt: it binds a statement prepared on the [DB] to this transaction. The returned
@@ -225,14 +225,14 @@ func (tx *Tx) Stmt(stmt *Stmt) *Stmt {
 // StmtContext shadows sql.Tx.StmtContext (see Stmt).
 func (tx *Tx) StmtContext(ctx context.Context, stmt *Stmt) *Stmt {
 	if stmt.err != nil {
-		return &Stmt{pq: stmt.pq, driverName: tx.driverName, tx: tx, err: stmt.err}
+		return &Stmt{pq: stmt.pq, tx: tx, err: stmt.err}
 	}
 	if tx.batchRefuses() {
 		// Binding may prepare on the connection, which an open batch's result set may still be using.
-		return &Stmt{pq: stmt.pq, driverName: tx.driverName, tx: tx, err: tx.shortCircuit()}
+		return &Stmt{pq: stmt.pq, tx: tx, err: tx.shortCircuit()}
 	}
 	// The statement text was unpacked for the same pool, so it carries over; only the binding changes.
-	return &Stmt{Stmt: tx.Tx.StmtContext(ctx, stmt.Stmt), pq: stmt.pq, driverName: tx.driverName, tx: tx}
+	return &Stmt{Stmt: tx.Tx.StmtContext(ctx, stmt.Stmt), pq: stmt.pq, tx: tx}
 }
 
 /*
