@@ -467,3 +467,24 @@ func TestVF_MySQLCommentRules(t *testing.T) {
 		assert.Equal("SELECT DATE_ADD(a, INTERVAL (1000 # comment , )\n) * 1000 MICROSECOND)", q)
 	}
 }
+
+// PostgreSQL, CockroachDB and SQL Server nest block comments, so a "*/" inside a nested comment does not end the outer
+// one: a ? or a virtual function after it is still commented out. MySQL and SQLite do not nest.
+func TestVF_NestedBlockComments(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	const q = "SELECT /* outer /* inner */ ? NOW_UTC() still comment */ ?"
+	for _, driver := range []string{"pgx", "cockroachdb", "mssql"} {
+		assert.Equal("SELECT /* outer /* inner */ ? NOW_UTC() still comment */ $1", conformPlaceholders(driver, q), driver)
+		expanded, err := callExpand(driver, q)
+		assert.NoError(err)
+		assert.Contains(expanded, "? NOW_UTC() still", driver)
+		assert.Equal([]string{"/* a /* b */ c;\nd */ SELECT 1"}, splitMigration(driver, "/* a /* b */ c;\nd */ SELECT 1"), driver)
+	}
+	expanded, err := callExpand("mysql", q)
+	assert.NoError(err)
+	assert.Contains(expanded, "? (UTC_TIMESTAMP(3)) still", "MySQL ends the comment at the first */")
+	assert.Equal("SELECT /* a */ $1", conformPlaceholders("pgx", "SELECT /* a */ ?"))
+	assert.Equal("SELECT /* unterminated /* */ ?", conformPlaceholders("pgx", "SELECT /* unterminated /* */ ?"))
+}

@@ -56,7 +56,7 @@ db, err := sequel.OpenSingleton("", dsn)
 
 ## Schema Migration
 
-Sequel performs incremental schema migration using numbered SQL files (`1.sql`, `2.sql`, etc.). Migrations are:
+Sequel performs incremental schema migration using numbered SQL files (`1.sql`, `2.sql`, etc.). Each number belongs to one file: two files with the same number, such as `1.users.sql` and `01.roles.sql`, fail `Migrate` before anything runs. Migrations are:
 
 - **Concurrency-safe** - Distributed locking ensures only one replica executes each migration
 - **Tracked** - A `sequel_migrations` table records completed migrations
@@ -95,13 +95,15 @@ Each engine has its own driver name - `mysql`, `mariadb`, `pgx`, `cockroachdb`, 
 
 ### Data Source Names and Pseudo-Schemes
 
-`Open`, `OpenSingleton` and `CreateTestingDatabase` take a driver name and a data source name (DSN). Pass `""` as the driver name and sequel infers it from the DSN. Two pairs of engines share a DSN format that names neither: the MySQL Go driver's `user:pass@tcp(host:3306)/db` serves MySQL and MariaDB, and the `postgres://` URL serves PostgreSQL and CockroachDB. So sequel accepts three **pseudo-schemes** that exist only to name the driver:
+`Open`, `OpenSingleton` and `CreateTestingDatabase` take a driver name and a data source name (DSN). Pass `""` as the driver name and sequel infers it from the DSN. Two pairs of engines share a DSN format that names neither: the MySQL Go driver's `user:pass@tcp(host:3306)/db` serves MySQL and MariaDB, and the `postgres://` URL serves PostgreSQL and CockroachDB. So sequel accepts **pseudo-schemes** that exist only to name the driver:
 
 | Pseudo-scheme | Driver | Example | Reaches the Go driver as |
 |---------------|--------|---------|--------------------------|
 | `mysql://` | `mysql` | `mysql://root:pw@tcp(127.0.0.1:3306)/app?tls=true` | `root:pw@tcp(127.0.0.1:3306)/app?tls=true` |
 | `mariadb://` | `mariadb` | `mariadb://root:pw@tcp(127.0.0.1:3306)/app?tls=true` | `root:pw@tcp(127.0.0.1:3306)/app?tls=true` |
 | `cockroachdb://` | `cockroachdb` | `cockroachdb://root@127.0.0.1:26257/app?sslmode=disable` | `postgres://root@127.0.0.1:26257/app?sslmode=disable` |
+| `pgx+dsn://` | `pgx` | `pgx+dsn://host=localhost user=app dbname=app` | `host=localhost user=app dbname=app` |
+| `cockroachdb+dsn://` | `cockroachdb` | `cockroachdb+dsn://host=localhost user=app dbname=app` | `host=localhost user=app dbname=app` |
 
 `mysql://` and `mariadb://` are prefixes, not URLs. What follows them is the MySQL driver's own DSN format, unchanged: sequel strips the prefix and the driver parses the rest as it always has, so nothing needs percent-encoding and a socket works too (`mariadb://root@unix(/tmp/mysql.sock)/app`). `cockroachdb://` is followed by a PostgreSQL URL, and sequel replaces it with `postgres://`.
 
@@ -109,12 +111,14 @@ Each engine has its own driver name - `mysql`, `mariadb`, `pgx`, `cockroachdb`, 
 db, err := sequel.Open("", "mariadb://root:pw@tcp(127.0.0.1:3306)/app") // db.DriverName() == "mariadb"
 ```
 
+The `+dsn` prefixes wrap PostgreSQL keyword syntax without escaping or changing it. A bare keyword DSN is inferred as PostgreSQL when its first key is a PostgreSQL connection keyword (`host`, `dbname`, `user`...) and it holds no `;` outside a quoted value, so a SQL Server DSN in the ADO form (`server=...;...`) is never taken for one; testing DSNs use a prefix to preserve their logical driver, including CockroachDB.
+
 The pseudo-schemes matter most where only a DSN can be given, such as `SEQUEL_TESTING_DSN`. A testing DSN from `CreateTestingDatabase` keeps its pseudo-scheme, so it opens as the same driver.
 
 The driver is inferred in this order, and the first match wins:
 
-1. **A scheme**, in any letter case and on any port: `mysql://`, `mariadb://`, `cockroachdb://`, `postgres://` or `postgresql://` (`pgx`), `sqlserver://` (`mssql`), `file:` (`sqlite`).
-2. **A format**: `:memory:` or a `.db`, `.sqlite` or `.sqlite3` file (`sqlite`), or `tcp(` (`mysql`).
+1. **A scheme**, in any letter case and on any port: `mysql://`, `mariadb://`, `cockroachdb://`, `pgx+dsn://`, `cockroachdb+dsn://`, `postgres://` or `postgresql://` (`pgx`), `sqlserver://` (`mssql`), `file:` (`sqlite`).
+2. **A format**: `:memory:` or a `.db`, `.sqlite` or `.sqlite3` file (`sqlite`), or `tcp(` (`mysql`), or a PostgreSQL keyword DSN as described above (`pgx`).
 3. **A default port**, as a last guess: `:3306` (`mysql`), `:5432` (`pgx`), `:26257` (`cockroachdb`), `:1433` (`mssql`).
 
 So a DSN in the MySQL driver's own format is taken for MySQL, and a `postgres://` URL for PostgreSQL even on port 26257. Use the pseudo-scheme, or pass the driver name, for MariaDB and CockroachDB.
@@ -316,7 +320,7 @@ err := db.Transact(ctx, func(tx *sequel.Tx) error {
 ```
 
 - **Retry-safe by re-running.** A retried attempt re-executes the closure from the start in a new transaction (the previous attempt is rolled back), so the closure must be safe to run more than once - any non-transactional side effects it performs may repeat. Because retries re-run the Go code rather than replay recorded statements, a transaction whose control flow depends on data committed by another transaction between attempts stays correct.
-- **No partial commits.** The `Tx` passed to the closure records the first error and short-circuits every statement after it, so the transaction never commits half its work even if the closure forgets to check an error. This covers every way an error surfaces: a failed `Exec`/`Query`/`InsertReturnID` statement, an error while iterating a result set (a `rows.Scan` failure or a streaming error from `rows.Err()`), a failed `QueryRow(...).Scan` - with `sql.ErrNoRows` exempt, since a missing row is normal control flow rather than a failure - executions of a prepared statement, whether prepared inside the transaction (`tx.Prepare`) or bound to it (`tx.Stmt`), and every failure or misuse of a batch: a failed statement or scan, and a batch never sent or never closed (`tx.Batch`, see [Statement Batches](#statement-batches)).
+- **No partial commits.** The `Tx` passed to the closure records the first error and short-circuits every statement after it, so the transaction never commits half its work even if the closure forgets to check an error. This covers every way an error surfaces: a failed `Exec`/`Query`/`InsertReturnID` statement, an error while iterating a result set (a `rows.Scan` failure, a streaming error from `rows.Err()`, or an error from `rows.Close()`, where a driver may find a failed statement among the results it discards), a failed `QueryRow(...).Scan` - with `sql.ErrNoRows` exempt, since a missing row is normal control flow rather than a failure - executions of a prepared statement, whether prepared inside the transaction (`tx.Prepare`) or bound to it (`tx.Stmt`), and every failure or misuse of a batch: a failed statement or scan, and a batch never sent or never closed (`tx.Batch`, see [Statement Batches](#statement-batches)).
 - **SQL Server `XACT_ABORT ON`.** Applied automatically inside `Transact` so any statement error aborts the whole transaction server-side.
 
 A `Tx` from `BeginTx` does neither error-recording nor retry - it behaves exactly like `sql.Tx`.

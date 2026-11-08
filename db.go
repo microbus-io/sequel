@@ -69,11 +69,6 @@ var (
 	// database. An in-memory database is dropped with its last connection, and a pool may close all of
 	// its connections while its handle stays open.
 	testingAnchors = map[string]*sql.DB{}
-
-	// insertSourceClausePattern matches the start of an INSERT statement's source clause - either
-	// VALUES (INSERT ... VALUES (...)) or SELECT (INSERT ... SELECT ...). MSSQL's OUTPUT INSERTED
-	// clause is injected immediately before whichever appears, so InsertReturnID works for both forms.
-	insertSourceClausePattern = regexp.MustCompile(`(?i)\s+(VALUES|SELECT)\b`)
 )
 
 // maxTestingDatabaseName is the longest testing database name minted: PostgreSQL's identifier limit, one under MySQL's.
@@ -107,8 +102,8 @@ func serverAddress(driverName, dsn string) string {
 			return cfg.Host + ":" + strconv.Itoa(int(cfg.Port))
 		}
 	case "mssql":
-		if u, err := url.Parse(dsn); err == nil {
-			return u.Host
+		if cfg, _, err := msdsn.Parse(dsn); err == nil {
+			return cfg.Host + ":" + strconv.Itoa(int(cfg.Port)) + "/" + cfg.Instance
 		}
 	}
 	return ""
@@ -171,6 +166,10 @@ included: mysql://, mariadb://, postgres:// or postgresql:// (pgx), cockroachdb:
 MySQL driver's own format, which names neither engine, and are stripped before the driver sees
 it; without one, that format is taken for MySQL. A cockroachdb:// URL reaches the driver as
 postgres://. A default port is the last guess, for a data source name with no scheme.
+
+A PostgreSQL keyword DSN (host=... dbname=...) is inferred as pgx when its first key is a
+PostgreSQL connection keyword and it has no ; outside a quoted value. The prefixes pgx+dsn:// and cockroachdb+dsn://
+name the logical driver of a keyword DSN and are stripped before the Go driver parses it.
 
 On "pgx" and "cockroachdb", every connection starts its session in the UTC time zone,
 whatever the server, database or role default, so that NOW_UTC() stores the right instant
@@ -1048,15 +1047,58 @@ func insertReturnID(ctx context.Context, qe Executor, driverName string, idColum
 	return 0, errors.New("unsupported driver name: %s", driverName)
 }
 
-// injectOutputInserted rewrites an INSERT statement to include an OUTPUT INSERTED clause
-// before the source clause (VALUES or SELECT), for use with MSSQL. This makes InsertReturnID
-// work for both INSERT ... VALUES (...) and INSERT ... SELECT ... forms.
+// injectOutputInserted rewrites an INSERT statement to include an OUTPUT INSERTED clause before the source clause
+// (VALUES, DEFAULT VALUES or SELECT) of its top-level INSERT, for use with MSSQL. It reads only code, at the
+// outermost level: a VALUES or SELECT in a comment, a string, a quoted identifier, a column list or a CTE before the
+// INSERT is not the source clause.
 func injectOutputInserted(stmt string, idColumn string) (string, error) {
-	loc := insertSourceClausePattern.FindStringIndex(stmt)
-	if loc == nil {
-		return "", errors.New("VALUES or SELECT clause not found in INSERT statement")
+	inserting := false
+	depth := 0
+	prevStart, prev := -1, ""
+	floor := 0 // The end of the last comment or string, which the clause must not be moved into
+	for i := 0; i < len(stmt); {
+		if j := skipNonCode("mssql", stmt, i, false); j > i {
+			i = j
+			floor = j
+			continue
+		}
+		ch := stmt[i]
+		switch {
+		case ch == '(':
+			depth++
+		case ch == ')':
+			depth--
+		case isWordByte(ch) && (i == 0 || !isIdentByte(stmt[i-1])):
+			j := i
+			for j < len(stmt) && isWordByte(stmt[j]) {
+				j++
+			}
+			if depth == 0 {
+				word := strings.ToUpper(stmt[i:j])
+				if !inserting {
+					inserting = word == "INSERT"
+				} else if word == "VALUES" || word == "SELECT" {
+					at := i
+					if word == "VALUES" && prev == "DEFAULT" {
+						at = prevStart
+					}
+					for at > floor && isSQLSpace(stmt[at-1]) {
+						at--
+					}
+					sep := ""
+					if !isSQLSpace(stmt[at]) {
+						sep = " "
+					}
+					return stmt[:at] + " OUTPUT INSERTED." + idColumn + sep + stmt[at:], nil
+				}
+				prevStart, prev = i, word
+			}
+			i = j
+			continue
+		}
+		i++
 	}
-	return stmt[:loc[0]] + " OUTPUT INSERTED." + idColumn + stmt[loc[0]:], nil
+	return "", errors.New("VALUES or SELECT clause not found in INSERT statement")
 }
 
 // leftoverTestingDatabasePattern matches a database name that the leftover-cleanup sweep is allowed to
@@ -1087,26 +1129,19 @@ func databaseNameFromDataSourceName(driverName string, dsn string) (databaseName
 		}
 		return cfg.DBName, nil
 	case "pgx", "cockroachdb":
-		_, err = pgx.ParseConfig(dsn)
+		// The driver's own reading, which covers a URL, a keyword DSN and the environment alike
+		cfg, err := pgx.ParseConfig(dsn)
 		if err != nil {
 			return "", dsnParseError(driverName)
 		}
-		u, err := url.Parse(dsn)
-		if err != nil {
-			return "", dsnParseError(driverName)
-		}
-		return strings.TrimPrefix(u.Path, "/"), nil
+		return cfg.Database, nil
 	case "mssql":
 		// https://github.com/microsoft/go-mssqldb?tab=readme-ov-file#common-parameters
-		_, _, err = msdsn.Parse(dsn)
+		cfg, _, err := msdsn.Parse(dsn)
 		if err != nil {
 			return "", dsnParseError(driverName)
 		}
-		u, err := url.Parse(dsn)
-		if err != nil {
-			return "", dsnParseError(driverName)
-		}
-		return u.Query().Get("database"), nil
+		return cfg.Database, nil
 	case "sqlite":
 		// The DSN is the file path, optionally prefixed with "file:" and with query params
 		path := dsn
@@ -1135,35 +1170,65 @@ func setDatabaseInDataSourceName(driverName string, dsn string, databaseName str
 		alteredDSN = cfg.FormatDSN()
 		return alteredDSN, nil
 	case "pgx", "cockroachdb":
-		_, err = pgx.ParseConfig(dsn)
+		before, err := pgx.ParseConfig(dsn)
 		if err != nil {
 			return "", dsnParseError(driverName)
 		}
-		u, err := url.Parse(dsn)
-		if err != nil {
-			return "", dsnParseError(driverName)
+		if _, isURL := cutPostgresScheme(dsn); isURL {
+			u, err := url.Parse(dsn)
+			if err != nil {
+				return "", dsnParseError(driverName)
+			}
+			u.Path = "/" + databaseName
+			alteredDSN = u.String()
+		} else {
+			// A later keyword overrides an earlier one
+			alteredDSN = dsn + " dbname='" + databaseName + "'"
 		}
-		u.Path = "/" + databaseName
-		alteredDSN = u.String()
+		after, err := pgx.ParseConfig(alteredDSN)
+		if err != nil || after.Database != databaseName || after.Host != before.Host || after.Port != before.Port ||
+			after.User != before.User || after.Password != before.Password {
+			// A keyword DSN ending in a backslash, say, which escapes the separator
+			return "", errors.New("unable to set the database in this %s data source name", driverName)
+		}
 		return alteredDSN, nil
 	case "mssql":
 		// https://github.com/microsoft/go-mssqldb?tab=readme-ov-file#common-parameters
-		_, _, err = msdsn.Parse(dsn)
+		before, _, err := msdsn.Parse(dsn)
 		if err != nil {
 			return "", dsnParseError(driverName)
 		}
-		u, err := url.Parse(dsn)
-		if err != nil {
-			return "", dsnParseError(driverName)
-		}
-		q := u.Query()
-		if databaseName == "" {
-			q.Del("database")
+		if strings.HasPrefix(dsn, "sqlserver://") {
+			u, err := url.Parse(dsn)
+			if err != nil {
+				return "", dsnParseError(driverName)
+			}
+			q := u.Query()
+			// The driver folds keys to lower case while iterating a map. Leaving a case variant would make
+			// the selected database depend on map iteration order, even after a successful validation parse.
+			for key := range q {
+				if strings.EqualFold(key, "database") {
+					q.Del(key)
+				}
+			}
+			if databaseName != "" {
+				q.Set("database", databaseName)
+			}
+			u.RawQuery = q.Encode()
+			alteredDSN = u.String()
 		} else {
-			q.Set("database", databaseName)
+			// An ADO or ODBC DSN, where a later key overrides an earlier one, synonyms (initial catalog) included
+			sep := ";"
+			if strings.HasSuffix(dsn, ";") {
+				sep = ""
+			}
+			alteredDSN = dsn + sep + "database=" + databaseName
 		}
-		u.RawQuery = q.Encode()
-		alteredDSN = u.String()
+		after, _, err := msdsn.Parse(alteredDSN)
+		if err != nil || after.Database != databaseName || after.Host != before.Host || after.Port != before.Port ||
+			after.Instance != before.Instance || after.User != before.User || after.Password != before.Password {
+			return "", errors.New("unable to set the database in this %s data source name", driverName)
+		}
 		return alteredDSN, nil
 	case "sqlite":
 		// Replace the file path in the DSN, preserving any "file:" prefix and query params
@@ -1218,9 +1283,19 @@ func physicalDriverName(driverName string) string {
 // bare DSN say it is CockroachDB on any port.
 const cockroachDBScheme = "cockroachdb://"
 
-// toPostgresScheme rewrites a cockroachdb:// URL to the postgres:// URL the driver accepts, and returns any
-// other DSN unchanged.
+// Keyword DSN prefixes name the driver without serializing or escaping the driver's keyword syntax.
+const (
+	pgxKeywordScheme       = "pgx+dsn://"
+	cockroachKeywordScheme = "cockroachdb+dsn://"
+)
+
+// toPostgresScheme removes keyword DSN prefixes or rewrites a cockroachdb:// URL to postgres://.
 func toPostgresScheme(dsn string) string {
+	for _, prefix := range []string{pgxKeywordScheme, cockroachKeywordScheme} {
+		if rest, ok := strings.CutPrefix(dsn, prefix); ok {
+			return rest
+		}
+	}
 	if rest, ok := strings.CutPrefix(dsn, cockroachDBScheme); ok {
 		return "postgres://" + rest
 	}
@@ -1256,7 +1331,7 @@ func cutPostgresScheme(dsn string) (rest string, ok bool) {
 var mySQLNetworkPattern = regexp.MustCompile(`^[^/]*@(tcp[46]?|unix)\(`)
 
 // knownSchemes are the URL schemes sequel recognizes, in lower case.
-var knownSchemes = []string{cockroachDBScheme, mariaDBScheme, mySQLScheme, "postgres://", "postgresql://", "sqlserver://"}
+var knownSchemes = []string{cockroachDBScheme, pgxKeywordScheme, cockroachKeywordScheme, mariaDBScheme, mySQLScheme, "postgres://", "postgresql://", "sqlserver://"}
 
 // lowerScheme lower-cases a known URL scheme, which is case-insensitive, so that the scheme checks and rewrites see
 // one spelling.
@@ -1268,6 +1343,41 @@ func lowerScheme(dsn string) string {
 		}
 	}
 	return dsn
+}
+
+// libpqKeywords are the connection keywords of a PostgreSQL keyword DSN, one of which must come first for the DSN to be
+// inferred as pgx.
+var libpqKeywords = map[string]bool{
+	"host": true, "hostaddr": true, "port": true, "dbname": true, "user": true, "password": true, "passfile": true,
+	"require_auth": true, "channel_binding": true, "connect_timeout": true, "client_encoding": true, "options": true,
+	"application_name": true, "fallback_application_name": true, "keepalives": true, "sslmode": true, "sslcert": true,
+	"sslkey": true, "sslrootcert": true, "sslpassword": true, "sslnegotiation": true, "target_session_attrs": true,
+	"service": true, "servicefile": true, "gssencmode": true, "krbsrvname": true, "load_balance_hosts": true,
+	"min_protocol_version": true, "max_protocol_version": true, "timezone": true,
+}
+
+// isPostgresKeywordDSN reports whether a DSN is a PostgreSQL keyword DSN (host=... dbname=...): its first key is a
+// libpq keyword, it has no ; outside a quoted value, and pgx parses it. pgx alone is not enough, since it takes any
+// unknown key for a runtime parameter: an ADO SQL Server DSN (server=...;password=...) parses, and would have been
+// opened as PostgreSQL with the SQL Server password. ADO separates its keys with ;, and a keyword DSN with spaces.
+func isPostgresKeywordDSN(dsn string) bool {
+	eq := strings.IndexByte(dsn, '=')
+	if eq <= 0 || !libpqKeywords[strings.TrimSpace(dsn[:eq])] {
+		return false
+	}
+	quoted := false
+	for i := 0; i < len(dsn); i++ {
+		switch {
+		case quoted && dsn[i] == '\\':
+			i++
+		case dsn[i] == '\'':
+			quoted = !quoted
+		case dsn[i] == ';' && !quoted:
+			return false
+		}
+	}
+	_, err := pgx.ParseConfig(dsn)
+	return err == nil
 }
 
 // inferDriverName tries to infer the driver name from the data source name.
@@ -1283,6 +1393,8 @@ func inferDriverName(dataSourceName string) (driverName string) {
 	// A scheme names the driver, whatever the port
 	for _, scheme := range []struct{ prefix, driver string }{
 		{cockroachDBScheme, "cockroachdb"},
+		{pgxKeywordScheme, "pgx"},
+		{cockroachKeywordScheme, "cockroachdb"},
 		{mariaDBScheme, "mariadb"},
 		{mySQLScheme, "mysql"},
 		{"postgres://", "pgx"},
@@ -1293,6 +1405,9 @@ func inferDriverName(dataSourceName string) (driverName string) {
 		if strings.HasPrefix(dataSourceName, scheme.prefix) {
 			return scheme.driver
 		}
+	}
+	if isPostgresKeywordDSN(dataSourceName) {
+		return "pgx"
 	}
 	if dataSourceName == ":memory:" {
 		return "sqlite"
@@ -1407,10 +1522,17 @@ func CreateTestingDatabase(driverName string, baseDataSourceName string, uniqueT
 	// asked for, where the driver's own format cannot, or where the base had one
 	named := func(native string) string {
 		switch driverName {
-		case "cockroachdb":
+		case "pgx", "cockroachdb":
 			if rest, ok := cutPostgresScheme(native); ok {
-				return cockroachDBScheme + rest
+				if driverName == "cockroachdb" {
+					return cockroachDBScheme + rest
+				}
+				return native
 			}
+			if driverName == "cockroachdb" {
+				return cockroachKeywordScheme + native
+			}
+			return pgxKeywordScheme + native
 		case "mariadb":
 			return mariaDBScheme + native
 		case "mysql":
@@ -1717,6 +1839,10 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 		if seqNum <= watermark {
 			// Already migrated
 			continue
+		}
+		if other, ok := fileNames[seqNum]; ok {
+			// Only one of the two would run, and the number would be recorded as done
+			return errors.New("migrations %s and %s have the same sequence number %d", other, file.Name(), seqNum)
 		}
 		sequenceNumbersToRun = append(sequenceNumbersToRun, seqNum)
 		content, err := fs.ReadFile(fileSys, file.Name())

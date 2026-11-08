@@ -157,6 +157,15 @@ that ends in a line comment (`--`, or MySQL/MariaDB `#`) keeps its newline (`tri
 after the argument. On MySQL and MariaDB a `--` is a comment only before whitespace (`1--1` is arithmetic) and `#` is
 one too, which `skipNonCode` follows. `TestVF_ArgumentsFollowTheLexer` and `TestVF_MySQLCommentRules` pin it.
 
+**Block comments nest on PostgreSQL, CockroachDB and SQL Server**, and `skipNonCode` counts their depth there; MySQL and
+SQLite end a comment at its first `*/`. Ended at the first `*/` everywhere, `/* a /* b */ ? */ ?` numbered the
+commented-out `?` as `$1`, and a nested comment holding a line-ending `;` split a migration. SQL Server's Go driver
+nests too (`internal/querytext`), which matters as much as the server: the conformer must skip what the driver skips.
+`TestVF_NestedBlockComments` pins it. Telemetry's table extraction (`maskNonCode`) and SQL Server's `OUTPUT INSERTED`
+injection (`injectOutputInserted`) read SQL through `skipNonCode` too; the first once took a `FROM` inside a string
+literal and put the data that followed into the span name, and the second injected `OUTPUT` into a comment that held
+the word `SELECT`, so the insert ran and returned no ID.
+
 ## An expansion keeps its arguments in the order they were written
 
 MySQL, MariaDB and SQLite bind bare `?` in text order, and PostgreSQL and CockroachDB number `?` after expansion, so on
@@ -536,8 +545,11 @@ that leave a transaction usable after a statement fails. `BeginTx` does not enab
 
 All statement paths must participate, including prepared-statement executions and deferred row errors:
 
-- `Rows` records Scan failures and streaming errors when Next or NextResultSet returns false. A healthy drain
-  or deliberate early break records nothing. `fixtures/rows_test.go` covers ignored scan errors and healthy reads.
+- `Rows` records Scan failures, streaming errors when Next or NextResultSet returns false, and Close's error. A
+  healthy drain or deliberate early break records nothing of itself, but Close can still fail after a break: a driver
+  discards the unread results there, and MySQL reports a later statement of a multi-statement query failing only
+  then, so an ignored Close once let the closure commit. `fixtures/rows_test.go` covers ignored scan errors and
+  healthy reads, `TestRows_CloseErrorIsRecorded` the Close error, with a driver whose rows fail at Close.
 - `Row` records Scan/Err failures except `sql.ErrNoRows`, which is normal control flow a caller may handle and
   commit after (`TestTransact_CommitsOnErrNoRows`). An unpack failure must return a `shortErr` Row rather than
   execute an empty query: some drivers report that as `ErrNoRows`, bypassing recording
@@ -685,6 +697,11 @@ anywhere in the text, one inside a string literal skipped its statement and the 
 `--` comments are stripped by `stripLineComments`, which leaves one inside a quoted string alone. Whitespace inside a
 statement is no longer trimmed line by line, since that rewrote multi-line string literals.
 
+**Two files with one sequence number fail `Migrate`** before anything runs (`1.a.sql` and `1.b.sql`, or `1.sql` and
+`01.sql`). They were indexed by number, so one overwrote the other, ran alone, and the number was recorded as done, so
+fixing the files later reran nothing. Duplicates at or below the watermark are not checked: that number is decided,
+and failing a deployed application's startup over it repairs nothing.
+
 ## Hardening against uncontrolled input
 
 Sequel splices text into SQL, error messages, and telemetry attributes in a handful of places. The rule in
@@ -704,6 +721,22 @@ Four places carry input sequel does not control:
 - **DSN parse errors omit both the DSN and parser error text** (`dsnParseError`). Parser errors can echo
   credentials, and malformed input cannot be reliably redacted across URL, keyword, ADO and ODBC grammars.
   Report only the driver; do not wrap the original error or reintroduce a best-effort redactor.
+- **A DSN's database is read and set in the driver's own grammar** (`databaseNameFromDataSourceName`,
+  `setDatabaseInDataSourceName`, `serverAddress`). They once parsed with the driver to validate and then treated the
+  text as a URL: an ADO DSN ending in `;` gained `?database=...`, which the driver ignores, so a testing DSN kept the
+  base's own database and tests would have written to it; a PostgreSQL keyword DSN became `/testing_...`. Reading
+  uses the parsed config. Setting appends the key (`;database=` on ADO and ODBC, ` dbname=''` on keyword DSNs), since
+  both drivers let a later key override an earlier one, and then **re-parses and checks** the database, host, port,
+  user and password, refusing a DSN it cannot rewrite - a keyword DSN ending in a backslash, which escapes the
+  separator - rather than returning one that connects somewhere else. `TestDB_DatabaseInEveryDSNGrammar` pins it. SQL Server URL
+  database keys must be removed case-insensitively before setting one canonical key: the driver lowercases keys
+  while iterating a map, so a case-variant duplicate can select a different database on the next parse.
+  Keyword testing DSNs carry `pgx+dsn://` or `cockroachdb+dsn://`; strip that prefix before driver parsing and cache
+  identity calculation. This keeps keyword syntax intact while preserving the logical driver at an inferred open.
+  A bare keyword DSN is inferred as pgx only when its first key is a libpq keyword and it has no `;` outside quotes
+  (`isPostgresKeywordDSN`). `pgx.ParseConfig` alone is no test: it takes any unknown key for a runtime parameter, so
+  every ADO SQL Server DSN parsed, and `Open("", ...)` would have sent its password to a PostgreSQL server on
+  localhost. `TestDB_InferKeywordDSN` pins it.
 - **`db.operation.name` is bounded, not curated** - see the section below.
 - **`InsertReturnID`'s idColumn** is spliced into the statement (`RETURNING <col>` on PostgreSQL/
   CockroachDB, `OUTPUT INSERTED.<col>` on SQL Server), so it must match `identifierPattern`
@@ -822,7 +855,8 @@ Statement text is unaffected by all of this: the Debug log still carries the rea
 
 `db.operation.name` is bounded as described above. `db.collection.name` (the table) is
 emitted **only when `parseOperation` can determine it unambiguously** - a single target after
-`FROM`/`INTO`/`UPDATE`, with no join, multi-table list, or subquery. The alternative (best-effort table
+`FROM`/`INTO`/`UPDATE` in code, with no join, multi-table list, or subquery; keywords in strings and comments
+do not count, and a table position holding a string or a comment yields no table. The alternative (best-effort table
 extraction from arbitrary SQL) would produce confident-looking but wrong attributes and would inflate
 span-name cardinality; omitting the table when unsure means a *present* table is trustworthy.
 

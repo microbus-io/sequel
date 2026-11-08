@@ -94,7 +94,7 @@ func newPreparedQuery(driverName string, query string) *preparedQuery {
 		pq.text = expanded
 	}
 
-	op, table := parseOperation(pq.text)
+	op, table := parseOperation(driverName, pq.text)
 	pq.op = op
 	pq.spanName = op
 	attrs := []attribute.KeyValue{

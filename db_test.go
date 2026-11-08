@@ -20,6 +20,7 @@ import (
 	"context"
 	"database/sql/driver"
 	"encoding/json"
+	"net/url"
 	"runtime"
 	"strconv"
 	"strings"
@@ -29,6 +30,7 @@ import (
 	"testing/fstest"
 	"time"
 
+	"github.com/denisenkom/go-mssqldb/msdsn"
 	"github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
 	"github.com/microbus-io/errors"
@@ -1507,7 +1509,6 @@ func TestDB_ParseErrorsDoNotLeakPasswords(t *testing.T) {
 		{"mssql", `server=h;password="top" secret;port=bad`},
 		{"mssql", "server=h;password={top} secret;port=bad"},
 		{"mssql", "sqlserver://sa:secret@host:bad"},
-		{"mssql", "server=h;user id=sa;password=a:secret@c;database=x"},
 		{"pgx", "host=x password='top secret' port=bad"},
 		{"pgx", "postgres://u:secret@host:bad/db"},
 		{"mysql", "user:secret@tcp(localhost)/db?timeout=bad"},
@@ -1795,4 +1796,200 @@ func TestMigrate_AddsTheOwnerColumnToAnOldTable(t *testing.T) {
 	var n int
 	assert.NoError(db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('never_runs', 'owner_col')").Scan(&n))
 	assert.Equal(1, n)
+}
+
+// The database of an ADO, ODBC or keyword DSN is read and set in the driver's own grammar, never as a URL: an ADO
+// testing DSN once kept its original database, and a PostgreSQL keyword DSN was replaced whole. Every rewrite is
+// checked with the driver's parser.
+func TestDB_DatabaseInEveryDSNGrammar(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	for _, dsn := range []string{
+		"server=localhost;uid=review;pwd=secret;database=production;",
+		"server=localhost;user id=review;password=a:b@c;Initial Catalog=production",
+		"odbc:server=localhost;uid=review;pwd={se;cret};database=production",
+		"sqlserver://review:secret@localhost:1433?database=production",
+	} {
+		name, err := databaseNameFromDataSourceName("mssql", dsn)
+		assert.NoError(err, "%q", dsn)
+		assert.Equal("production", name, "%q", dsn)
+		for _, db := range []string{"testing_02_review", ""} {
+			altered, err := setDatabaseInDataSourceName("mssql", dsn, db)
+			if !assert.NoError(err, "%q", dsn) {
+				continue
+			}
+			before, _, _ := msdsn.Parse(dsn)
+			cfg, _, err := msdsn.Parse(altered)
+			assert.NoError(err)
+			assert.Equal(db, cfg.Database, "%q", altered)
+			assert.Equal("localhost", cfg.Host)
+			assert.Equal(before.User, cfg.User)
+			assert.Equal(before.Password, cfg.Password)
+		}
+		assert.True(strings.HasPrefix(serverAddress("mssql", dsn), "localhost:"), "%q", dsn)
+	}
+
+	for _, dsn := range []string{
+		"host=localhost user=review password=secret dbname=production",
+		"host=localhost user=review password='se cret' dbname = production sslmode=disable",
+		"postgres://review:secret@localhost:5432/production?sslmode=disable",
+	} {
+		name, err := databaseNameFromDataSourceName("pgx", dsn)
+		assert.NoError(err, "%q", dsn)
+		assert.Equal("production", name, "%q", dsn)
+		for _, db := range []string{"testing_02_review", ""} {
+			altered, err := setDatabaseInDataSourceName("pgx", dsn, db)
+			if !assert.NoError(err, "%q", dsn) {
+				continue
+			}
+			cfg, err := pgx.ParseConfig(altered)
+			assert.NoError(err)
+			assert.Equal(db, cfg.Database, "%q", altered)
+			assert.Equal("localhost", cfg.Host)
+			assert.Equal("review", cfg.User)
+		}
+	}
+	// A keyword DSN whose last value ends in a backslash cannot take another keyword; it is refused, not misread
+	_, err := setDatabaseInDataSourceName("pgx", `host=localhost user=review password=abc\`, "testing_02_review")
+	assert.Error(err)
+}
+
+// Two migration files with one sequence number - 1.sql and 01.sql, say - fail Migrate before anything runs, rather
+// than one of them running and the number being recorded as done. A duplicate already below the watermark has been
+// decided, and is left alone.
+func TestMigrate_DuplicateSequenceNumbersFail(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newSQLiteDB(t)
+	for _, names := range [][2]string{{"1.first.sql", "1.second.sql"}, {"2.sql", "02.sql"}} {
+		err := db.Migrate(t.Name()+names[0], fstest.MapFS{
+			names[0]: {Data: []byte("CREATE TABLE dup_a (id INT)")},
+			names[1]: {Data: []byte("CREATE TABLE dup_b (id INT)")},
+		})
+		if assert.Error(err) {
+			assert.Contains(err.Error(), names[0])
+			assert.Contains(err.Error(), names[1])
+		}
+		var n int
+		assert.NoError(db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name IN ('dup_a', 'dup_b')").Scan(&n))
+		assert.Equal(0, n)
+	}
+
+	assert.NoError(db.Migrate(t.Name(), fstest.MapFS{"1.a.sql": {Data: []byte("CREATE TABLE dup_c (id INT)")}}))
+	assert.NoError(db.Migrate(t.Name(), fstest.MapFS{
+		"1.a.sql": {Data: []byte("CREATE TABLE dup_c (id INT)")},
+		"1.b.sql": {Data: []byte("CREATE TABLE dup_d (id INT)")},
+	}))
+}
+
+// SQL Server's OUTPUT INSERTED goes before the source clause of the top-level INSERT, which a VALUES or SELECT in a
+// comment, a string, a quoted identifier or a CTE before it is not.
+func TestDB_InjectOutputInsertedFindsTheSourceClause(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	for _, c := range []struct{ in, out string }{
+		{"INSERT /* SELECT an example */ INTO t(v) VALUES (?)", "INSERT /* SELECT an example */ INTO t(v) OUTPUT INSERTED.id VALUES (?)"},
+		{"INSERT INTO t(v) -- VALUES\nSELECT v FROM s", "INSERT INTO t(v) -- VALUES\n OUTPUT INSERTED.id SELECT v FROM s"},
+		{"INSERT INTO [select values] (v) VALUES (?)", "INSERT INTO [select values] (v) OUTPUT INSERTED.id VALUES (?)"},
+		{"INSERT INTO t (v) VALUES ('SELECT')", "INSERT INTO t (v) OUTPUT INSERTED.id VALUES ('SELECT')"},
+		{"WITH x AS (SELECT 1 AS a) INSERT INTO t (v) SELECT a FROM x", "WITH x AS (SELECT 1 AS a) INSERT INTO t (v) OUTPUT INSERTED.id SELECT a FROM x"},
+		{"INSERT INTO t DEFAULT VALUES", "INSERT INTO t OUTPUT INSERTED.id DEFAULT VALUES"},
+		{"INSERT INTO t (selected, values_x) VALUES (?, ?)", "INSERT INTO t (selected, values_x) OUTPUT INSERTED.id VALUES (?, ?)"},
+	} {
+		out, err := injectOutputInserted(c.in, "id")
+		assert.NoError(err, "%q", c.in)
+		assert.Equal(c.out, out, "%q", c.in)
+	}
+	_, err := injectOutputInserted("INSERT /* VALUES */ INTO t EXEC p", "id")
+	assert.Error(err)
+}
+
+func TestDB_SQLServerDatabaseKeyCaseVariants(t *testing.T) {
+	t.Parallel()
+	for _, query := range []string{
+		"Database=production", "DATABASE=production", "dAtAbAsE=production",
+		"Database=production&database=other&DATABASE=third",
+	} {
+		for _, target := range []string{"testing_02_review", ""} {
+			dsn, err := setDatabaseInDataSourceName("mssql", "sqlserver://review:secret@localhost:1433?"+query, target)
+			if err != nil {
+				t.Fatal(err)
+			}
+			u, err := url.Parse(dsn)
+			if err != nil {
+				t.Fatal(err)
+			}
+			keys := 0
+			for key, values := range u.Query() {
+				if strings.EqualFold(key, "database") {
+					keys++
+					if key != "database" || len(values) != 1 || values[0] != target {
+						t.Fatalf("noncanonical database key in %q", dsn)
+					}
+				}
+			}
+			if (target == "" && keys != 0) || (target != "" && keys != 1) {
+				t.Fatalf("unexpected database keys in %q", dsn)
+			}
+			for range 100 {
+				cfg, _, err := msdsn.Parse(dsn)
+				if err != nil || cfg.Database != target {
+					t.Fatalf("unstable database selection: %q, %v", cfg.Database, err)
+				}
+			}
+		}
+	}
+}
+
+func TestDB_KeywordDSNDriverPrefixes(t *testing.T) {
+	t.Parallel()
+	const native = "host=localhost port=54329 user=review password='se cret' dbname=example sslmode=disable options='-c timezone=UTC'"
+	for _, dsn := range []string{native, "host=localhost dbname=app.db", "host=localhost password='tcp('"} {
+		if got := inferDriverName(dsn); got != "pgx" {
+			t.Fatalf("keyword DSN inferred as %q", got)
+		}
+	}
+	if got := inferDriverName("root:pw=secret@tcp(localhost)/app"); got != "mysql" {
+		t.Fatalf("MySQL password mistaken for a keyword DSN: %q", got)
+	}
+	for _, c := range []struct{ prefix, driver string }{
+		{pgxKeywordScheme, "pgx"}, {cockroachKeywordScheme, "cockroachdb"},
+	} {
+		for _, prefix := range []string{c.prefix, strings.ToUpper(c.prefix)} {
+			db, err := Open("", prefix+native)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if db.DriverName() != c.driver || db.dataSourceName != native {
+				t.Errorf("prefix changed driver or keyword parameters: %q", db.DriverName())
+			}
+			db.Close()
+		}
+	}
+}
+
+// A PostgreSQL keyword DSN is inferred as pgx, but only one: pgx parses any key=value text, an ADO SQL Server DSN
+// included, which must not be opened as PostgreSQL with its SQL Server password.
+func TestDB_InferKeywordDSN(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	for dsn, want := range map[string]string{
+		"host=localhost user=review password=secret dbname=app": "pgx",
+		"dbname=app":                    "pgx",
+		"host=localhost password='a;b'": "pgx",
+		"server=localhost;user id=sa;password=secret;database=app": "",
+		"server=localhost,1433;uid=sa;pwd=secret":                  "",
+		"password=secret;server=localhost;database=app":            "",
+		"Server=tcp:host,1433;Database=app":                        "",
+		"foo=bar":                                                  "",
+		"host=localhost;port=1433":                                 "",
+		"pgx+dsn://host=localhost dbname=app":                      "pgx",
+		"cockroachdb+dsn://host=localhost dbname=app":              "cockroachdb",
+	} {
+		assert.Equal(want, inferDriverName(dsn), "%q", dsn)
+	}
 }

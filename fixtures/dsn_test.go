@@ -97,3 +97,31 @@ func TestDSN_MariaDBTestingDSNNamesItsDriver(t *testing.T) {
 		{"", "mysql://" + native, "mysql://", "mysql"},
 	})
 }
+
+// Both logical PostgreSQL drivers must survive the provision -> Open/OpenSingleton flow with a keyword DSN.
+func TestDSN_KeywordTestingDSNNamesItsDriver(t *testing.T) {
+	t.Parallel()
+	base := os.Getenv("SEQUEL_TESTING_DSN")
+	if !strings.HasPrefix(base, "host=") {
+		t.Skip("needs SEQUEL_TESTING_DSN in keyword form beginning with host=")
+	}
+	sharesTestingDatabase(t, t.Name(), []testingDSNCall{
+		{"pgx", base, "pgx+dsn://", "pgx"},
+		{"cockroachdb", base, "cockroachdb+dsn://", "cockroachdb"},
+		{"", base, "pgx+dsn://", "pgx"},
+	})
+	assert := testarossa.For(t)
+	for _, driver := range []string{"pgx", "cockroachdb"} {
+		dsn, err := sequel.CreateTestingDatabase(driver, base, t.Name()+driver)
+		if !assert.NoError(err) {
+			continue
+		}
+		db, err := sequel.OpenSingleton("", dsn)
+		if !assert.NoError(err) {
+			continue
+		}
+		assert.Equal(driver, db.DriverName())
+		assert.NoError(db.Ping())
+		db.Close()
+	}
+}

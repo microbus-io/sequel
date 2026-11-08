@@ -25,7 +25,8 @@ import "strings"
 //     PostgreSQL E'...' string
 //   - "..." everywhere (an identifier, or a string on MySQL), doubled to escape, with backslashes on MySQL
 //   - `...` on MySQL, MariaDB and SQLite, and [...] on SQL Server and SQLite, with ]] escaping a bracket
-//   - -- to the end of the line (on MySQL and MariaDB, -- followed by whitespace, or #), and /* ... */
+//   - -- to the end of the line (on MySQL and MariaDB, -- followed by whitespace, or #), and /* ... */, nested on
+//     PostgreSQL, CockroachDB and SQL Server
 //   - $tag$...$tag$ on PostgreSQL and CockroachDB, only when dollarQuotes is set
 //
 // An unterminated region runs to the end of s.
@@ -59,8 +60,26 @@ func skipNonCode(driverName, s string, i int, dollarQuotes bool) int {
 		}
 		return len(s)
 	case ch == '/' && strings.HasPrefix(s[i:], "/*"):
-		if j := strings.Index(s[i+2:], "*/"); j >= 0 {
-			return i + 2 + j + 2
+		if !pg && driverName != "mssql" {
+			if j := strings.Index(s[i+2:], "*/"); j >= 0 {
+				return i + 2 + j + 2
+			}
+			return len(s)
+		}
+		// PostgreSQL, CockroachDB and SQL Server nest block comments, and so does the SQL Server driver's own scanner
+		depth := 0
+		for j := i; j+1 < len(s); j++ {
+			switch {
+			case s[j] == '/' && s[j+1] == '*':
+				depth++
+				j++
+			case s[j] == '*' && s[j+1] == '/':
+				depth--
+				j++
+				if depth == 0 {
+					return j + 1
+				}
+			}
 		}
 		return len(s)
 	case ch == '$' && dollarQuotes && pg && (i == 0 || !isIdentByte(s[i-1])):

@@ -407,10 +407,6 @@ func (t *telemetry) recordMigration(ctx context.Context, driver, sequence string
 	))
 }
 
-// parseOperation extracts the SQL operation keyword and, only when it can do so unambiguously, the primary
-// table from a statement. The operation is always the leading keyword. The table is returned only for a
-// single-target statement: it is omitted for joins, multi-table FROM lists, and subqueries, so a non-empty
-// table is trustworthy (and keeps span-name cardinality bounded) rather than a guess.
 // operationOther is the bucket for a statement verb that is not reported verbatim, either because it is
 // not shaped like a verb or because the label cap has been reached.
 const operationOther = "OTHER"
@@ -516,7 +512,12 @@ func (t *telemetry) logOperationCapOnce(ctx context.Context) {
 	})
 }
 
-func parseOperation(query string) (op string, table string) {
+// parseOperation extracts the SQL operation keyword and, only when it can do so unambiguously, the primary
+// table from a statement. The operation is always the leading keyword. The table is returned only for a
+// single-target statement: it is omitted for joins, multi-table FROM lists, and subqueries, so a non-empty
+// table is trustworthy (and keeps span-name cardinality bounded) rather than a guess. Keywords are looked for only
+// in code: a FROM inside a string literal or a comment is data, and must not put that data in a span name.
+func parseOperation(driverName, query string) (op string, table string) {
 	s := strings.TrimLeft(query, " \t\r\n")
 	if s == "" {
 		return "", ""
@@ -530,14 +531,15 @@ func parseOperation(query string) (op string, table string) {
 	if op == operationOther {
 		return op, ""
 	}
-	upper := strings.ToUpper(s)
+	m := maskNonCode(driverName, s)
+	upper := strings.ToUpper(m)
 	switch op {
 	case "SELECT", "DELETE":
-		table = tableAfter(s, upper, " FROM ")
+		table = tableAfter(driverName, s, m, upper, " FROM ")
 	case "INSERT", "REPLACE", "UPSERT":
-		table = tableAfter(s, upper, " INTO ")
+		table = tableAfter(driverName, s, m, upper, " INTO ")
 	case "UPDATE", "MERGE":
-		table = identAt(s, end)
+		table = identAt(driverName, s, m, end)
 	default:
 		return op, ""
 	}
@@ -548,38 +550,107 @@ func parseOperation(query string) (op string, table string) {
 	return op, table
 }
 
-// tableAfter returns the identifier following the first occurrence of keyword (e.g. " FROM "), or "" if the
-// keyword is absent or the following token is not a plain single table.
-func tableAfter(s, upper, keyword string) string {
+// maskedByte stands in maskNonCode's result for every byte of a string literal, quoted identifier or comment.
+const maskedByte = 0
+
+// maskNonCode returns s with every byte of its string literals, quoted identifiers and comments replaced by
+// maskedByte, so that a search of the result finds only code, at the same offsets as in s.
+func maskNonCode(driverName, s string) string {
+	var b []byte
+	for i := 0; i < len(s); {
+		j := skipNonCode(driverName, s, i, true)
+		if j == i {
+			i++
+			continue
+		}
+		if b == nil {
+			b = []byte(s)
+		}
+		for k := i; k < j; k++ {
+			b[k] = maskedByte
+		}
+		i = j
+	}
+	if b == nil {
+		return s
+	}
+	return string(b)
+}
+
+// tableAfter returns the identifier following the first occurrence of keyword (e.g. " FROM ") in code, or "" if the
+// keyword is absent or the following token is not a plain single table. m is s masked by maskNonCode, and upper is m
+// in upper case.
+func tableAfter(driverName, s, m, upper, keyword string) string {
 	i := strings.Index(upper, keyword)
 	if i < 0 {
 		return ""
 	}
-	return identAt(s, i+len(keyword))
+	return identAt(driverName, s, m, i+len(keyword))
 }
 
-// identAt reads the identifier starting at or after position start (skipping leading whitespace), returning
-// "" for a subquery ('(') or a multi-table list (token immediately followed by a comma).
-func identAt(s string, start int) string {
-	for start < len(s) && isSQLSpace(s[start]) {
+// identAt reads the possibly qualified identifier starting at or after position start (skipping leading
+// whitespace), with its parts unquoted and joined by '.', returning "" for a subquery ('('), a multi-table list
+// (token immediately followed by a comma), or anything but an identifier - a string literal or a comment - where the
+// table would be. m is s masked by maskNonCode.
+func identAt(driverName, s, m string, start int) string {
+	for start < len(m) && isSQLSpace(m[start]) {
 		start++
 	}
-	if start >= len(s) || s[start] == '(' {
+	if start >= len(m) || m[start] == '(' {
 		return ""
 	}
-	end := start
-	for end < len(s) && !isIdentDelim(s[end]) {
-		end++
+	var parts []string
+	for {
+		if start >= len(m) {
+			return ""
+		}
+		if m[start] == maskedByte {
+			closing, ok := identifierQuote(driverName, s[start])
+			end := skipNonCode(driverName, s, start, true)
+			if !ok || end-start < 2 || s[end-1] != closing {
+				return ""
+			}
+			parts = append(parts, s[start+1:end-1])
+			start = end
+		} else {
+			end := start
+			for end < len(m) && !isIdentDelim(m[end]) && m[end] != '.' && m[end] != maskedByte {
+				end++
+			}
+			if end == start {
+				return ""
+			}
+			parts = append(parts, s[start:end])
+			start = end
+		}
+		if start < len(m) && m[start] == '.' {
+			start++
+			continue
+		}
+		break
 	}
-	tok := s[start:end]
-	j := end
-	for j < len(s) && isSQLSpace(s[j]) {
+	j := start
+	for j < len(m) && isSQLSpace(m[j]) {
 		j++
 	}
-	if j < len(s) && s[j] == ',' {
+	if j < len(m) && (m[j] == ',' || m[j] == maskedByte) {
 		return ""
 	}
-	return strings.Trim(tok, "`\"[]")
+	return strings.Join(parts, ".")
+}
+
+// identifierQuote reports whether ch opens a quoted identifier on the driver, and the byte that closes it.
+func identifierQuote(driverName string, ch byte) (closing byte, ok bool) {
+	mysqlish := driverName == "mysql" || driverName == "mariadb"
+	switch {
+	case ch == '"' && !mysqlish:
+		return '"', true
+	case ch == '`' && (mysqlish || driverName == "sqlite"):
+		return '`', true
+	case ch == '[' && (driverName == "mssql" || driverName == "sqlite"):
+		return ']', true
+	}
+	return 0, false
 }
 
 func isSQLSpace(c byte) bool {

@@ -194,11 +194,7 @@ func TestVF_DateAddMillisIgnoresDaylightSaving(t *testing.T) {
 	if !assert.NoError(err) {
 		return
 	}
-	sep := "?"
-	if strings.Contains(dsn, "?") {
-		sep = "&"
-	}
-	local, err := sequel.Open("", dsn+sep+"timezone=America/Los_Angeles")
+	local, err := sequel.Open("", withQueryParam(dsn, "timezone=America/Los_Angeles"))
 	if !assert.NoError(err) {
 		return
 	}

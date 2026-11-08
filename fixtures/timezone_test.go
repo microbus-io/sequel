@@ -18,6 +18,7 @@ package fixtures
 
 import (
 	"database/sql"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
@@ -66,7 +67,8 @@ func openNonUTCDatabase(t *testing.T) string {
 
 	// A session opened without sequel takes the database default, so the server really is not in UTC for
 	// this database and the assertions that follow cannot pass by default.
-	raw, err := sql.Open("pgx", dsn)
+	rawDSN := strings.TrimPrefix(strings.TrimPrefix(dsn, "pgx+dsn://"), "cockroachdb+dsn://")
+	raw, err := sql.Open("pgx", rawDSN)
 	assert.NoError(err)
 	defer raw.Close()
 	var zone string
@@ -77,8 +79,17 @@ func openNonUTCDatabase(t *testing.T) string {
 	return dsn
 }
 
-// withQueryParam appends a parameter to a URL-form DSN.
+// withQueryParam appends a URL-encoded parameter in the DSN's grammar.
 func withQueryParam(dsn string, param string) string {
+	if strings.HasPrefix(dsn, "pgx+dsn://") || strings.HasPrefix(dsn, "cockroachdb+dsn://") {
+		key, value, _ := strings.Cut(param, "=")
+		value, err := url.QueryUnescape(value)
+		if err != nil {
+			panic(err)
+		}
+		value = strings.NewReplacer(`\`, `\\`, `'`, `\'`).Replace(value)
+		return dsn + " " + key + "='" + value + "'"
+	}
 	if strings.Contains(dsn, "?") {
 		return dsn + "&" + param
 	}

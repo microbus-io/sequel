@@ -22,7 +22,8 @@ import "database/sql"
 Rows shadows *sql.Rows. Inside a [DB.Transact] transaction, a Scan error and the streaming error that ends
 iteration (what rows.Err() reports) are recorded like a statement error: the transaction will not commit, and
 later statements short-circuit. A closure that stops checking errors therefore cannot commit work built on a
-truncated read. Breaking out of the loop early records nothing.
+truncated read. So is an error from Close, which a driver can report while it discards unread results. Breaking out
+of the loop early records nothing of itself.
 
 It embeds *sql.Rows, so the usual `for rows.Next() { rows.Scan(...) }`, `rows.Err()`, and `rows.Close()`
 call sites are unchanged; only code that explicitly stores the result as *sql.Rows needs adjustment. Outside a
@@ -71,6 +72,14 @@ func (r *Rows) NextResultSet() bool {
 		r.latch(r.Rows.Err())
 	}
 	return ok
+}
+
+// Close shadows sql.Rows.Close and latches its error. A driver discards the unread results at Close, and may find a
+// statement's error there - a later statement of a multi-statement query, say - which no earlier call reported.
+func (r *Rows) Close() error {
+	err := r.Rows.Close()
+	r.latch(err)
+	return traceErr(err)
 }
 
 // Err shadows sql.Rows.Err and latches the streaming error, so an explicit rows.Err() check aborts the

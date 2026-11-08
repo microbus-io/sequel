@@ -53,7 +53,17 @@ func TestTelemetry_ParseOperation(t *testing.T) {
 		{"UPDATE accounts SET balance=? WHERE id=?", "UPDATE", "accounts"},
 		{"DELETE FROM sessions WHERE expired=1", "DELETE", "sessions"},
 		{"SELECT * FROM `my-table`", "SELECT", "my-table"},
-		{"SELECT * FROM [dbo].[Orders]", "SELECT", "dbo].[Orders"}, // bracket-trim is best-effort; schema kept
+		{"SELECT * FROM [dbo].[Orders]", "SELECT", "dbo.Orders"},
+		{`SELECT * FROM "public"."users" WHERE id=?`, "SELECT", "public.users"},
+		{"SELECT * FROM app.users", "SELECT", "app.users"},
+		// FROM, INTO and JOIN count only in code: a string literal or a comment is data
+		{"SELECT ' FROM private_token ' AS v", "SELECT", ""},
+		{"SELECT 1 /* FROM private_token */", "SELECT", ""},
+		{"SELECT 1 -- FROM private_token\n", "SELECT", ""},
+		{"SELECT * FROM users WHERE name = ' JOIN '", "SELECT", "users"},
+		{"INSERT INTO t (v) VALUES (' INTO secret ')", "INSERT", "t"},
+		{"SELECT * FROM 'not_a_table'", "SELECT", ""},
+		{"SELECT * FROM /* c */ users", "SELECT", ""}, // uncertain, so omitted
 		// Ambiguous: table omitted on purpose.
 		{"SELECT a.* FROM a JOIN b ON a.id=b.id", "SELECT", ""},
 		{"SELECT * FROM t1, t2 WHERE t1.id=t2.id", "SELECT", ""},
@@ -77,10 +87,19 @@ func TestTelemetry_ParseOperation(t *testing.T) {
 		{"123 GO", "OTHER", ""},                       // must start with a letter
 	}
 	for _, c := range cases {
-		op, table := parseOperation(c.query)
+		op, table := parseOperation("sqlite", c.query)
 		assert.Equal(c.op, op, "op for %q", c.query)
 		assert.Equal(c.table, table, "table for %q", c.query)
 	}
+	// Quoting follows the driver: "..." is a string on MySQL and an identifier elsewhere
+	_, table := parseOperation("mysql", `SELECT * FROM "users"`)
+	assert.Equal("", table)
+	_, table = parseOperation("pgx", `SELECT * FROM "users"`)
+	assert.Equal("users", table)
+	_, table = parseOperation("mysql", "SELECT * FROM `users`")
+	assert.Equal("users", table)
+	_, table = parseOperation("pgx", "SELECT * FROM t WHERE v = $$ JOIN $$")
+	assert.Equal("t", table)
 }
 
 // The learned verb set is bounded: past the cap, further verbs report as OTHER rather than minting
