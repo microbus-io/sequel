@@ -18,7 +18,9 @@ package fixtures
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/microbus-io/sequel"
 	"github.com/microbus-io/testarossa"
@@ -64,4 +66,58 @@ func TestErrors_UndefinedTableFromTheDatabase(t *testing.T) {
 	err = db.QueryRowContext(ctx, "SELECT f.* FROM present_table WHERE id=?", 1).Scan(&n)
 	assert.Error(err)
 	assert.Equal(db.DriverName() == "sqlite", sequel.IsUndefinedTableError(err), "a qualified star with no FROM-clause entry: %v", err)
+}
+
+// TestErrors_ConnectionErrorFromTheDatabase pins the classification against what the database and driver return:
+// a statement's own failures are not connection errors, and a statement on a connection the server has killed is.
+// SQLite has no connection to kill, and CockroachDB cancels a session rather than killing its connection, so on
+// those only the first half runs.
+func TestErrors_ConnectionErrorFromTheDatabase(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+	ctx := context.Background()
+
+	db := newTestDB(t)
+	_, err := db.ExecContext(ctx, "CREATE TABLE conn_table (id INT NOT NULL PRIMARY KEY)")
+	assert.NoError(err)
+	_, err = db.ExecContext(ctx, "INSERT INTO conn_table (id) VALUES (?)", 1)
+	assert.NoError(err)
+	_, err = db.ExecContext(ctx, "INSERT INTO conn_table (id) VALUES (?)", 1)
+	assert.Error(err)
+	assert.False(sequel.IsConnectionError(err), "a duplicate key: %v", err)
+	var n int
+	err = db.QueryRowContext(ctx, "SELECT id FROM absent_table WHERE id=?", 1).Scan(&n)
+	assert.Error(err)
+	assert.False(sequel.IsConnectionError(err), "a missing table: %v", err)
+
+	var idQuery, kill string
+	switch db.DriverName() {
+	case "pgx":
+		idQuery, kill = "SELECT pg_backend_pid()", "SELECT pg_terminate_backend(%d)"
+	case "mysql", "mariadb":
+		idQuery, kill = "SELECT CONNECTION_ID()", "KILL %d"
+	case "mssql":
+		idQuery, kill = "SELECT @@SPID", "KILL %d"
+	default:
+		return
+	}
+	// A pinned connection, because the pool would retry a dead one on a fresh connection and hide the error.
+	conn, err := db.Conn(ctx)
+	assert.Must(assert.NoError(err))
+	defer conn.Close()
+	var id int64
+	assert.Must(assert.NoError(conn.QueryRowContext(ctx, idQuery).Scan(&id)))
+	_, err = db.ExecContext(ctx, fmt.Sprintf(kill, id))
+	assert.Must(assert.NoError(err))
+	// The server ends the session asynchronously, so the pinned connection may answer once more before it notices.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		_, err = conn.ExecContext(ctx, "SELECT 1")
+		if err != nil || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	assert.Error(err, "the killed connection kept answering")
+	assert.True(sequel.IsConnectionError(err), "a statement on a killed connection: %T %v", err, err)
 }

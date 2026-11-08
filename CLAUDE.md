@@ -594,6 +594,32 @@ Two exemptions, and one ordering rule, are load-bearing:
 - Latches (`recordErr`, `Rows`/`Row` `latch`) may receive either form; they classify with `errors.Is`/
   `errors.As`, so it does not matter which.
 
+## Connection errors (`IsConnectionError`)
+
+`IsConnectionError` answers one question for a caller deciding what a failed statement says about the statement:
+did the failure come from reaching the database rather than from what was sent? Its use is to *withhold* a verdict
+against the statement (a retry instead of failing it for good), so a code it misses only falls back to the
+caller's own judgement, while a code it wrongly includes can keep a caller retrying a statement that can never
+succeed. Every code listed is therefore about the server or the link, never about statement content.
+
+- **The context check comes first.** `context.DeadlineExceeded` satisfies `net.Error` (it has `Timeout()` and
+  `Temporary()`), so a deadline checked after the network test reads as a lost connection. A deadline or
+  cancellation is the caller's own.
+- **`08P01` protocol_violation is excluded from PostgreSQL's connection class.** The server raises it for a
+  malformed message, which the client's own input can produce, so it is no evidence that the link failed.
+- **A read-only refusal is included** (`25006`; MySQL `1290`, `1836`; SQL Server `3906`, `976`, `983`), because
+  that is what writes meet on a primary demoted in a failover. The cost is a caller writing inside a transaction it
+  declared read-only itself, which the godoc states.
+- **Payload limits stay out even where they end the connection.** MySQL `1153` (packet too large) is not listed,
+  but the server closes the connection after it, so the next statement on that connection reports
+  `invalid connection`. No code list can see through that; the godoc tells callers to bound their retries.
+- **SQLite returns false for every typed error.** It has no connection, and its I/O errors are about the file.
+- **The real drivers' shapes are pinned** by `TestErrors_ConnectionErrorFromTheDatabase` (fixtures), which kills a
+  pinned connection from a second session: PostgreSQL reports a typed `57P01`, MySQL and MariaDB the driver's
+  `invalid connection` sentinel, and SQL Server a `*net.OpError` reset. A pinned `sql.Conn` is required, since
+  the pool retries a dead connection on a fresh one and hides the error. The codes themselves are pinned by
+  `TestErrors_IsConnectionError`.
+
 ## Per-statement work is computed once (`querycache.go`)
 
 Everything sequel derives from a statement depends only on its driver and text: the virtual-function expansion,

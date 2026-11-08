@@ -17,7 +17,13 @@ limitations under the License.
 package sequel
 
 import (
+	"context"
 	"database/sql"
+	"database/sql/driver"
+	"fmt"
+	"io"
+	"net"
+	"syscall"
 	"testing"
 
 	"github.com/go-sql-driver/mysql"
@@ -184,4 +190,80 @@ func TestErrors_IsUndefinedTableError(t *testing.T) {
 		assert.False(IsUndefinedTableError(errors.New(msg)), "should not be undefined table: %s", msg)
 	}
 	assert.False(IsUndefinedTableError(nil))
+}
+
+func TestErrors_IsConnectionError(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	assert.False(IsConnectionError(nil))
+
+	// Below the protocol: the pool's and the drivers' sentinels, and the socket.
+	assert.True(IsConnectionError(driver.ErrBadConn))
+	assert.True(IsConnectionError(sql.ErrConnDone))
+	assert.True(IsConnectionError(io.EOF))
+	assert.True(IsConnectionError(io.ErrUnexpectedEOF))
+	assert.True(IsConnectionError(mysql.ErrInvalidConn))
+	assert.True(IsConnectionError(&net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}))
+	assert.True(IsConnectionError(&pgconn.ConnectError{}))
+	assert.True(IsConnectionError(mssql.StreamError{}))
+	assert.True(IsConnectionError(fmt.Errorf("exec: %w", driver.ErrBadConn)), "through a wrapped chain")
+
+	// The caller's own context is not the connection's, though a deadline satisfies net.Error.
+	assert.False(IsConnectionError(context.Canceled))
+	assert.False(IsConnectionError(context.DeadlineExceeded))
+	assert.False(IsConnectionError(fmt.Errorf("timeout: %w", context.DeadlineExceeded)))
+
+	// Typed server errors decide by their code.
+	for _, code := range []string{"08000", "08001", "08003", "08004", "08006", "08007", "57P01", "57P02", "57P03", "57P05", "53300", "25006"} {
+		assert.True(IsConnectionError(&pgconn.PgError{Code: code}), "PostgreSQL %s", code)
+	}
+	for _, code := range []string{"08P01", "22001", "23505", "54000", "40P01", "42P01"} {
+		assert.False(IsConnectionError(&pgconn.PgError{Code: code}), "PostgreSQL %s", code)
+	}
+	for _, n := range []uint16{1040, 1053, 1290, 1836, 1927, 4031} {
+		assert.True(IsConnectionError(&mysql.MySQLError{Number: n}), "MySQL %d", n)
+	}
+	for _, n := range []uint16{1062, 1153, 1213, 1366, 1406, 1146} {
+		assert.False(IsConnectionError(&mysql.MySQLError{Number: n}), "MySQL %d", n)
+	}
+	for _, n := range []int32{233, 4060, 976, 983, 3906, 40197, 40501, 40613, 49918, 49919, 49920} {
+		assert.True(IsConnectionError(mssql.Error{Number: n}), "SQL Server %d", n)
+	}
+	for _, n := range []int32{1205, 2627, 2628, 8152, 208} {
+		assert.False(IsConnectionError(mssql.Error{Number: n}), "SQL Server %d", n)
+	}
+	// A typed error is classified by its code alone, whatever its message says.
+	assert.False(IsConnectionError(&pgconn.PgError{Code: "23505", Message: "duplicate key value: (note)=(connection refused)"}))
+	assert.False(IsConnectionError(&mysql.MySQLError{Number: 1062, Message: "Duplicate entry 'server has gone away' for key 'PRIMARY'"}))
+	assert.False(IsConnectionError(mssql.Error{Number: 2627, Message: "duplicate key value is (transport-level error)"}))
+
+	// Substring fallback, for errors whose driver type is not in the chain.
+	lost := []string{
+		"dial tcp 127.0.0.1:5432: connect: connection refused",
+		"read tcp 127.0.0.1:5432: read: connection reset by peer",
+		"write: broken pipe",
+		"driver: bad connection",
+		"unexpected EOF",
+		"read tcp 127.0.0.1:3306: i/o timeout",
+		"server closed the connection unexpectedly",
+		"conn closed",
+		"invalid connection",
+		"MySQL server has gone away",
+		"Lost connection to MySQL server during query",
+		"A transport-level error has occurred when receiving results from the server",
+	}
+	for _, msg := range lost {
+		assert.True(IsConnectionError(errors.New(msg)), "should be a connection error: %s", msg)
+	}
+	statement := []string{
+		"syntax error near ')'",
+		"UNIQUE constraint failed: users.email",
+		"no such table: users",
+		"SQLITE_BUSY: database is locked",
+		"value too long for type character varying(4)",
+	}
+	for _, msg := range statement {
+		assert.False(IsConnectionError(errors.New(msg)), "should not be a connection error: %s", msg)
+	}
 }

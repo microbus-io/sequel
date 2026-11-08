@@ -21,11 +21,14 @@ import (
 	crand "crypto/rand"
 	"crypto/sha256"
 	"database/sql"
+	"database/sql/driver"
 	"encoding/hex"
+	"io"
 	"io/fs"
 	"log/slog"
 	"math"
 	"math/rand/v2"
+	"net"
 	"net/url"
 	"os"
 	"regexp"
@@ -540,6 +543,109 @@ var columnResolutionRoutines = map[string]bool{
 // report as 42P01 undefined_table although no table is missing.
 func isFromClauseEntryMessage(msg string) bool {
 	return strings.Contains(msg, "FROM-clause entry") || strings.Contains(msg, "no data source matches")
+}
+
+// IsConnectionError returns true if the error says the database could not be reached, or the connection to it was
+// lost, rather than anything about the statement: a refused, reset or closed connection, a server shutting down or
+// not accepting connections yet, a connection limit, or a server that refuses writes because it is read-only, as a
+// primary demoted in a failover does. Such an error says nothing against the statement, which may succeed on a
+// later attempt. Recognizes these errors from MySQL, MariaDB, PostgreSQL, SQL Server, and CockroachDB; SQLite has
+// no connection to lose, and none of its errors is one.
+//
+// A read-only refusal counts whatever made the server or transaction read-only, so a caller that starts a
+// read-only transaction and then writes in it gets true. A context cancellation or deadline is the caller's own,
+// not the connection's, and returns false.
+//
+// A statement can itself end its connection: a MySQL server closes it on a packet larger than its
+// max_allowed_packet, and the driver reports the lost connection. A caller that retries a statement on a
+// connection error must therefore bound the retries.
+//
+// As with [IsLockContentionError], the driver's native error code is preferred, and a substring match is the
+// fallback for errors whose driver type is not in the chain.
+func IsConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// A context deadline satisfies net.Error, so it must be decided before the network check below.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, driver.ErrBadConn) || errors.Is(err, sql.ErrConnDone) ||
+		errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, mysql.ErrInvalidConn) {
+		return true
+	}
+
+	// A typed error the server reported decides by its code.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "08000", "08001", "08003", "08004", "08006", "08007", // connection_exception, except 08P01 protocol_violation
+			"57P01", "57P02", "57P03", "57P05", // admin_shutdown, crash_shutdown, cannot_connect_now, idle_session_timeout
+			"53300", // too_many_connections
+			"25006": // read_only_sql_transaction
+			return true
+		}
+		return false
+	}
+	var myErr *mysql.MySQLError
+	if errors.As(err, &myErr) {
+		switch myErr.Number {
+		case 1040, // ER_CON_COUNT_ERROR, too many connections
+			1053, // ER_SERVER_SHUTDOWN
+			1290, // ER_OPTION_PREVENTS_STATEMENT, raised by read_only and super_read_only
+			1836, // ER_READ_ONLY_MODE
+			1927, // ER_CONNECTION_KILLED (MariaDB)
+			4031: // ER_CLIENT_INTERACTION_TIMEOUT, disconnected for inactivity
+			return true
+		}
+		return false
+	}
+	var msErr mssql.Error
+	if errors.As(err, &msErr) {
+		switch msErr.Number {
+		case 233, // no process is on the other end of the pipe
+			4060,     // cannot open the database requested by the login
+			976, 983, // the database is an availability group secondary
+			3906,                // the database is read-only
+			40197, 40501, 40613, // Azure SQL: service error, service busy, database unavailable
+			49918, 49919, 49920: // Azure SQL: not enough resources to process the request
+			return true
+		}
+		return false
+	}
+	var liteErr *sqlite.Error
+	if errors.As(err, &liteErr) {
+		return false
+	}
+
+	// An error from below the protocol: the dial, the socket, or the TDS stream.
+	var netErr net.Error
+	var connectErr *pgconn.ConnectError
+	var streamErr mssql.StreamError
+	if errors.As(err, &netErr) || errors.As(err, &connectErr) || errors.As(err, &streamErr) {
+		return true
+	}
+	return isConnectionMessage(err.Error())
+}
+
+// isConnectionMessage is the substring fallback for connection errors whose native driver type is not in the
+// error chain.
+func isConnectionMessage(msg string) bool {
+	switch {
+	case strings.Contains(msg, "connection refused"), strings.Contains(msg, "connection reset"),
+		strings.Contains(msg, "broken pipe"), strings.Contains(msg, "bad connection"),
+		strings.Contains(msg, "unexpected EOF"), strings.Contains(msg, "i/o timeout"): // the socket, any driver
+		return true
+	case strings.Contains(msg, "server closed the connection unexpectedly"), strings.Contains(msg, "conn closed"): // PostgreSQL
+		return true
+	case strings.Contains(msg, "invalid connection"), strings.Contains(msg, "server has gone away"),
+		strings.Contains(msg, "Lost connection to"): // MySQL, MariaDB
+		return true
+	case strings.Contains(msg, "transport-level error"): // SQL Server
+		return true
+	}
+	return false
 }
 
 // Close closes the database connection.
