@@ -354,6 +354,58 @@ TRANSACTION" - masking the original error (e.g. a deadlock) and defeating retry 
 `XACT_ABORT ON`, any statement error aborts the whole transaction server-side, so the real error is the
 one that surfaces.
 
+### A cancelled SQL Server transaction reaches the driver as a network error (`mssqlTxContext`)
+
+go-mssqldb v1.11.2 rolls a transaction back on the context it began with (`Conn.transactionCtx`). When that context
+is **cancelled**, the rollback request is sent and the call returns at once with the server's reply unread
+(`noAttn`), while `checkBadConn` leaves the connection valid, so `database/sql` - which keeps a connection after a
+rollback when the driver implements `SessionResetter` and `Validator` - pools it. The next request on it goes out
+before the old reply is read, the server closes the socket, and that unrelated caller fails with `Read: EOF`
+([microsoft/go-mssqldb#390](https://github.com/microsoft/go-mssqldb/issues/390), from #293; the fix,
+[#486](https://github.com/microsoft/go-mssqldb/pull/486), is unmerged). A **deadline** is safe, because
+`DeadlineExceeded` is a `net.Error` and the driver marks a connection bad on one. The deprecated
+`denisenkom/go-mssqldb` had no such bug: its rollback sent an attention and read until the server confirmed it -
+without a limit, which is the hang that moved sequel to the maintained driver in v1.17.1.
+
+So `beginTx` begins every SQL Server transaction, under `Transact` or `BeginTx`, on `mssqlTxContext`, whose `Err`
+wraps a cancellation as `connCanceledError`: a `net.Error` whose message and `errors.Is` are the cancellation's.
+The driver marks the connection bad, as after a deadline, and `database/sql` discards it; the cost is one reconnect
+per cancelled transaction. A cancelled `BEGIN` or `COMMIT` now discards its connection too, where the driver's
+attention used to keep it. Remove `mssqlTxContext` and `plainCancellation` once a driver release fixes the rollback.
+
+**The wrapper must not reach callers.** A caller testing `errors.As(err, &net.Error)` before checking for a
+cancellation would take it for a lost connection. `database/sql` and the driver return the context's `Err` as is from
+`BEGIN` (including the pool wait before it), `COMMIT` and `ROLLBACK`, so `plainCancellation` unwraps it inside the
+instrumented call in `beginTx` and `Tx.finalize`, and telemetry sees the plain cancellation too.
+`TestTransact_CancellationIsNotANetworkError` (fixtures) failed on all three without it. `sql.Tx`'s own context
+usually carries the plain cancellation, since `WithCancel` attaches to the parent's `cancelCtx` through the embedded
+`Done` and `Value`. Two cases leak the wrapper there, and sequel cannot unwrap them, because database/sql reports
+them from inside `sql.Tx` (`Commit`'s early return, `Rows.Err`). One is a parent that is not backed by a `cancelCtx`.
+The other is a parent cancelled after the driver's `BEGIN` returns but before `beginDC` derives the child, which
+copies the parent's `Err`. Both still read `context canceled` and match `errors.Is(err, context.Canceled)`.
+
+Rejected:
+
+- **Reporting the cancellation as `DeadlineExceeded`.** The driver would discard the connection just the same, but
+  callers would see a deadline where they cancelled, and `Canceled` versus `DeadlineExceeded` is how many tell a
+  client that left from a slow query.
+- **Holding a `sql.Conn` and discarding it with `Raw` returning `driver.ErrBadConn`.** `Conn.grabConn` checks
+  `done` before taking `closemu`, so a `Raw` racing `database/sql`'s own rollback - which closes the `Conn` when the
+  driver reports the connection bad - dereferences a nil driver connection. Nothing public waits for that rollback.
+  It also needed a `BEGIN` retry of its own (`Conn.BeginTx` does not retry `driver.ErrBadConn`, which go-mssqldb
+  reports for a connection the server closed while pooled) and an `AfterFunc` for a `BeginTx` abandoned after its
+  context ended.
+
+**What is left is the driver's.** `Conn.Close` returns the connection's read buffer to a `sync.Pool` before it
+closes the socket, so discarding a connection whose rollback returned early races the rollback's response reader
+against the next connection to take the buffer. A reply arriving in that window is written into another connection's
+buffer: rare, but a real hazard, not only a race-detector report. The race detector reports it after a deadline on an
+unmodified sequel, and routing cancellations to the same path makes it more frequent. It replaces #390's own race,
+the reader against the next checkout of the pooled connection. `TestTransact_EndedContextLeavesThePoolUsable`
+(fixtures) therefore skips SQL Server under `-race`, and CI's SQL Server job runs it again without the race detector.
+It runs 300 iterations per case on a one-connection pool; without the workaround, 256-298 of 300 statements after a
+cancelled transaction failed.
+
 ## Statement batches (`Tx.Batch`, `batch.go`, `batchresults.go`)
 
 The contract is on the `Batch`, `BatchResults` and `Tx.Batch` godoc; this is why it has the shape it does.
@@ -1232,3 +1284,8 @@ virtual-function tests are split deliberately across the two: the root package a
 but invalid SQL on some server is caught. `REGEXP_TEXT_SEARCH` expands to `REGEXP_LIKE`, which exists only on
 PostgreSQL 18+ and SQL Server 2025+; its fixture skips (not fails) when the engine lacks the function, so the
 suite stays green on older servers while CI's modern images still exercise it.
+
+**Testing against SQL Server 2019 locally**: its self-signed certificate has a negative serial number, which Go's
+`crypto/x509` refuses to parse (`x509: negative serial number`), so the TLS handshake fails before
+`TrustServerCertificate` is consulted. Run the suite with `GODEBUG=x509negativeserial=1`. CI's 2025 image does not
+need it.

@@ -301,7 +301,7 @@ func (tx *Tx) finalize(op string, run func() error) error {
 	if tx.done.Load() {
 		return sql.ErrTxDone
 	}
-	err := instrumentTxEnd(tx.t, tx.rtt, tx.ctx, tx.driverName, op, run)
+	err := instrumentTxEnd(tx.t, tx.rtt, tx.ctx, tx.driverName, op, func() error { return plainCancellation(run()) })
 	if err == nil {
 		tx.done.Store(true)
 	}

@@ -19,8 +19,11 @@ package sequel
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/microbus-io/testarossa"
 )
@@ -141,4 +144,34 @@ func TestTx_ConcurrentUseIsRaceFree(t *testing.T) {
 		return nil
 	})
 	assert.Error(err)
+}
+
+// A SQL Server transaction's context reports a cancellation to the driver as a net.Error, which makes the driver
+// discard the connection, while staying context.Canceled - in message and errors.Is - to everyone else, including the
+// context database/sql derives from it for the transaction. A deadline and a live context are unchanged.
+func TestTx_MSSQLContextReportsCancellationAsNetError(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	parent, cancel := context.WithCancel(context.Background())
+	ctx := mssqlTxContext{parent}
+	child, cancelChild := context.WithCancel(ctx) // as database/sql's beginDC derives the transaction's
+	defer cancelChild()
+	assert.NoError(ctx.Err())
+	cancel()
+	err := ctx.Err()
+	var netErr net.Error
+	assert.True(errors.As(err, &netErr), "the driver takes it for a network error")
+	assert.True(errors.Is(err, context.Canceled))
+	assert.False(errors.Is(err, context.DeadlineExceeded))
+	assert.Equal(context.Canceled.Error(), err.Error())
+	<-child.Done()
+	assert.Equal(context.Canceled, child.Err(), "database/sql's own context reports the plain cancellation")
+	assert.Equal(context.Canceled, plainCancellation(err), "sequel hands back the plain cancellation")
+	assert.Nil(plainCancellation(nil))
+
+	expired, cancelExpired := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancelExpired()
+	<-expired.Done()
+	assert.Equal(context.DeadlineExceeded, mssqlTxContext{expired}.Err())
 }

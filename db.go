@@ -1031,8 +1031,12 @@ func (db *DB) beginTx(ctx context.Context, hold bool, opts *sql.TxOptions) (*sql
 	var conn *sql.Conn
 	sqlTx, err := instrumentTxOp(db.telemetry.Load(), rtt, ctx, db.driverName, "BEGIN",
 		func(ctx context.Context) (*sql.Tx, error) {
+			if db.driverName == "mssql" {
+				ctx = mssqlTxContext{ctx}
+			}
 			if !hold {
-				return db.DB.BeginTx(ctx, opts)
+				sqlTx, err := db.DB.BeginTx(ctx, opts)
+				return sqlTx, plainCancellation(err)
 			}
 			c, err := db.DB.Conn(ctx)
 			if err != nil {
@@ -1047,6 +1051,39 @@ func (db *DB) beginTx(ctx context.Context, hold bool, opts *sql.TxOptions) (*sql
 			return sqlTx, nil
 		})
 	return sqlTx, conn, rtt, err
+}
+
+// mssqlTxContext is the context a SQL Server transaction begins on. go-mssqldb v1.11.2 pools a connection whose
+// rollback on a cancelled context returned with the server's reply unread, and the next request on it fails
+// (https://github.com/microsoft/go-mssqldb/issues/390). It discards one after a deadline, a net.Error, so a
+// cancellation is handed to it as a net.Error too. Remove once a driver release carries the fix
+// (https://github.com/microsoft/go-mssqldb/pull/486).
+type mssqlTxContext struct{ context.Context }
+
+// Err returns the context's error, a cancellation wrapped as a net.Error.
+func (c mssqlTxContext) Err() error {
+	err := c.Context.Err()
+	if errors.Is(err, context.Canceled) {
+		return connCanceledError{err}
+	}
+	return err
+}
+
+// connCanceledError is a cancellation that the SQL Server driver takes for a network error. Its message and
+// errors.Is are the cancellation's.
+type connCanceledError struct{ error }
+
+func (e connCanceledError) Unwrap() error { return e.error }
+func (connCanceledError) Timeout() bool   { return false }
+func (connCanceledError) Temporary() bool { return false }
+
+// plainCancellation returns the cancellation a connCanceledError wraps, so that only the driver sees the wrapper:
+// database/sql and the driver return the context's Err as is from BEGIN, COMMIT and ROLLBACK.
+func plainCancellation(err error) error {
+	if c, ok := err.(connCanceledError); ok {
+		return c.error
+	}
+	return err
 }
 
 // transactMaxAttempts bounds how many times Transact reruns a transaction that keeps losing to lock

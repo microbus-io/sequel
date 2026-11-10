@@ -144,6 +144,9 @@ jobs:
           cache-dependency-path: go.sum
       - name: Test (SQL Server)
         run: go test -race ./... -count=1 -timeout 20m
+      # Skipped above: go-mssqldb races on a discarded connection's read buffer, which the race detector reports
+      - name: Test cancelled transactions (SQL Server, no race detector)
+        run: go test ./fixtures -run TestTransact_EndedContextLeavesThePoolUsable -count=1 -timeout 20m
 
   cockroachdb:
     name: CockroachDB
