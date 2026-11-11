@@ -14,6 +14,7 @@ A Go library that enhances `database/sql` with cross-driver SQL, schema migratio
 - **Schema migration** - Concurrency-safe, incremental database migrations
 - **Cross-driver support** - MySQL, MariaDB, PostgreSQL, CockroachDB, SQL Server, and SQLite with unified API
 - **Retrying transactions** - `Transact` runs a closure in a transaction, retries on deadlock/lock contention, and never commits partial work
+- **Held connections** - `db.Conn` holds one connection for a sequence of statements and transactions, with the same cross-driver handling
 - **Statement batches** - `tx.Batch` sends a transaction's independent statements together and reads their results in order: one round trip on PostgreSQL and CockroachDB, statement by statement elsewhere, same code either way
 - **Ephemeral test databases** - Isolated databases per test with automatic cleanup, with optional simulated network latency
 
@@ -325,6 +326,51 @@ err := db.Transact(ctx, func(tx *sequel.Tx) error {
 
 A `Tx` from `BeginTx` does neither error-recording nor retry - it behaves exactly like `sql.Tx`.
 
+## Holding a Connection
+
+Every statement run on a `*DB` takes a connection from the pool and gives it back afterward. Under a busy pool, each
+of those statements waits for a free connection. `db.Conn(ctx)` takes one connection and holds it until `Close`, so a
+sequence of statements waits for the pool once rather than once per statement:
+
+```go
+conn, err := db.Conn(ctx)
+if err != nil {
+    return err
+}
+defer conn.Close()
+
+rows, err := conn.QueryContext(ctx, "SELECT id FROM jobs WHERE due <= NOW_UTC() ORDER BY id LIMIT_OFFSET(?, ?)", 100, 0)
+// ...
+err = conn.Transact(ctx, func(tx *sequel.Tx) error {
+    _, err := tx.ExecContext(ctx, "UPDATE jobs SET claimed=? WHERE id=?", true, id)
+    return err
+})
+```
+
+A `*sequel.Conn` gives every statement the same handling as the `DB`: placeholders, virtual functions, telemetry and
+`SimulateRTT`. It satisfies `Executor`, so code written against `Executor` runs on it unchanged. `conn.Transact` runs
+its transaction on the held connection, with the same retries and error recording as `db.Transact`, and every retry
+stays on that connection.
+
+- **Close returns the connection as it is.** Session state left on it - a session lock, a temporary table, a session
+  variable - stays with the pooled connection on PostgreSQL, CockroachDB, MySQL and MariaDB, and the next statement to
+  get that connection from the pool inherits it. SQL Server resets the session. Leave none.
+- **A lost connection is not replaced.** Once the connection is gone, every later call on the `Conn` returns
+  `sql.ErrConnDone`, unwrapped. Take a new `Conn` from the `DB`. A call whose context has already ended returns the
+  context's error and leaves the `Conn` usable, but a `conn.Transact` whose context ends before it commits ends the
+  `Conn`, since the transaction may still be rolling back on the connection when it returns.
+- **One thing at a time.** While `conn.Transact` runs, every other call on the `Conn` fails, a nested `conn.Transact`
+  included: run the transaction's statements through its `Tx`. Use a `Conn` from one goroutine at a time, and read a
+  query's rows to the end or close them before the next statement.
+- **Statements prepared on it** run on its connection only, and `Close` closes them.
+- **On SQL Server**, the `XACT_ABORT ON` that `Transact` sets for its transaction is turned off again before the
+  `Conn`'s next statement outside a transaction.
+- **It holds a connection away from the pool** for as long as it is open, including while Go code runs between
+  statements. Close it as soon as the work that needed it is done.
+
+`db.Conn` returns a `*sequel.Conn`, not `database/sql`'s `*sql.Conn`. The raw connection, which bypasses sequel
+entirely, is still available as `db.DB.Conn(ctx)`.
+
 ## Statement Batches
 
 A transaction is usually a chain of round trips, one per statement. When several statements in a transaction do
@@ -572,7 +618,7 @@ var pgErr *pgconn.PgError
 if errors.As(err, &pgErr) { ... }
 ```
 
-The two `database/sql` sentinels are deliberately **not** wrapped: `sql.ErrNoRows` and `sql.ErrTxDone` are routine control flow rather than failures, and they pass through exactly as `database/sql` returns them, so existing `err == sql.ErrNoRows` comparisons keep working. `errors.Is(err, sql.ErrNoRows)` works too, and is the more robust habit.
+The two `database/sql` sentinels are deliberately **not** wrapped: `sql.ErrNoRows` and `sql.ErrTxDone` are routine control flow rather than failures, and they pass through exactly as `database/sql` returns them, so existing `err == sql.ErrNoRows` comparisons keep working. A `Conn` whose connection is gone returns `sql.ErrConnDone` unwrapped too (see [Holding a Connection](#holding-a-connection)). `errors.Is(err, sql.ErrNoRows)` works too, and is the more robust habit.
 
 Every other error - a driver error, a context cancellation - is wrapped, so never compare those with `==`; use `errors.Is`/`errors.As`. (Code that compares a driver error with `==` is broken with plain `database/sql` as well - drivers return distinct error values per occurrence - so in practice this asks nothing new.)
 

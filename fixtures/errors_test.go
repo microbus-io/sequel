@@ -101,8 +101,9 @@ func TestErrors_ConnectionErrorFromTheDatabase(t *testing.T) {
 	default:
 		return
 	}
-	// A pinned connection, because the pool would retry a dead one on a fresh connection and hide the error.
-	conn, err := db.Conn(ctx)
+	// A pinned connection, because the pool would retry a dead one on a fresh connection and hide the error. The raw
+	// one, because sequel.Conn reports the statements after the loss as sql.ErrConnDone, not the driver's shapes.
+	conn, err := db.DB.Conn(ctx)
 	assert.Must(assert.NoError(err))
 	defer conn.Close()
 	var id int64

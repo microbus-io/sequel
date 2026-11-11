@@ -198,6 +198,47 @@ func TestRTT_ChargedPerRoundTrip(t *testing.T) {
 	assert.Equal(statements, n, "the transaction must still commit its work")
 }
 
+// Statements and transactions on a held Conn pay the delay per round trip, as on the DB.
+func TestRTT_ChargedOnConn(t *testing.T) {
+	assert := testarossa.For(t)
+
+	dsn, err := CreateTestingDatabase("sqlite", "", t.Name())
+	assert.NoError(err)
+	db, err := Open("sqlite", dsn)
+	assert.NoError(err)
+	defer db.Close()
+	_, err = db.Exec("CREATE TABLE rtt_conn (k INT)")
+	assert.NoError(err)
+
+	ctx := context.Background()
+	conn, err := db.Conn(ctx)
+	assert.Must(assert.NoError(err))
+	defer conn.Close()
+
+	const (
+		rtt        = 40 * time.Millisecond
+		statements = 3
+		trips      = 1 + statements + 2 // the statement, then BEGIN and COMMIT around the transaction's
+	)
+	db.SimulateRTT(rtt)
+	defer db.SimulateRTT(0)
+	t0 := time.Now()
+	_, err = conn.ExecContext(ctx, "INSERT INTO rtt_conn (k) VALUES (?)", 0)
+	assert.NoError(err)
+	err = conn.Transact(ctx, func(tx *Tx) error {
+		for i := range statements {
+			if _, err := tx.ExecContext(ctx, "INSERT INTO rtt_conn (k) VALUES (?)", i); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	elapsed := time.Since(t0)
+	assert.NoError(err)
+	assert.True(elapsed >= trips*rtt, "%d round trips, took %v", trips, elapsed)
+	assert.True(elapsed < 2*trips*rtt, "the delay must be charged once per round trip, took %v", elapsed)
+}
+
 // A context whose deadline is shorter than the simulated round trip fails the operation with the
 // context's error and never reaches the database - the outcome a real round trip that outlives its
 // deadline produces.

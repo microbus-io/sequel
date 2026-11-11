@@ -498,7 +498,7 @@ If one is added, keep it write-only - accepting a row-returning statement would 
 ### Reaching the pgx connection, and what may run while it is borrowed
 
 `sql.Tx` does not expose its driver connection. `Transact` therefore begins its transaction on a held `sql.Conn` on
-the pgx drivers (`beginTx` with `hold` set), and a batch reaches the `*pgx.Conn` through `Conn.Raw` while the
+the pgx drivers (`beginTx` with `hold` set, or the `sequel.Conn`'s own under `Conn.Transact`), and a batch reaches the `*pgx.Conn` through `Conn.Raw` while the
 transaction is open. `Conn.BeginTx` and `Conn.Raw` both take the `Conn`'s read lock, and the per-call driver mutex
 serializes `Raw` against the transaction's own statements. pgx's `database/sql` driver runs a transaction as a
 plain server-side `BEGIN` on that same connection, so a batch sent there runs inside it. Checking out the `Conn` is
@@ -608,11 +608,77 @@ All statement paths must participate, including prepared-statement executions an
   (`TestTransact_QueryRowUnpackErrorIsNotErrNoRows`).
 - `Stmt` executions use the same guard and recording, whether prepared through Tx or rebound with Tx.Stmt.
   DB-prepared statements read telemetry and latency live; Tx-bound statements use the transaction's snapshots.
-  Raw `sql.Conn` operations are outside this boundary.
+  Operations on `db.DB.Conn`'s raw `sql.Conn` are outside this boundary.
 
 `Tx.mu` protects the first error and batch bookkeeping. Do not call into batch execution with it held;
 Rollback snapshots the open batch under the lock and abandons it afterward. `TestTx_ConcurrentUseIsRaceFree`
 protects concurrent statement use. Batch-specific refusal and result-order rules are recorded in the batch section.
+
+## Held connections (`DB.Conn`, `conn.go`)
+
+`DB.Conn` takes one connection from the pool and holds it, so a sequence of statements waits for the pool once. It
+exists for throughput under a saturated pool, not for session state; the contract is on the `Conn` godoc.
+
+**It shadows `sql.DB.Conn`, breaking callers that used the result as `*sql.Conn`.** A separately named method was
+the compatible option, but it left `db.Conn` compiling and silently skipping placeholder conforming, virtual
+functions, telemetry, `SimulateRTT` and `Transact` - a trap for every caller, not a missing feature. That is the same
+reasoning that made `Query`, `QueryRow`, `Prepare` and `BeginTx` return sequel's types. The break was accepted while
+the library has few users; the raw connection stays reachable as `db.DB.Conn`. **`Conn` does not embed `*sql.Conn`**,
+since promoted `BeginTx`, `Raw` and `PrepareContext` would reopen the bypass. It has no `BeginTx` or `Raw` of its own
+yet; add them if a caller needs them.
+
+**`Close` returns the connection as it is.** pgx's and the MySQL driver's `ResetSession` clear nothing (pgx only
+discards a connection still in a transaction), so session state outlives `Close` there; SQL Server resets the
+session on the connection's next use. Discarding or resetting at `Close` would cost a reconnect or a round trip per
+`Conn`, which is the cost `Conn` exists to save, so the godoc tells callers to leave no session state instead.
+
+**A lost connection is never replaced**, because a sequence that silently continued on another connection would be
+running on a different session without knowing it. `lost` makes every later call return the bare `sql.ErrConnDone`
+without reaching `database/sql`. `database/sql` closes a `sql.Conn` whose driver returned `driver.ErrBadConn`, so
+`observe` marks the `Conn` lost on that or on `sql.ErrConnDone`, on every path including `Row.Scan`, and returns the
+bare sentinel, or the context's error when that has ended. `traceErr` is not exempted for it: every `Conn` path
+returns it itself. `Transact`'s retry loop (`DB.transact`, shared with `DB.Transact`) stops when the `Conn` is lost.
+`transactOnce` decides that from the transaction's own errors (BEGIN, the SET, the recorded statement error, COMMIT),
+never from `fn`'s, which may carry another `Conn`'s `sql.ErrConnDone`. On pgx `tx.conn` is the `Conn`'s connection, so
+batches pipeline; elsewhere it stays nil, because a batch pipelines whenever its transaction has one.
+
+**An ended context is checked before the driver, and does not end the `Conn`.** `driver.ErrBadConn` does not always
+mean the connection is gone: pgx returns it for a statement whose context is already done (pgconn's
+`contextAlreadyDoneError` is safe to retry), and for any failed `Ping`. `database/sql` checks the context before a
+pool checkout, so the `DB` never hands pgx such a statement, but a `sql.Conn` hands it straight through and then
+closes the healthy connection. `check` therefore returns the context's error first. A context that ends between the
+check and the driver still costs the `Conn`, and `observe` reports the context's error for it.
+
+**Every call fails while the `Conn`'s own `Transact` runs** (`transacting`). `sql.Conn.BeginTx` only checks that the
+`Conn` is open, so a nested `Transact` began a second transaction on a connection already in one: MySQL commits the
+outer transaction at the inner `BEGIN`, and PostgreSQL's inner `COMMIT` commits the outer statements. A plain statement
+on the `Conn` would run inside the transaction too, but without its error recorded, and could fire the `XACT_ABORT`
+reset below mid-transaction. A nested `DB.Transact` is unaffected: it runs on another connection.
+`TestConn_NestedTransactIsRefused` fails on MySQL and PostgreSQL without the guard.
+
+**SQL Server's `XACT_ABORT ON` is a session setting**, sent as a plain batch, so it outlived `Conn.Transact` and made
+the `Conn`'s later batches stop at their first error. Under `DB.Transact` the pool's `ResetSession` clears it on the
+next checkout, which a held connection never gets. `xactAbortOn` records that the session has it on: the next statement
+outside a transaction (`ready`) turns it off first, and the next transaction skips setting it. A sequence that ends in
+a transaction, or runs several in a row, pays nothing; turning it off at the end of every transaction would cost a round
+trip each. `TestConn_XactAbortEndsWithTheTransaction` reads `@@OPTIONS` and runs a batch past a failed statement.
+
+**`Close` closes the statements prepared on the `Conn`** (`stmts`). `database/sql` does not, and a conn-bound
+`sql.Stmt` closed after its connection went back to the pool closes the driver statement on a connection that may be
+someone else's, serialized only by the driver connection's mutex: the MySQL driver resets the packet sequence first,
+which can break another caller's open result set.
+
+**A `Conn.Transact` whose context ends before it commits marks the `Conn` lost**, on every driver. A held connection
+never passes the pool's `ResetSession`, which is what catches a pooled connection left in a transaction. And when the
+context ends, `database/sql`'s `awaitDone` may win the rollback, so `transactOnce`'s deferred `Rollback` returns
+`ErrTxDone` at once while the real rollback is still in flight on another goroutine. A statement issued then could
+run inside the dying transaction, since nothing orders it after the rollback, and if that rollback reports
+`driver.ErrBadConn`, `database/sql` closes the `sql.Conn` under it - the `grabConn` race described under the SQL Server
+cancellation section. On SQL Server, `mssqlTxContext` also has the driver discard the connection. Once the `Conn` is
+lost only `Close` touches it, and `sql.Conn.Close` takes `closemu` exclusively, so it waits for the rollback before the
+pool validates the connection. A context that ends just after the rollback finished costs one `Conn` needlessly, which
+is the cheap direction. `TestConn_EndedContextEndsTheConn` pins it on a pool of one, and
+`TestConn_LostConnectionIsNotReplaced` kills the session from a second connection.
 
 ## A closed `DB` keeps its closed pool
 
@@ -1073,8 +1139,8 @@ uses the transaction's captured delay; a DB-bound one reads the pool's current v
 Three things are deliberately *not* charged. The boundary is not simply "what sequel shadows" - `Close` is
 shadowed and exempt - but "caller-facing work sequel is in the path of":
 
-- **Raw handles obtained through sequel.** A `*sql.Conn` talks to the driver directly; sequel is not in
-  the path and cannot delay it without shadowing that type too.
+- **Raw handles.** The `*sql.Conn` from `db.DB.Conn` talks to the driver directly; sequel is not in the path.
+  A `sequel.Conn` is, and is charged like the `DB`.
 - **Fetching successive rows from an open `Rows`.** Drivers batch that transfer, so charging a full round
   trip per `Next()` would model the wire *worse* than charging nothing - it would make a 1000-row scan look
   like 1000 round trips when the driver made a handful.

@@ -765,6 +765,9 @@ type Row struct {
 	// shortErr without touching the database, and op is zero.
 	shortErr error
 	done     bool
+	// conn is the Conn the query ran on, which a lost connection marks lost; connCtx is the query's context.
+	conn    *Conn
+	connCtx context.Context
 }
 
 // latch records a non-nil error into the owning transaction, when there is one. sql.ErrNoRows is exempt -
@@ -785,6 +788,9 @@ func (r *Row) Scan(dest ...any) error {
 	err := r.Row.Scan(dest...)
 	r.complete(err)
 	r.latch(err)
+	if r.conn != nil {
+		return r.conn.observe(r.connCtx, traceErr(err))
+	}
 	return traceErr(err)
 }
 
@@ -797,6 +803,9 @@ func (r *Row) Err() error {
 	err := r.Row.Err()
 	r.complete(err)
 	r.latch(err)
+	if r.conn != nil {
+		return r.conn.observe(r.connCtx, traceErr(err))
+	}
 	return traceErr(err)
 }
 

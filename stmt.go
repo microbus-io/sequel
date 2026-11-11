@@ -33,7 +33,7 @@ It embeds *sql.Stmt, so stmt.Exec(...)/stmt.Query(...)/stmt.Close() call sites a
 that explicitly stores the result of Prepare as *sql.Stmt needs adjustment (the same source-compat shape
 as [Rows] and [Row]).
 
-A Stmt prepared on a [DB] reads the pool's telemetry and simulated delay at each execution; a Stmt bound
+A Stmt prepared on a [DB] or a [Conn] reads the pool's telemetry and simulated delay at each execution; a Stmt bound
 to a [Tx] (from [Tx.Prepare] or [Tx.Stmt]) uses the snapshots the transaction captured when it began, so
 one transaction runs at one consistent latency. Close is a passthrough: releasing the statement handle is
 lifecycle, not caller-facing work.
@@ -43,6 +43,8 @@ type Stmt struct {
 	pq *preparedQuery // the statement, unpacked when it was prepared
 	db *DB            // for a DB-prepared Stmt: telemetry and simulated delay are read live per execution
 	tx *Tx            // for a Tx-bound Stmt: latch, short-circuit and snapshots come from the transaction
+	// conn is the Conn a Stmt was prepared on, which a lost connection fails like any of its statements
+	conn *Conn
 	// err is set on a Stmt that could not be bound to its transaction, and is what every execution returns; the
 	// embedded *sql.Stmt is then nil.
 	err error
@@ -66,13 +68,17 @@ func (s *Stmt) rttDelay() time.Duration {
 	return s.db.rtt()
 }
 
-// shortCircuit mirrors Tx.shortCircuit for a transaction-bound statement, and is a no-op otherwise.
-func (s *Stmt) shortCircuit() error {
+// shortCircuit mirrors Tx.shortCircuit for a transaction-bound statement and Conn.ready for one prepared on a Conn,
+// and is a no-op otherwise.
+func (s *Stmt) shortCircuit(ctx context.Context) error {
 	if s.err != nil {
 		return s.err
 	}
 	if s.tx != nil {
 		return s.tx.shortCircuit()
+	}
+	if s.conn != nil {
+		return s.conn.ready(ctx)
 	}
 	return nil
 }
@@ -82,13 +88,20 @@ func (s *Stmt) Close() error {
 	if s.Stmt == nil {
 		return nil
 	}
+	if s.conn != nil {
+		s.conn.forget(s)
+	}
 	return s.Stmt.Close()
 }
 
-// recordErr mirrors Tx.recordErr for a transaction-bound statement, and returns err unchanged otherwise.
-func (s *Stmt) recordErr(err error) error {
+// recordErr mirrors Tx.recordErr for a transaction-bound statement, and Conn.observe for one prepared on a Conn. It
+// returns err unchanged otherwise.
+func (s *Stmt) recordErr(ctx context.Context, err error) error {
 	if s.tx != nil {
 		return s.tx.recordErr(err)
+	}
+	if s.conn != nil {
+		return s.conn.observe(ctx, err)
 	}
 	return err
 }
@@ -100,14 +113,14 @@ func (s *Stmt) Exec(args ...any) (sql.Result, error) {
 
 // ExecContext shadows sql.Stmt.ExecContext.
 func (s *Stmt) ExecContext(ctx context.Context, args ...any) (sql.Result, error) {
-	if err := s.shortCircuit(); err != nil {
+	if err := s.shortCircuit(ctx); err != nil {
 		return nil, err
 	}
 	res, err := instrumentExec(s.telemetry(), s.rttDelay(), ctx, s.pq,
 		func(ctx context.Context, _ string) (sql.Result, error) {
 			return s.Stmt.ExecContext(ctx, args...)
 		})
-	return res, s.recordErr(err)
+	return res, s.recordErr(ctx, err)
 }
 
 // Query shadows sql.Stmt.Query. It returns a [Rows], which embeds *sql.Rows so existing call sites are
@@ -118,7 +131,7 @@ func (s *Stmt) Query(args ...any) (*Rows, error) {
 
 // QueryContext shadows sql.Stmt.QueryContext. It returns a [Rows] (see Query).
 func (s *Stmt) QueryContext(ctx context.Context, args ...any) (*Rows, error) {
-	if err := s.shortCircuit(); err != nil {
+	if err := s.shortCircuit(ctx); err != nil {
 		return nil, err
 	}
 	rows, err := instrumentExec(s.telemetry(), s.rttDelay(), ctx, s.pq,
@@ -126,7 +139,7 @@ func (s *Stmt) QueryContext(ctx context.Context, args ...any) (*Rows, error) {
 			return s.Stmt.QueryContext(ctx, args...)
 		})
 	if err != nil {
-		return nil, s.recordErr(err)
+		return nil, s.recordErr(ctx, err)
 	}
 	return &Rows{Rows: rows, tx: s.tx}, nil
 }
@@ -139,11 +152,15 @@ func (s *Stmt) QueryRow(args ...any) *Row {
 
 // QueryRowContext shadows sql.Stmt.QueryRowContext. It returns a [Row] (see QueryRow).
 func (s *Stmt) QueryRowContext(ctx context.Context, args ...any) *Row {
-	if err := s.shortCircuit(); err != nil {
+	if err := s.shortCircuit(ctx); err != nil {
 		return &Row{shortErr: err}
 	}
-	return instrumentQueryRow(s.telemetry(), s.rttDelay(), ctx, s.pq, s.tx,
+	row := instrumentQueryRow(s.telemetry(), s.rttDelay(), ctx, s.pq, s.tx,
 		func(ctx context.Context, _ string) *sql.Row {
 			return s.Stmt.QueryRowContext(ctx, args...)
 		})
+	if s.conn != nil {
+		row.conn, row.connCtx = s.conn, ctx
+	}
+	return row
 }

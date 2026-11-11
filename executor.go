@@ -24,9 +24,10 @@ import (
 var (
 	_ Executor = (*DB)(nil)
 	_ Executor = (*Tx)(nil)
+	_ Executor = (*Conn)(nil)
 )
 
-// Executor is the interface satisfied by both DB and Tx.
+// Executor is the interface satisfied by DB, Conn and Tx.
 type Executor interface {
 	Exec(query string, args ...any) (sql.Result, error)
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
