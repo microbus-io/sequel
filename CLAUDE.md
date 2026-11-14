@@ -818,10 +818,11 @@ runner from running it too, each the fix for a way it once did:
 - **Each extension must succeed before the lease it extends lapses.** It runs under a deadline of the last lease's
   start plus 15s, less a 2s margin, taken from before the statement that set it, so the local deadline is never later
   than the server's. An extension that fails or misses the deadline cancels the run's context and waits for the
-  goroutine before giving the lock up. Cancelling stops the statements after the one in flight; whether the
-  in-flight one stops is the driver's and server's business (MySQL closes the connection, and the server may finish
-  a DDL anyway). That in-flight statement is the one remaining way two runners can overlap; nothing short of a
-  server-side lock held for the statement's lifetime prevents it.
+  goroutine before giving the lock up, unless the run's transaction has taken the lock over (below). Cancelling stops
+  the statements after the one in flight; whether the in-flight one stops is the driver's and server's business
+  (MySQL closes the connection, and the server may finish a DDL anyway). That in-flight statement is the one
+  remaining way two runners can overlap outside a transaction; nothing short of a server-side lock held for the
+  statement's lifetime prevents it.
 - **The lock has an owner** (`locked_by`, a random token per `Migrate` call). Extending, releasing and completing are
   conditional on the lock still naming the runner, so a runner that lost its lock - a process paused past its lease,
   say - fails with `errMigrationLockLost` rather than recording the migration as done. MySQL counts only the rows an
@@ -841,10 +842,92 @@ anywhere in the text, one inside a string literal skipped its statement and the 
 `--` comments are stripped by `stripLineComments`, which leaves one inside a quoted string alone. Whitespace inside a
 statement is no longer trimmed line by line, since that rewrote multi-line string literals.
 
+**A waiting runner backs off from 5ms to a second** (`migrationPollStart`, `migrationPollMax`), doubling with jitter.
+At a flat 5ms - three statements a pass - a runner waiting out an hour-long migration sent hundreds of statements a
+second for the hour. It starts at 5ms so that a short migration is still noticed at once
+(`TestMigrate_AWaitingRunnerBacksOff`).
+
+**A waiting runner takes lock contention for a held lock** (`takeMigrationLock`). On a SQLite file, a migration's
+transaction (below) holds the database's write lock until it commits, so the waiter's writes fail with `SQLITE_BUSY`
+once `busy_timeout` runs out, and `retryContention` gives up after eight attempts: the waiting replica's `Migrate`
+failed whenever a file ran longer than that. Its statements are all safe to repeat, so it polls again instead. A
+shared-cache database never gets there: modernc waits for the lock through unlock notification, bounded only by the
+context. The cost is that a database locked by something stuck makes `Migrate` wait rather than fail, as a held lease
+always has. `TestMigrate_AWaitingRunnerOutlastsATransaction` pins it.
+
 **Two files with one sequence number fail `Migrate`** before anything runs (`1.a.sql` and `1.b.sql`, or `1.sql` and
 `01.sql`). They were indexed by number, so one overwrote the other, ran alone, and the number was recorded as done, so
 fixing the files later reran nothing. Duplicates at or below the watermark are not checked: that number is decided,
 and failing a deployed application's startup over it repairs nothing.
+
+## A migration file of several statements runs in one transaction (`runMigrationInTx`)
+
+Run a statement at a time, a file that failed midway left its earlier statements applied and ran again from its
+first, so every statement had to be safe to run twice; a runner that died between the last statement and the mark
+did the same. Now a file with two or more statements left after `-- DRIVER:` filtering and comment-only pieces
+(`migrationStatements`) runs on `pgx`, `mssql` and `sqlite` in one transaction that also writes the mark
+(`migrationInTransaction`). Anything else runs as before.
+
+- **A statement count, not a directive.** A one-statement file is atomic by itself, so "one statement runs alone"
+  is the way to run a statement that refuses a transaction (`CREATE INDEX CONCURRENTLY`, SQL Server's `ALTER
+  DATABASE`, SQLite's `VACUUM`), with no syntax to learn or forget. The failure the count causes is loud: the
+  engine refuses the statement inside the transaction.
+- **The mark is inside the transaction**, so the commit and the mark are one event: a runner that dies before the
+  commit leaves neither, and a lost lock found by the mark rolls the whole file back.
+- **MySQL, MariaDB and CockroachDB are excluded.** MySQL and MariaDB commit every schema statement implicitly, so a
+  transaction around the file would claim an atomicity it does not have. CockroachDB advises against schema changes
+  in explicit transactions, which can fail at commit with part of them applied.
+- **A plain transaction, not `Transact`'s**: a failed file returns, and the next `Migrate` runs it again. No
+  `XACT_ABORT` on SQL Server: the first error stops the file and the rollback undoes it anyway, while `XACT_ABORT`
+  would doom the transaction on an error the migration catches in its own `TRY/CATCH`.
+- **The cost is that a file's locks last until its commit.** A schema change followed by a long backfill or index
+  build in the same file keeps its table locked for the whole file, on SQLite the whole database, and locks that
+  different statements take now overlap, so a deadlock with the application fails the file (the next `Migrate` runs it
+  again). The README tells callers to split such files; a file must also hold no transaction control of its own.
+- On PostgreSQL `completed_on` records when the file's transaction began, since `NOW()` is fixed for a transaction.
+
+**The transaction takes the lock over from the lease** (`migrationRun`). Once it has written the lock row, no other
+runner can take the lock until it ends, and by then the file is complete or rolled back. So from then on the lease is
+not extended, an extension under way is called off, and one that failed is not a lost lock. The run and the loop
+extending its lease race by compare-and-swap to move it on from `running`: the run to `holding` (`takeOver`), the loop
+to `abandoned` (`abandon`), and whichever loses defers. **Before the run ends, `runCtx` is cancelled only when the
+loop wins**, because all three drivers commit on the context the transaction began with (pgx's stdlib, modernc, and
+go-mssqldb's `transactionCtx`): cancelled during the `COMMIT`, it can be rolled back or its outcome left unknown. Once
+taken over, a run is bounded only by the engine: a statement waiting for another session's lock waits as long as that
+lock is held, as statements on the other engines always have.
+
+- **PostgreSQL and SQL Server take over at the mark, which comes last.** The mark's `UPDATE` locks the row, so
+  another runner's lock-taking `UPDATE` blocks until the commit and then finds the file `completed`, or until a
+  rollback and then takes the lock. Writing the mark first was rejected: the transaction would hold the row for the
+  whole file, and every waiting runner would block inside one statement for the duration - into a DBA's
+  `statement_timeout` or `lock_timeout`, failing that replica's `Migrate`, and on SQL Server's locking read committed
+  even in its `SELECT completed`. Last, the window is the commit.
+- **SQLite takes over at a first write to the lock row** (`renewMigrationLock` inside the transaction). A SQLite
+  write locks the whole database until the commit, so writing first costs waiters nothing they would not pay at the
+  file's first write, and it makes the takeover hold from `BEGIN` rather than from whichever statement writes first.
+  It also keeps WAL mode working: a deferred transaction that reads before it writes fails that write with
+  `SQLITE_BUSY_SNAPSHOT`, which no retry fixes, if an extension commits in between. `BEGIN IMMEDIATE` would do the
+  same, but modernc offers it only for a whole DSN (`_txlock`). The first statement holds no lock when it fails, so it
+  is retried on contention. This covers a private in-memory database too, whose extension shares the caller's pool
+  and would wait for the transaction's connection.
+- **An extension called off on pgx still runs on the server.** pgx closes the connection, but the server finishes the
+  `UPDATE` once the row unlocks; if the commit then fails, that renewal can land after the release and hold other
+  runners off for one lease. Not calling extensions off on pgx and SQL Server would avoid it, at the price of a driver
+  branch, for a delay that needs a failed commit to happen.
+- **A one-statement SQLite file does not take over.** One that writes for longer than the lease still fails, since
+  its extension cannot write. Taking that failure for a held lock would be unsafe: nothing marks the file until the
+  statement ends, and a waiter can take the lapsed lease between the statement's end and the mark, and run it again.
+- `TestMigrate_ATransactionHoldsItsOwnLock` pins the SQLite takeover at the first statement, and
+  `TestMigrate_ATakeoverOutlastsAnExtensionUnderWay` an extension under way at the takeover, which must not cancel the
+  run. `TestMigrate_ALockLostBeforeCommitLeavesNothing` (fixtures) has the file hand its own lock away, which the mark
+  must find and roll back.
+
+**The trap this leaves: a concurrent index build cannot be made safe to re-run.** That takes two statements, `DROP
+INDEX CONCURRENTLY IF EXISTS` and then `CREATE INDEX CONCURRENTLY`, which this rule puts in a transaction that
+PostgreSQL refuses. Splitting them across two files does not help, because the drop's file is marked done and does
+not run again when the build fails. So a concurrent build stays unguarded: a failed build leaves an invalid index, and
+the re-run fails on "already exists" until someone drops it - better than `CREATE INDEX CONCURRENTLY IF NOT EXISTS`,
+which would skip the invalid index silently.
 
 ## Hardening against uncontrolled input
 

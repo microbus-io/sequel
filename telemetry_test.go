@@ -366,8 +366,10 @@ func TestTelemetry_TransactionLifecycleSpans(t *testing.T) {
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
 
 	db := newSQLiteDB(t)
-	db.SetTracerProvider(tp)
 	assert.NoError(db.Migrate(t.Name(), testdata.FS))
+	// Traced from here, so that the spans are only those of the transactions below: a migration file of more than one
+	// statement runs in a transaction of its own
+	db.SetTracerProvider(tp)
 
 	ctx := context.Background()
 	assert.NoError(db.Transact(ctx, func(tx *Tx) error {

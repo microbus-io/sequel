@@ -2007,8 +2007,18 @@ func (db *DB) createMigrationsTable() error {
 	return nil
 }
 
-// Migrate reads all #.sql files from the FS, and executes any new migrations in order of their file name.
+// Migrate reads all #.sql files from the FS, and executes any new migrations in the order of their sequence numbers.
 // The order of execution is guaranteed only within the context of a sequence name.
+//
+// The statements of a file that are left to run on the driver, after -- DRIVER: directives and comment-only pieces,
+// determine how it runs. Two or more on PostgreSQL (pgx), SQL Server or SQLite run in one transaction, which also
+// marks the file complete: a file that fails leaves nothing applied, and the next Migrate runs it again whole. The
+// transaction holds the locks its statements take until it commits, and the file must not begin, commit or roll back
+// a transaction of its own. Such a file cannot hold a statement that refuses a transaction, such as PostgreSQL's
+// CREATE INDEX CONCURRENTLY; give that statement a file of its own. A file with one statement, and every file on
+// MySQL, MariaDB and CockroachDB, runs a
+// statement at a time and is marked complete after the last, so a file that fails there leaves the statements before
+// the failure applied, and the next Migrate runs it again from its first statement.
 func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 	ctx, finishMigrate := db.telemetry.Load().beginMigrate(context.Background(), db.driverName, sequenceName)
 	defer func() { finishMigrate(err) }()
@@ -2097,78 +2107,27 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 	}()
 
 	// Execute the migrations
+	poll := migrationPollStart
 	for len(sequenceNumbersToRun) > 0 {
 		seqNum := sequenceNumbersToRun[0]
 
-		// Insert new migrations into the database first
-		// Ignore duplicate key violations
-		switch db.driverName {
-		case "mysql", "mariadb":
-			stmt = `INSERT IGNORE INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
-		case "pgx", "cockroachdb":
-			stmt = `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?) ON CONFLICT DO NOTHING`
-		case "mssql":
-			// The existence check spares the duplicate-key error, and its error span, in the common case of a row
-			// already there; two runners that both pass it race to the INSERT, and the loser's duplicate is ignored
-			// below. A MERGE WITH (HOLDLOCK) took key-range locks that deadlocked concurrent first runs, each one
-			// found only by the 5s deadlock monitor.
-			stmt = `IF NOT EXISTS (SELECT 1 FROM sequel_migrations WHERE seq_name=? AND seq_num=?)
-				INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
-		case "sqlite":
-			stmt = `INSERT OR IGNORE INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
-		default:
-			return errors.New("unsupported driver name: %s", db.driverName)
-		}
-		args := []any{sequenceName, seqNum}
-		if db.driverName == "mssql" {
-			args = append(args, sequenceName, seqNum)
-		}
-		_, err = db.execRetryingContention(stmt, args...)
-		if err != nil && !isDuplicateKeyError(db.driverName, err) {
-			return errors.Trace(err)
-		}
-
-		// See if completed by another process
-		stmt = `SELECT completed FROM sequel_migrations WHERE seq_name=? AND seq_num=?`
-		var completed bool
-		err := retryContention(func() error {
-			return db.QueryRow(stmt, sequenceName, seqNum).Scan(&completed)
-		})
-		if err != nil {
+		completed, taken, leasedAt, err := db.takeMigrationLock(sequenceName, seqNum, owner)
+		if err != nil && !IsLockContentionError(err) {
 			return errors.Trace(err)
 		}
 		if completed {
 			sequenceNumbersToRun = sequenceNumbersToRun[1:]
+			poll = migrationPollStart
 			continue
 		}
-
-		// Try to obtain a lock. A row just inserted, or just released, holds the moment it was written, so the
-		// comparison must include it: with a strict < a lock taken within that millisecond fails and sleeps.
-		switch db.driverName {
-		case "mysql", "mariadb", "pgx", "cockroachdb":
-			stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000), locked_by=?
-					WHERE seq_name=? AND seq_num=? AND locked_before<=NOW_UTC() AND completed=FALSE`
-		case "mssql", "sqlite":
-			stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000), locked_by=?
-					WHERE seq_name=? AND seq_num=? AND locked_before<=NOW_UTC() AND completed=0`
-		default:
-			return errors.New("unsupported driver name: %s", db.driverName)
-		}
-		// The lease runs from before the statement, so the deadline kept here is never later than the server's
-		leasedAt := time.Now()
-		res, err := db.execRetryingContention(stmt, owner, sequenceName, seqNum)
-		if err != nil {
-			return errors.Trace(err)
-		}
-		affected, err := res.RowsAffected()
-		if err != nil {
-			return errors.Trace(err)
-		}
-		if affected == 0 {
-			// Another runner holds the lock: poll until it completes the migration or its lease lapses.
-			time.Sleep(5 * time.Millisecond)
+		if !taken {
+			// Another runner holds the lock, or is in the way of taking it, as a SQLite migration's transaction is in
+			// the way of every write: poll until it completes the migration or its lease lapses
+			time.Sleep(poll + rand.N(poll/4))
+			poll = min(2*poll, migrationPollMax)
 			continue
 		}
+		poll = migrationPollStart
 
 		// Obtained lock, execute migration in a goroutine
 		db.telemetry.Load().logMigrationAttempt(ctx, db.driverName, sequenceName, fileNames[seqNum])
@@ -2179,44 +2138,46 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 				return errors.Trace(err)
 			}
 		}
-		statements := splitMigration(db.driverName, migrations[seqNum])
+		statements := migrationStatements(db.driverName, migrations[seqNum])
+		inTx := migrationInTransaction(db.driverName, len(statements))
 
 		// Buffered, so the goroutine never blocks on a receiver that has gone; cancelled if the lock is lost
 		runCtx, cancelRun := context.WithCancel(ctx)
+		run := newMigrationRun(ctx)
 		done := make(chan error, 1)
 		go func() {
-			for _, stmt := range statements {
-				if drivers, ok := migrationDriverDirective(db.driverName, stmt); ok && !slices.Contains(drivers, db.driverName) {
-					continue
-				}
-				stmt = strings.TrimSpace(stripLineComments(db.driverName, stmt))
-				if stmt == "" {
-					// Empty after stripping comments (e.g. a comment-only segment); skip to avoid erroring out
-					continue
-				}
-				_, e := db.ExecContext(runCtx, stmt)
-				if e != nil {
-					done <- e
-					return
-				}
+			if inTx {
+				done <- db.runMigrationInTx(runCtx, run, statements, sequenceName, seqNum, owner)
+			} else {
+				done <- db.execMigration(runCtx, statements)
 			}
-			done <- nil
 		}()
 
 		// Wait for it to finish, extending the lock while it runs. Each extension must succeed before the lease it
-		// extends lapses, or another runner may take the lock: one that cannot is given up on, and the run stopped
+		// extends lapses, or another runner may take the lock: one that cannot is given up on, and the run stopped.
+		// Once the run's transaction holds the lock itself, it needs no extending, and an extension waiting for the
+		// lock the transaction holds is called off.
 		exit := false
 		for !exit {
 			select {
 			case err = <-done:
 				exit = true
+			case <-run.holding.Done():
+				err = <-done
+				exit = true
 			case <-time.After(migrationLockRenewal):
-				extendCtx, cancelExtend := context.WithDeadline(ctx, leasedAt.Add(migrationLease-migrationLeaseMargin))
+				extendCtx, cancelExtend := context.WithDeadline(run.holding, leasedAt.Add(migrationLease-migrationLeaseMargin))
 				extendedAt := time.Now()
 				extendErr := extendMigrationLock(extendCtx, lease, sequenceName, seqNum, owner)
 				cancelExtend()
 				if extendErr == nil {
 					leasedAt = extendedAt
+					continue
+				}
+				if !run.abandon() {
+					// The transaction took the lock over while the extension was under way: it ends with the commit
+					err = <-done
+					exit = true
 					continue
 				}
 				// The lock will lapse, and another runner may take it. Stop this run before giving it up, and
@@ -2229,6 +2190,7 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			}
 		}
 		cancelRun()
+		run.release()
 
 		db.telemetry.Load().recordMigration(ctx, db.driverName, sequenceName, err)
 
@@ -2237,25 +2199,225 @@ func (db *DB) Migrate(sequenceName string, fileSys fs.FS) (err error) {
 			return errors.New("error running migration %s", fileNames[seqNum], err)
 		}
 
-		// Mark as complete, only while the lock is still this runner's
-		switch db.driverName {
-		case "mysql", "mariadb", "pgx", "cockroachdb":
-			stmt = `UPDATE sequel_migrations SET locked_before=NOW_UTC(), completed_on=NOW_UTC(), completed=TRUE WHERE seq_name=? AND seq_num=? AND locked_by=?`
-		case "mssql", "sqlite":
-			stmt = `UPDATE sequel_migrations SET locked_before=NOW_UTC(), completed_on=NOW_UTC(), completed=1 WHERE seq_name=? AND seq_num=? AND locked_by=?`
-		default:
-			return errors.New("unsupported driver name: %s", db.driverName)
-		}
-		res, err = db.execRetryingContention(stmt, sequenceName, seqNum, owner)
-		if err == nil {
-			err = migrationLockHeld(ctx, db, res, sequenceName, seqNum, owner)
-		}
-		if err != nil {
-			return errors.New("unable to mark migration %s as complete", fileNames[seqNum], err)
+		if !inTx {
+			// Mark as complete, only while the lock is still this runner's
+			err = retryContention(func() error {
+				return markMigrationComplete(ctx, db, sequenceName, seqNum, owner)
+			})
+			if err != nil {
+				return errors.New("unable to mark migration %s as complete", fileNames[seqNum], err)
+			}
 		}
 		sequenceNumbersToRun = sequenceNumbersToRun[1:]
 	}
 	return nil
+}
+
+// takeMigrationLock registers migration seqNum, and unless it is already complete, tries once to take its lock for
+// owner. It reports whether the migration is complete, and whether the lock was taken and the moment its lease began.
+// Neither means another runner holds the lock.
+func (db *DB) takeMigrationLock(sequenceName string, seqNum int, owner string) (completed bool, taken bool, leasedAt time.Time, err error) {
+	// Insert new migrations into the database first
+	// Ignore duplicate key violations
+	var stmt string
+	switch db.driverName {
+	case "mysql", "mariadb":
+		stmt = `INSERT IGNORE INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
+	case "pgx", "cockroachdb":
+		stmt = `INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?) ON CONFLICT DO NOTHING`
+	case "mssql":
+		// The existence check spares the duplicate-key error, and its error span, in the common case of a row
+		// already there; two runners that both pass it race to the INSERT, and the loser's duplicate is ignored
+		// below. A MERGE WITH (HOLDLOCK) took key-range locks that deadlocked concurrent first runs, each one
+		// found only by the 5s deadlock monitor.
+		stmt = `IF NOT EXISTS (SELECT 1 FROM sequel_migrations WHERE seq_name=? AND seq_num=?)
+			INSERT INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
+	case "sqlite":
+		stmt = `INSERT OR IGNORE INTO sequel_migrations (seq_name, seq_num) VALUES (?, ?)`
+	default:
+		return false, false, time.Time{}, errors.New("unsupported driver name: %s", db.driverName)
+	}
+	args := []any{sequenceName, seqNum}
+	if db.driverName == "mssql" {
+		args = append(args, sequenceName, seqNum)
+	}
+	_, err = db.execRetryingContention(stmt, args...)
+	if err != nil && !isDuplicateKeyError(db.driverName, err) {
+		return false, false, time.Time{}, err
+	}
+
+	// See if completed by another process
+	err = retryContention(func() error {
+		return db.QueryRow(`SELECT completed FROM sequel_migrations WHERE seq_name=? AND seq_num=?`, sequenceName, seqNum).
+			Scan(&completed)
+	})
+	if err != nil || completed {
+		return completed, false, time.Time{}, err
+	}
+
+	// Try to obtain a lock. A row just inserted, or just released, holds the moment it was written, so the
+	// comparison must include it: with a strict < a lock taken within that millisecond fails and sleeps.
+	switch db.driverName {
+	case "mysql", "mariadb", "pgx", "cockroachdb":
+		stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000), locked_by=?
+				WHERE seq_name=? AND seq_num=? AND locked_before<=NOW_UTC() AND completed=FALSE`
+	default:
+		stmt = `UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000), locked_by=?
+				WHERE seq_name=? AND seq_num=? AND locked_before<=NOW_UTC() AND completed=0`
+	}
+	// The lease runs from before the statement, so the deadline kept here is never later than the server's
+	leasedAt = time.Now()
+	res, err := db.execRetryingContention(stmt, owner, sequenceName, seqNum)
+	if err != nil {
+		return false, false, time.Time{}, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, false, time.Time{}, err
+	}
+	return false, affected > 0, leasedAt, nil
+}
+
+// migrationPollStart and migrationPollMax bound the wait between attempts to take a migration lock that another
+// runner holds, which doubles from the one to the other.
+const (
+	migrationPollStart = 5 * time.Millisecond
+	migrationPollMax   = time.Second
+)
+
+// migrationStatements returns the statements of a migration that run on driverName: those that no -- DRIVER:
+// directive excludes, with their -- comments stripped, leaving out any that is empty once they are.
+func migrationStatements(driverName, migration string) []string {
+	var statements []string
+	for _, stmt := range splitMigration(driverName, migration) {
+		if drivers, ok := migrationDriverDirective(driverName, stmt); ok && !slices.Contains(drivers, driverName) {
+			continue
+		}
+		stmt = strings.TrimSpace(stripLineComments(driverName, stmt))
+		if stmt != "" {
+			statements = append(statements, stmt)
+		}
+	}
+	return statements
+}
+
+// migrationInTransaction reports whether a migration of n statements runs in one transaction on driverName.
+func migrationInTransaction(driverName string, n int) bool {
+	switch driverName {
+	case "pgx", "mssql", "sqlite":
+		return n >= 2
+	}
+	return false
+}
+
+// States of a migrationRun.
+const (
+	migrationRunning   int32 = iota // under a lease that is being extended
+	migrationHolding                // its transaction holds the lock itself, until it ends
+	migrationAbandoned              // its lease could not be extended, and it is being stopped
+)
+
+// migrationRun is the state of a running migration, which the run and the loop extending its lease both try to move
+// on from running. The first to do so decides: the run's transaction takes the lock over, or the loop gives the lease
+// up and stops the run, which then cannot commit.
+type migrationRun struct {
+	state   atomic.Int32
+	holding context.Context // Done once the run's transaction holds the lock
+	release context.CancelFunc
+}
+
+// newMigrationRun returns a running migrationRun whose holding context derives from ctx.
+func newMigrationRun(ctx context.Context) *migrationRun {
+	run := &migrationRun{}
+	run.holding, run.release = context.WithCancel(ctx)
+	return run
+}
+
+// takeOver records that the run's transaction holds the lock, unless the run was abandoned first.
+func (run *migrationRun) takeOver() bool {
+	if !run.state.CompareAndSwap(migrationRunning, migrationHolding) {
+		return false
+	}
+	run.release()
+	return true
+}
+
+// abandon records that the run's lease is being given up, unless its transaction took the lock over first.
+func (run *migrationRun) abandon() bool {
+	return run.state.CompareAndSwap(migrationRunning, migrationAbandoned)
+}
+
+// execMigration runs the statements of a migration one at a time, and stops at the first that fails.
+func (db *DB) execMigration(ctx context.Context, statements []string) error {
+	for _, stmt := range statements {
+		_, err := db.ExecContext(ctx, stmt)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// runMigrationInTx runs the statements of a migration in one transaction, and marks the migration complete in it. The
+// transaction takes the lock over from the lease (run.takeOver) once it has written the lock row: after the mark,
+// which comes last, or on SQLite after a renewal that comes first. ctx must not be cancelled after the takeover, since
+// the commit runs on it.
+func (db *DB) runMigrationInTx(ctx context.Context, run *migrationRun, statements []string, sequenceName string, seqNum int, owner string) (err error) {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	if db.driverName == "sqlite" {
+		// The first statement of the transaction holds no lock when it fails, so it can be repeated
+		err = retryContention(func() error {
+			return renewMigrationLock(ctx, tx, sequenceName, seqNum, owner)
+		})
+		if err != nil {
+			return err
+		}
+		if !run.takeOver() {
+			return errMigrationLockLost
+		}
+	}
+	for _, stmt := range statements {
+		_, err = tx.ExecContext(ctx, stmt)
+		if err != nil {
+			return err
+		}
+	}
+	err = markMigrationComplete(ctx, tx, sequenceName, seqNum, owner)
+	if err != nil {
+		return err
+	}
+	if db.driverName != "sqlite" && !run.takeOver() {
+		return errMigrationLockLost
+	}
+	err = tx.Commit()
+	if err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+// markMigrationComplete marks migration seqNum complete, as long as its lock is still owned by owner.
+func markMigrationComplete(ctx context.Context, ex Executor, sequenceName string, seqNum int, owner string) error {
+	stmt := `UPDATE sequel_migrations SET locked_before=NOW_UTC(), completed_on=NOW_UTC(), completed=1 WHERE seq_name=? AND seq_num=? AND locked_by=?`
+	switch ex.DriverName() {
+	case "mysql", "mariadb", "pgx", "cockroachdb":
+		stmt = `UPDATE sequel_migrations SET locked_before=NOW_UTC(), completed_on=NOW_UTC(), completed=TRUE WHERE seq_name=? AND seq_num=? AND locked_by=?`
+	}
+	res, err := ex.ExecContext(ctx, stmt, sequenceName, seqNum, owner)
+	if err != nil {
+		return err
+	}
+	return migrationLockHeld(ctx, ex, res, sequenceName, seqNum, owner)
 }
 
 // isDuplicateKeyError reports whether err is SQL Server's duplicate-key error: 2627 for a primary key or unique
@@ -2314,14 +2476,19 @@ func (db *DB) openLeasePool() (*DB, error) {
 // that a test can make it fail.
 var extendMigrationLock = func(ctx context.Context, db *DB, sequenceName string, seqNum int, owner string) error {
 	return retryContention(func() error {
-		res, err := db.ExecContext(ctx,
-			`UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000) WHERE seq_name=? AND seq_num=? AND locked_by=?`,
-			sequenceName, seqNum, owner)
-		if err != nil {
-			return err
-		}
-		return migrationLockHeld(ctx, db, res, sequenceName, seqNum, owner)
+		return renewMigrationLock(ctx, db, sequenceName, seqNum, owner)
 	})
+}
+
+// renewMigrationLock starts a new lease on the lock of a migration, as long as it is still owned by owner.
+func renewMigrationLock(ctx context.Context, ex Executor, sequenceName string, seqNum int, owner string) error {
+	res, err := ex.ExecContext(ctx,
+		`UPDATE sequel_migrations SET locked_before=DATE_ADD_MILLIS(NOW_UTC(), 15000) WHERE seq_name=? AND seq_num=? AND locked_by=?`,
+		sequenceName, seqNum, owner)
+	if err != nil {
+		return err
+	}
+	return migrationLockHeld(ctx, ex, res, sequenceName, seqNum, owner)
 }
 
 // releaseMigrationLock gives up a migration lock held by owner, so that another runner can take it at once.
@@ -2334,14 +2501,14 @@ func (db *DB) releaseMigrationLock(sequenceName string, seqNum int, owner string
 // migrationLockHeld reports errMigrationLockLost unless the update that res reports, made on the condition that the
 // lock names owner, found it. MySQL counts only the rows an update changed, so no rows affected is confirmed by
 // reading the lock.
-func migrationLockHeld(ctx context.Context, db *DB, res sql.Result, sequenceName string, seqNum int, owner string) error {
+func migrationLockHeld(ctx context.Context, ex Executor, res sql.Result, sequenceName string, seqNum int, owner string) error {
 	if affected, err := res.RowsAffected(); err != nil {
 		return err
 	} else if affected > 0 {
 		return nil
 	}
 	var n int
-	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sequel_migrations WHERE seq_name=? AND seq_num=? AND locked_by=?`,
+	err := ex.QueryRowContext(ctx, `SELECT COUNT(*) FROM sequel_migrations WHERE seq_name=? AND seq_num=? AND locked_by=?`,
 		sequenceName, seqNum, owner).Scan(&n)
 	if err != nil {
 		return err

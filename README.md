@@ -88,6 +88,17 @@ ALTER TABLE users ALTER COLUMN email NVARCHAR(384) NOT NULL;
 -- SQLite does not support ALTER COLUMN; a table rebuild would be needed
 ```
 
+On PostgreSQL, SQL Server and SQLite, a file with two or more statements runs in one transaction, which also marks it complete: if a statement fails, nothing in the file is applied, and the next `Migrate` runs it again from the start. Only the statements that run on the driver count, after `-- DRIVER:` filtering. A file with one statement runs outside a transaction, which is how to run a statement that refuses one, such as PostgreSQL's `CREATE INDEX CONCURRENTLY`:
+
+```sql
+-- 7.users-email-index.sql, alone in its file
+CREATE INDEX CONCURRENTLY users_email ON users (email);
+```
+
+The transaction holds the locks its statements take until the file commits, so a file that alters a table and then backfills it keeps the table locked for the whole file, and on SQLite the whole database. Give a long backfill or index build a file of its own. A file of several statements must not begin, commit or roll back a transaction itself. On SQLite, `PRAGMA journal_mode` fails inside a transaction, so it needs a file of its own, and `PRAGMA foreign_keys` has no effect there.
+
+On MySQL, MariaDB and CockroachDB, every file runs a statement at a time and is marked complete after the last: MySQL and MariaDB commit each schema change on its own, and CockroachDB advises against schema changes in explicit transactions. There, a file that fails leaves the statements before the failure applied, and the next `Migrate` runs it again from its first statement, so write its statements to be safe to run twice.
+
 ## Cross-Driver Support
 
 Sequel supports MySQL, MariaDB, PostgreSQL, CockroachDB, SQL Server, and SQLite through a unified API. Write your SQL once using MySQL-style `?` placeholders and virtual functions, and Sequel automatically adapts queries for the active driver.

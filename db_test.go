@@ -21,6 +21,7 @@ import (
 	"database/sql/driver"
 	"encoding/json"
 	"net/url"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -1397,8 +1398,9 @@ func TestMigrate_ADroppedTableIsMadeAgain(t *testing.T) {
 
 // A migration whose lock cannot be extended is stopped and waited for before the lock is given up, so that a runner
 // taking the lapsed lock cannot run the same migration alongside it. Here the lock renewal fails while a long
-// statement runs: Migrate must cancel it, not run the statement after it, and return the failure. Not parallel: it
-// replaces package-level hooks.
+// statement runs: Migrate must cancel it and return the failure. The file has one statement, which runs outside a
+// transaction; a file of more on SQLite runs in a transaction that holds the lock itself, and is not stopped (see
+// TestMigrate_ATransactionHoldsItsOwnLock). Not parallel: it replaces package-level hooks.
 func TestMigrate_StopsWhenItsLockCannotBeExtended(t *testing.T) {
 	assert := testarossa.For(t)
 
@@ -1414,9 +1416,8 @@ func TestMigrate_StopsWhenItsLockCannotBeExtended(t *testing.T) {
 		return
 	}
 	defer db.Close()
-	fs := fstest.MapFS{"1.slow.sql": {Data: []byte(
-		"WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 2000000000) SELECT COUNT(*) FROM c;\n" +
-			"CREATE TABLE after_lost_lock (id INT);\n")}}
+	const slow = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 2000000000) SELECT COUNT(*) FROM c"
+	fs := fstest.MapFS{"1.slow.sql": {Data: []byte(slow + ";\n")}}
 	before := runtime.NumGoroutine()
 	start := time.Now()
 	err = db.Migrate(t.Name(), fs)
@@ -1425,9 +1426,84 @@ func TestMigrate_StopsWhenItsLockCannotBeExtended(t *testing.T) {
 	// The run was waited for: no goroutine is left executing the migration
 	time.Sleep(200 * time.Millisecond)
 	assert.True(runtime.NumGoroutine() <= before, "a goroutine is still running the migration: %d > %d", runtime.NumGoroutine(), before)
+	var completed int
+	assert.NoError(db.QueryRow("SELECT completed FROM sequel_migrations WHERE seq_name=?", t.Name()).Scan(&completed))
+	assert.Equal(0, completed)
+
+	// A file of several statements runs them this way on MySQL, MariaDB and CockroachDB: once the run is cancelled,
+	// the statements after the one in flight do not run
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	assert.Error(db.execMigration(ctx, []string{slow, "CREATE TABLE after_lost_lock (id INT)"}))
 	var n int
 	assert.NoError(db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name='after_lost_lock'").Scan(&n))
-	assert.Equal(0, n, "the statement after the lost lock ran")
+	assert.Equal(0, n, "the statement after the cancelled one ran")
+}
+
+// On SQLite, a migration's transaction takes the lock over from the lease at its first statement, by when it holds
+// the database's write lock until its commit. So no extension is attempted while the file runs for five renewal
+// periods, any of which would have failed and stopped it, on a file database and on a private in-memory one, where
+// an extension would also wait for the transaction's connection. Not parallel: it replaces package-level hooks.
+func TestMigrate_ATransactionHoldsItsOwnLock(t *testing.T) {
+	assert := testarossa.For(t)
+
+	renewal, extend := migrationLockRenewal, extendMigrationLock
+	defer func() { migrationLockRenewal, extendMigrationLock = renewal, extend }()
+	migrationLockRenewal = 100 * time.Millisecond
+	// Every extension fails, as a real one would until the commit, or until its deadline if the commit is later
+	var attempts atomic.Int32
+	extendMigrationLock = func(context.Context, *DB, string, int, string) error {
+		attempts.Add(1)
+		return errors.New("database is locked")
+	}
+
+	for _, dsn := range []string{
+		"file:" + filepath.Join(t.TempDir(), "migrate.db"),
+		":memory:",
+	} {
+		db, err := Open("sqlite", dsn)
+		if !assert.NoError(err) {
+			continue
+		}
+		db.SetMaxOpenConns(1)
+		fs := fstest.MapFS{"1.slow.sql": {Data: []byte(
+			"SELECT sequel_test_sleep(500);\nCREATE TABLE held_lock (id INT);\n")}}
+		attempts.Store(0)
+		assert.NoError(db.Migrate(t.Name(), fs), "%s", dsn)
+		var n int
+		assert.NoError(db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name='held_lock'").Scan(&n))
+		assert.Equal(1, n, "%s", dsn)
+		// The transaction took the lock over at its first statement, before the first renewal was due
+		assert.Equal(int32(0), attempts.Load(), "%s", dsn)
+		db.Close()
+	}
+}
+
+// An extension under way when the run's transaction takes the lock over is called off, and its failure is not a lost
+// lock: the run goes on to commit, rather than being cancelled mid-commit. Renewals here are due at once, so the
+// extension starts before the takeover, and it fails only when the takeover calls it off. Not parallel: it replaces
+// package-level hooks.
+func TestMigrate_ATakeoverOutlastsAnExtensionUnderWay(t *testing.T) {
+	assert := testarossa.For(t)
+
+	renewal, extend := migrationLockRenewal, extendMigrationLock
+	defer func() { migrationLockRenewal, extendMigrationLock = renewal, extend }()
+	migrationLockRenewal = time.Nanosecond
+	var underWay atomic.Int32
+	extendMigrationLock = func(ctx context.Context, _ *DB, _ string, _ int, _ string) error {
+		underWay.Add(1)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+
+	db := newSQLiteDB(t)
+	for i := range 10 {
+		fs := fstest.MapFS{"1.pair.sql": {Data: []byte(
+			"SELECT sequel_test_sleep(100);\nCREATE TABLE under_way_" + strconv.Itoa(i) + " (id INT);\n")}}
+		assert.NoError(db.Migrate(t.Name()+strconv.Itoa(i), fs))
+	}
+	// When the takeover comes first, the loop may see it before it starts an extension
+	assert.True(underWay.Load() > 0, "no extension was under way at a takeover")
 }
 
 // Migrate strips -- comments, but not a "--" inside a quoted string.
@@ -1703,6 +1779,126 @@ func TestMigrate_DriverDirective(t *testing.T) {
 	var v string
 	assert.NoError(db.QueryRow("SELECT v FROM directives WHERE v LIKE 'first%'").Scan(&v))
 	assert.Equal("first;\nsecond", v)
+}
+
+// Whether a file runs in a transaction depends on the statements left to run on the driver, after -- DRIVER: directives
+// and comment-only pieces: two or more, on PostgreSQL, SQL Server and SQLite only.
+func TestMigrate_StatementsPerDriver(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	mixed := "-- DRIVER: pgx\nCREATE INDEX CONCURRENTLY i ON t (id);\n\n" +
+		"-- DRIVER: sqlite\nINSERT INTO t VALUES (1);\n\n" +
+		"-- DRIVER: sqlite\nINSERT INTO t VALUES (2);\n\n" +
+		"-- only a comment;\n"
+	assert.Equal([]string{"CREATE INDEX CONCURRENTLY i ON t (id)"}, migrationStatements("pgx", mixed))
+	assert.False(migrationInTransaction("pgx", len(migrationStatements("pgx", mixed))))
+	assert.Equal([]string{"INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (2)"}, migrationStatements("sqlite", mixed))
+	assert.True(migrationInTransaction("sqlite", len(migrationStatements("sqlite", mixed))))
+	assert.Len(migrationStatements("mssql", mixed), 0)
+	assert.False(migrationInTransaction("mssql", 0))
+
+	pair := "CREATE TABLE t (id INT);\nINSERT INTO t VALUES (1);\n"
+	for _, driver := range []string{"pgx", "mssql", "sqlite"} {
+		assert.True(migrationInTransaction(driver, len(migrationStatements(driver, pair))), driver)
+		assert.False(migrationInTransaction(driver, 1), driver)
+	}
+	for _, driver := range []string{"mysql", "mariadb", "cockroachdb"} {
+		assert.False(migrationInTransaction(driver, len(migrationStatements(driver, pair))), driver)
+	}
+}
+
+// A runner waiting for another's migration backs off, from 5ms to a second: it notices a short migration complete at
+// once, and polls a long one a few times rather than hundreds of times a second.
+func TestMigrate_AWaitingRunnerBacksOff(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	for _, c := range []struct {
+		name     string
+		ms       int
+		attempts int // at most, to take the lock while the first runner holds it
+		lag      time.Duration
+	}{
+		{"short", 100, 10, 500 * time.Millisecond},
+		{"long", 2000, 15, 2 * time.Second},
+	} {
+		dsn, err := CreateTestingDatabase("sqlite", "", t.Name()+"_"+c.name)
+		if !assert.NoError(err) {
+			continue
+		}
+		first, err := Open("sqlite", dsn)
+		if !assert.NoError(err) {
+			continue
+		}
+		defer first.Close()
+		second, err := Open("sqlite", dsn)
+		if !assert.NoError(err) {
+			continue
+		}
+		defer second.Close()
+		sr := tracetest.NewSpanRecorder()
+		second.SetTracerProvider(sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr)))
+		// Makes the migrations table, so that the second runner starts by waiting
+		assert.NoError(first.Migrate(t.Name(), fstest.MapFS{}))
+
+		fs := fstest.MapFS{"1.sleep.sql": {Data: []byte("SELECT sequel_test_sleep(" + strconv.Itoa(c.ms) + ")")}}
+		var firstDone time.Time
+		var wg sync.WaitGroup
+		wg.Go(func() {
+			assert.NoError(first.Migrate(t.Name(), fs))
+			firstDone = time.Now()
+		})
+		time.Sleep(20 * time.Millisecond)
+		assert.NoError(second.Migrate(t.Name(), fs))
+		secondDone := time.Now()
+		wg.Wait()
+
+		attempts := 0
+		for _, s := range sr.Ended() {
+			if strings.HasPrefix(s.Name(), "UPDATE") {
+				attempts++
+			}
+		}
+		assert.True(attempts <= c.attempts, "%s: %d attempts to take the lock", c.name, attempts)
+		assert.True(secondDone.Sub(firstDone) < c.lag, "%s: noticed %v after completion", c.name, secondDone.Sub(firstDone))
+	}
+}
+
+// On a SQLite file, a migration's transaction holds the database's write lock until it commits, and a waiting runner's
+// writes fail on it once busy_timeout runs out. That is a held lock, and the runner waits for the migration to
+// complete rather than failing.
+func TestMigrate_AWaitingRunnerOutlastsATransaction(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	// The waiter has a short busy_timeout, so that its writes give up long before the transaction ends. The migrating
+	// runner keeps the default, so that its commit waits out the waiter's reads
+	dsn := "file:" + filepath.Join(t.TempDir(), "migrate.db")
+	first, err := Open("sqlite", dsn)
+	if !assert.NoError(err) {
+		return
+	}
+	defer first.Close()
+	second, err := Open("sqlite", dsn+"?_pragma=busy_timeout(20)")
+	if !assert.NoError(err) {
+		return
+	}
+	defer second.Close()
+	// Makes the migrations table, so that the second runner starts by waiting
+	assert.NoError(first.Migrate(t.Name(), fstest.MapFS{}))
+
+	fs := fstest.MapFS{"1.slow.sql": {Data: []byte("CREATE TABLE outlasted (id INT);\nSELECT sequel_test_sleep(1500);\n")}}
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		assert.NoError(first.Migrate(t.Name(), fs))
+	})
+	time.Sleep(100 * time.Millisecond)
+	assert.NoError(second.Migrate(t.Name(), fs))
+	wg.Wait()
+	var n int
+	assert.NoError(second.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE name='outlasted'").Scan(&n))
+	assert.Equal(1, n)
 }
 
 // A migration extends its lock on a pool of its own, so that a long statement holding the caller's only connection

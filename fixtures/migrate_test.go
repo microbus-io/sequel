@@ -187,3 +187,139 @@ func TestMigrate_SemicolonsAndDirectivesInStrings(t *testing.T) {
 	assert.NoError(db.QueryRow("SELECT v FROM literals WHERE id=2").Scan(&v))
 	assert.Equal("-- DRIVER: none", v)
 }
+
+// migratesInTransaction reports whether a migration file of more than one statement runs in one transaction on db.
+func migratesInTransaction(db *sequel.DB) bool {
+	switch db.DriverName() {
+	case "pgx", "mssql", "sqlite":
+		return true
+	}
+	return false
+}
+
+// migrationCompleted reports whether the migration of a sequence is marked complete.
+func migrationCompleted(t *testing.T, db *sequel.DB, sequenceName string, seqNum int) bool {
+	t.Helper()
+	var completed bool
+	err := db.QueryRow("SELECT completed FROM sequel_migrations WHERE seq_name=? AND seq_num=?", sequenceName, seqNum).Scan(&completed)
+	testarossa.For(t).NoError(err)
+	return completed
+}
+
+// tableRows returns the number of rows of a table, or -1 if there is no such table.
+func tableRows(db *sequel.DB, table string) int {
+	var n int
+	if db.QueryRow("SELECT COUNT(*) FROM "+table).Scan(&n) != nil {
+		return -1
+	}
+	return n
+}
+
+// A file of more than one statement whose later statement fails leaves nothing applied on PostgreSQL, SQL Server and
+// SQLite, and is not marked complete, so the next Migrate runs it whole. On MySQL, MariaDB and CockroachDB the
+// statements before the failure stay applied, as before.
+func TestMigrate_AFailedFileLeavesNothingBehind(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB(t)
+	err := db.Migrate(t.Name(), fstest.MapFS{"1.whole.sql": {Data: []byte(
+		"CREATE TABLE whole_a (id INT);\nINSERT INTO whole_a (id) VALUES (1);\nINSERT INTO whole_missing (id) VALUES (1);\n")}})
+	if assert.Error(err) {
+		assert.Contains(err.Error(), "1.whole.sql")
+	}
+	assert.False(migrationCompleted(t, db, t.Name(), 1))
+	if !migratesInTransaction(db) {
+		assert.Equal(1, tableRows(db, "whole_a"), "the statements before the failure stay applied")
+		return
+	}
+	assert.Equal(-1, tableRows(db, "whole_a"), "the statements before the failure were left applied")
+
+	assert.NoError(db.Migrate(t.Name(), fstest.MapFS{"1.whole.sql": {Data: []byte(
+		"CREATE TABLE whole_a (id INT);\nINSERT INTO whole_a (id) VALUES (1);\nINSERT INTO whole_a (id) VALUES (2);\n")}}))
+	assert.True(migrationCompleted(t, db, t.Name(), 1))
+	assert.Equal(2, tableRows(db, "whole_a"))
+}
+
+// A file whose lock is lost before it commits leaves nothing applied where it runs in a transaction: the mark, which
+// is written in the same transaction, finds the lock gone, and the whole file rolls back. Here the file itself hands
+// its lock to another runner.
+func TestMigrate_ALockLostBeforeCommitLeavesNothing(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB(t)
+	steal := "UPDATE sequel_migrations SET locked_by='another' WHERE seq_name='" + t.Name() + "'"
+	err := db.Migrate(t.Name(), fstest.MapFS{"1.stolen.sql": {Data: []byte(
+		"CREATE TABLE stolen_a (id INT);\n" + steal + ";\nCREATE TABLE stolen_b (id INT);\n")}})
+	if assert.Error(err) {
+		assert.Contains(err.Error(), "1.stolen.sql")
+		assert.Contains(err.Error(), "lock was lost")
+	}
+	assert.False(migrationCompleted(t, db, t.Name(), 1))
+	if !migratesInTransaction(db) {
+		assert.Equal(0, tableRows(db, "stolen_b"), "the statements ran one at a time")
+		return
+	}
+	assert.Equal(-1, tableRows(db, "stolen_a"), "the file was left applied")
+	assert.Equal(-1, tableRows(db, "stolen_b"), "the file was left applied")
+
+	// The rollback took the theft back with it, and the lock was released: the file runs at once
+	assert.NoError(db.Migrate(t.Name(), fstest.MapFS{"1.stolen.sql": {Data: []byte(
+		"CREATE TABLE stolen_a (id INT);\nCREATE TABLE stolen_b (id INT);\n")}}))
+	assert.True(migrationCompleted(t, db, t.Name(), 1))
+}
+
+// A statement that refuses a transaction, such as PostgreSQL's CREATE INDEX CONCURRENTLY, runs in a file of its own,
+// and fails beside another statement, which puts the file in a transaction.
+func TestMigrate_AConcurrentIndexBuildStandsAlone(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB(t)
+	if db.DriverName() != "pgx" {
+		t.Skip("CREATE INDEX CONCURRENTLY is PostgreSQL's")
+	}
+	fs := fstest.MapFS{
+		"1.table.sql": {Data: []byte("CREATE TABLE concurrent (a INT, b INT)")},
+		"2.index.sql": {Data: []byte("-- Alone in its file\nCREATE INDEX CONCURRENTLY concurrent_a ON concurrent (a);\n")},
+	}
+	assert.NoError(db.Migrate(t.Name(), fs))
+	assert.True(migrationCompleted(t, db, t.Name(), 2))
+
+	fs["3.pair.sql"] = &fstest.MapFile{Data: []byte(
+		"CREATE INDEX CONCURRENTLY concurrent_b ON concurrent (b);\nCREATE TABLE concurrent_after (id INT);\n")}
+	err := db.Migrate(t.Name(), fs)
+	if assert.Error(err) {
+		assert.Contains(err.Error(), "cannot run inside a transaction block")
+	}
+	assert.False(migrationCompleted(t, db, t.Name(), 3))
+	assert.Equal(-1, tableRows(db, "concurrent_after"))
+}
+
+// The statements that decide whether a file runs in a transaction are the ones left to run on the driver: a file with
+// one PostgreSQL statement and two SQLite ones runs the index build alone on PostgreSQL, which it could not do in a
+// transaction, and both inserts in one transaction on SQLite, where the failure of the second takes back the first.
+func TestMigrate_StatementCountIsPerDriver(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	db := newTestDB(t)
+	err := db.Migrate(t.Name(), fstest.MapFS{
+		"1.table.sql": {Data: []byte("CREATE TABLE per_driver (id INT)")},
+		"2.mixed.sql": {Data: []byte(
+			"-- DRIVER: pgx\nCREATE INDEX CONCURRENTLY per_driver_id ON per_driver (id);\n\n" +
+				"-- DRIVER: sqlite\nINSERT INTO per_driver (id) VALUES (1);\n\n" +
+				"-- DRIVER: sqlite\nINSERT INTO per_driver_missing (id) VALUES (2);\n")},
+	})
+	switch db.DriverName() {
+	case "sqlite":
+		assert.Error(err)
+		assert.False(migrationCompleted(t, db, t.Name(), 2))
+		assert.Equal(0, tableRows(db, "per_driver"), "the first insert was left applied")
+	default:
+		// The index build alone on PostgreSQL, and nothing at all elsewhere
+		assert.NoError(err)
+		assert.True(migrationCompleted(t, db, t.Name(), 2))
+	}
+}
