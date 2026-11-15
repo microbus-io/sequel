@@ -140,6 +140,25 @@ correct on any session. So `normalizeDriverAndDSN` adds `timezone=UTC` to every 
   against `NOW_UTC()`: the comparison converts both through the same session zone and the error cancels.
   It skips on CockroachDB, where a database default does not reach the root user the suite connects as.
 
+## Timeouts are the caller's
+
+Sequel sets no connect, read or write timeout on any driver; a statement is bounded by its context. MySQL and MariaDB
+once had `timeout=4s`, `readTimeout=8s` and `writeTimeout=8s` forced over the DSN's own values. The driver's
+`readTimeout` is a deadline on each read, so it capped how long the server could stay silent, which is how long any
+statement could run: a lock wait under InnoDB's 50s default, a large `DELETE`, a migration's index build. Past it the
+driver drops the connection and returns `invalid connection`, which `IsConnectionError` reports as a lost link while
+the server is still running the statement. An autocommit write could commit after its caller retried it, and a DDL
+could finish after `Migrate` recorded it failed, so every later run failed on "already exists". A context ends the
+statement the same way on the wire (the driver closes the connection), but the limit is the caller's and the error
+says so. A vanished server is still found by TCP keepalive, which every driver's dialer enables. The dial timeout went
+too: a deadline in the caller's context already bounds the dial, and the OS bounds it otherwise.
+
+Do not add a timeout default back on one driver; PostgreSQL and SQL Server never had one from sequel. `parseTime=true`
+stays forced, because sequel's time handling needs it, and is set as `cfg.ParseTime`: a known key written through
+`cfg.Params` comes out of `FormatDSN` twice, the later one winning, which is how the DSN's timeouts were overridden.
+SQLite's `busy_timeout` default is a lock wait, not an I/O deadline, and yields to the DSN's. `TestDB_MySQLTimeoutsAreTheCallers`
+pins it.
+
 ## Virtual functions are not expanded inside strings or comments
 
 `expandOnce` skips string literals, quoted identifiers and comments (`skipNonCode`), and looks for a call only at the
@@ -407,6 +426,24 @@ It runs 20 iterations per case on a one-connection pool; without the workaround,
 cancelled transaction failed, except under `cancelled/in_flight/Transact`, which fails about once in 300 and is left
 to the other cases, since they exercise the same workaround. It once ran 300 iterations on SQL Server, which took CI
 161s - most of it the deadline cases waiting out their deadlines - and caught nothing 20 do not.
+
+### SQL Server keeps a transaction's isolation level on the session
+
+A level passed to `BeginTx` on SQL Server is still set on the connection after the transaction ends, so the pool hands
+it to the next caller, and `Transact` runs at it too: go-mssqldb begins a default-level transaction at whatever level
+the session holds. The server keeps the level as session state, and the reset a reused connection gets clears
+`XACT_ABORT` but not the level - probed on SQL Server 2019 with go-mssqldb at TDS 7.4, although older Microsoft posts
+say 2014 began resetting it for TDS 7.3 clients. A plain `SET TRANSACTION ISOLATION LEVEL` leaks the same way. The pgx
+and MySQL drivers scope the level to the transaction (MySQL's `SET TRANSACTION`, without `SESSION`, covers only the
+next one).
+
+Sequel documents it on `BeginTx` rather than fixing it. go-mssqldb's `Connector.SessionInitSQL` runs on every reset
+and could restore READ COMMITTED, but at a round trip every time any statement takes a pooled connection. Restoring it
+after each transaction needs the connection held past the transaction's end, where a statement must not race
+`database/sql`'s rollback of a cancelled transaction (the `grabConn` race above). So a `Transact` that takes options,
+if one is ever added, should accept only the default and READ COMMITTED on SQL Server. To test that a level took
+effect, check behaviour - whether a second read sees another session's commit - not a variable: inside a transaction
+begun at READ COMMITTED, MySQL's `@@transaction_isolation` and MariaDB's `@@tx_isolation` still read REPEATABLE-READ.
 
 ## Statement batches (`Tx.Batch`, `batch.go`, `batchresults.go`)
 

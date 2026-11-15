@@ -181,6 +181,54 @@ func TestDB_MySQLSchemes(t *testing.T) {
 	assert.Equal("mysql", physicalDriverName("mariadb"))
 }
 
+// TestDB_MySQLTimeoutsAreTheCallers checks that sequel sets no MySQL timeouts of its own, keeps the ones a data
+// source name sets, and names no key twice.
+func TestDB_MySQLTimeoutsAreTheCallers(t *testing.T) {
+	t.Parallel()
+	assert := testarossa.For(t)
+
+	keysOnce := func(dsn string) {
+		_, query, _ := strings.Cut(dsn, "?")
+		values, err := url.ParseQuery(query)
+		if assert.NoError(err) {
+			for key, v := range values {
+				assert.Len(v, 1, "%s appears %d times in %q", key, len(v), dsn)
+			}
+		}
+	}
+
+	_, dsn, err := normalizeDriverAndDSN("mysql", "root:pw@tcp(h:3306)/app")
+	assert.NoError(err)
+	cfg, err := mysql.ParseDSN(dsn)
+	if assert.NoError(err) {
+		assert.Zero(cfg.Timeout)
+		assert.Zero(cfg.ReadTimeout)
+		assert.Zero(cfg.WriteTimeout)
+		assert.True(cfg.ParseTime)
+	}
+	keysOnce(dsn)
+
+	_, dsn, err = normalizeDriverAndDSN("", "mariadb://root:pw@tcp(h:3306)/app?timeout=30s&readTimeout=60s&writeTimeout=90s&parseTime=true")
+	assert.NoError(err)
+	cfg, err = mysql.ParseDSN(dsn)
+	if assert.NoError(err) {
+		assert.Equal(30*time.Second, cfg.Timeout)
+		assert.Equal(60*time.Second, cfg.ReadTimeout)
+		assert.Equal(90*time.Second, cfg.WriteTimeout)
+		assert.True(cfg.ParseTime)
+	}
+	keysOnce(dsn)
+
+	// parseTime is sequel's to set: the time handling depends on it
+	_, dsn, err = normalizeDriverAndDSN("mysql", "root:pw@tcp(h:3306)/app?parseTime=false")
+	assert.NoError(err)
+	cfg, err = mysql.ParseDSN(dsn)
+	if assert.NoError(err) {
+		assert.True(cfg.ParseTime)
+	}
+	keysOnce(dsn)
+}
+
 func TestDB_InferDriverName(t *testing.T) {
 	t.Parallel()
 	assert := testarossa.For(t)

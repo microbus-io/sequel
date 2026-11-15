@@ -211,6 +211,12 @@ a timezone parameter in the data source name or in a service file it names, an o
 parameter that sets timezone, or the PGTZ or PGOPTIONS environment variable. A name from
 the pgx stdlib's RegisterConnConfig is passed through unchanged; set timezone in its
 RuntimeParams.
+
+On "mysql" and "mariadb", parseTime=true is always set, so DATETIME and TIMESTAMP columns scan
+into time.Time. On "sqlite", busy_timeout is 2000 ms unless the data source name sets it, so a
+write waits for another connection's lock instead of failing at once. Connect, read and write
+timeouts are the driver's own defaults and whatever the data source name sets: bound a statement
+with its context.
 */
 func Open(driverName string, dataSourceName string) (db *DB, err error) {
 	driverName, dataSourceName, err = normalizeDriverAndDSN(driverName, dataSourceName)
@@ -306,7 +312,7 @@ func OpenSingleton(driverName string, dataSourceName string) (db *DB, err error)
 }
 
 // normalizeDriverAndDSN normalizes driver name aliases, infers the driver name when
-// missing, and applies driver-specific DSN tweaks (MySQL connection params, the
+// missing, and applies driver-specific DSN tweaks (MySQL parseTime, the
 // PostgreSQL session time zone, SQLite busy_timeout pragma).
 func normalizeDriverAndDSN(driverName, dataSourceName string) (string, string, error) {
 	if dataSourceName == "" {
@@ -328,14 +334,9 @@ func normalizeDriverAndDSN(driverName, dataSourceName string) (string, string, e
 		if err != nil {
 			return "", "", errors.Trace(err)
 		}
-		if cfg.Params == nil {
-			cfg.Params = map[string]string{}
-		}
-		// See https://github.com/go-sql-driver/mysql#dsn-data-source-name
-		cfg.Params["parseTime"] = "true"
-		cfg.Params["timeout"] = "4s"
-		cfg.Params["readTimeout"] = "8s"
-		cfg.Params["writeTimeout"] = "8s"
+		// A field, not cfg.Params: FormatDSN writes the field and then every param, so a param named like a known
+		// key gives that key twice, and the later one wins when the driver parses it.
+		cfg.ParseTime = true
 		dataSourceName = cfg.FormatDSN()
 	case "pgx", "cockroachdb":
 		dataSourceName = pinSessionTimeZoneUTC(toPostgresScheme(dataSourceName))
@@ -1013,6 +1014,11 @@ func (db *DB) Begin() (*Tx, error) {
 
 // BeginTx starts a transaction with the given options and returns a sequel.Tx that
 // applies virtual function expansion and placeholder conforming.
+//
+// On SQL Server, an isolation level in opts outlives the transaction. It stays set on the connection, which goes back
+// to the pool with it, and every later statement and transaction on that connection runs at that level, [DB.Transact]
+// included: the pool's session reset does not clear it. READ COMMITTED, SQL Server's default, leaves nothing behind.
+// On the other drivers the level lasts only for the transaction.
 func (db *DB) BeginTx(ctx context.Context, opts *sql.TxOptions) (*Tx, error) {
 	sqlTx, _, rtt, err := db.beginTx(ctx, nil, false, opts)
 	if err != nil {
