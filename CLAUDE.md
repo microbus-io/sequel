@@ -403,8 +403,10 @@ buffer: rare, but a real hazard, not only a race-detector report. The race detec
 unmodified sequel, and routing cancellations to the same path makes it more frequent. It replaces #390's own race,
 the reader against the next checkout of the pooled connection. `TestTransact_EndedContextLeavesThePoolUsable`
 (fixtures) therefore skips SQL Server under `-race`, and CI's SQL Server job runs it again without the race detector.
-It runs 300 iterations per case on a one-connection pool; without the workaround, 256-298 of 300 statements after a
-cancelled transaction failed.
+It runs 20 iterations per case on a one-connection pool; without the workaround, 19-20 of 20 statements after a
+cancelled transaction failed, except under `cancelled/in_flight/Transact`, which fails about once in 300 and is left
+to the other cases, since they exercise the same workaround. It once ran 300 iterations on SQL Server, which took CI
+161s - most of it the deadline cases waiting out their deadlines - and caught nothing 20 do not.
 
 ## Statement batches (`Tx.Batch`, `batch.go`, `batchresults.go`)
 

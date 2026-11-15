@@ -62,9 +62,6 @@ func TestTransact_EndedContextLeavesThePoolUsable(t *testing.T) {
 					}
 					db.SetMaxOpenConns(1)
 					iterations := 20
-					if db.DriverName() == "mssql" {
-						iterations = 300
-					}
 
 					failures := 0
 					var firstErr error
